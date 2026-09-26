@@ -10,7 +10,12 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build"
+    "desktop:build": "tauri build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:dst": "node scripts/run-tests-in-tz.mjs America/New_York",
+    "test:all": "npm run test && npm run test:dst",
+    "check": "tsc -b && vitest run"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
@@ -21,11 +26,12 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
-    "@tauri-apps/cli": "^2.8.0",
     "typescript": "^5.7.2",
-    "vite": "^6.0.7"
+    "vite": "^6.0.7",
+    "vitest": "^5.0.2"
   }
 }

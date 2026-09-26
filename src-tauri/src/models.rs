@@ -253,3 +253,211 @@ pub fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+// ===============================================================
+// 测试
+//
+// 重点只有一个：**老数据文件必须还能读**。
+//
+// 这些 JSON 是用户唯一的资产，而且会随着版本升级不断加字段
+// （`duration_ms` 就是后加的）。如果新版本读不了旧文件，
+// 用户的计时器、备忘录会在一夜之间全部消失。
+//
+// 所以每个模型都测一遍"只给必填字段的最小 JSON"能否解析成功。
+// ===============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 只有必填字段的计时器也能解析() {
+        // 模拟 duration_ms 存在之前写下的老数据
+        let json = r#"{
+            "id": "t1",
+            "name": "煮蛋",
+            "kind": "countdown",
+            "createdAt": 1800000000000
+        }"#;
+
+        let t: Timer = serde_json::from_str(json).expect("老数据必须能解析");
+
+        assert_eq!(t.id, "t1");
+        assert_eq!(t.name, "煮蛋");
+        assert_eq!(t.kind, TimerKind::Countdown);
+        // 缺省值必须合理：这些字段在老数据里根本不存在
+        assert_eq!(t.duration_ms, None, "老数据没有设定时长，应为 None 而不是 0");
+        assert_eq!(t.ends_at, None);
+        assert_eq!(t.remaining_ms, None);
+        assert_eq!(t.phase, None);
+        assert_eq!(t.rounds, 0);
+        assert!(!t.fired);
+        assert!(t.laps.is_empty());
+        // 番茄钟时长要有可用的默认值，否则老数据里的番茄钟会变成 0 分钟
+        assert_eq!(t.focus_minutes, 25);
+        assert_eq!(t.break_minutes, 5);
+    }
+
+    #[test]
+    fn 只有必填字段的备忘录也能解析() {
+        let json = r#"{
+            "id": "m1",
+            "date": "2026-09-19",
+            "title": "交材料",
+            "createdAt": 1,
+            "updatedAt": 1
+        }"#;
+
+        let m: Memo = serde_json::from_str(json).expect("老数据必须能解析");
+
+        assert_eq!(m.date, "2026-09-19");
+        assert_eq!(m.remind_at, None);
+        assert_eq!(m.repeat, Repeat::None, "缺省重复规则必须是不重复");
+        assert_eq!(m.fired_for, None);
+        assert!(m.tags.is_empty());
+        assert_eq!(m.body, "");
+    }
+
+    #[test]
+    fn 只有必填字段的链接也能解析() {
+        let json = r#"{
+            "id": "l1",
+            "name": "记事本",
+            "target": "C:\\Windows\\notepad.exe",
+            "kind": "program",
+            "createdAt": 1
+        }"#;
+
+        let l: Link = serde_json::from_str(json).expect("老数据必须能解析");
+
+        assert_eq!(l.kind, LinkKind::Program);
+        assert_eq!(l.args, None);
+        assert_eq!(l.order, 0);
+    }
+
+    #[test]
+    fn 空对象能解析成默认设置() {
+        let s: Settings = serde_json::from_str("{}").expect("空设置必须能解析");
+
+        assert!(!s.autostart, "开机自启默认必须是关的");
+        assert!(s.alert_sound, "提示音默认开着");
+        assert!(s.panel_always_on_top);
+        assert_eq!(s.paste_restore_delay_ms, 120);
+    }
+
+    #[test]
+    fn 字段名用驼峰而不是下划线() {
+        // 前端 TypeScript 按驼峰写，两侧必须一致，否则前端永远读不到值
+        let t = Timer {
+            id: "t".into(),
+            name: "n".into(),
+            kind: TimerKind::Countdown,
+            ends_at: Some(1),
+            remaining_ms: Some(2),
+            duration_ms: Some(3),
+            phase: None,
+            focus_minutes: 25,
+            break_minutes: 5,
+            rounds: 0,
+            elapsed_ms: 0,
+            running_since: None,
+            laps: Vec::new(),
+            fired: false,
+            created_at: 4,
+        };
+
+        let json = serde_json::to_string(&t).expect("序列化");
+
+        assert!(json.contains("\"endsAt\""), "实际：{json}");
+        assert!(json.contains("\"remainingMs\""));
+        assert!(json.contains("\"durationMs\""));
+        assert!(json.contains("\"createdAt\""));
+        assert!(!json.contains("ends_at"), "不该出现下划线命名");
+    }
+
+    #[test]
+    fn 枚举按小写字符串序列化() {
+        // 前端的 TS 联合类型是小写字面量，两侧必须对得上
+        assert_eq!(
+            serde_json::to_string(&TimerKind::Countdown).expect("序列化"),
+            "\"countdown\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PomodoroPhase::Focus).expect("序列化"),
+            "\"focus\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Repeat::Weekday).expect("序列化"),
+            "\"weekday\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LinkKind::Url).expect("序列化"),
+            "\"url\""
+        );
+    }
+
+    #[test]
+    fn 多出来的未知字段不会导致解析失败() {
+        // 场景：用户先用新版软件，再退回旧版。
+        // 旧版不认识新字段，但不该因此读不了数据。
+        let json = r#"{
+            "id": "t1",
+            "name": "n",
+            "kind": "countdown",
+            "createdAt": 1,
+            "someFutureField": {"nested": true}
+        }"#;
+
+        assert!(serde_json::from_str::<Timer>(json).is_ok());
+    }
+
+    #[test]
+    fn 未知的枚举值会解析失败而不是静默取错() {
+        // 这是有意的：如果将来加了新的计时器类型，
+        // 旧版本应该明确报错（走"损坏备份 + 回退默认值"那条路），
+        // 而不是把未知类型悄悄当成倒计时处理，那会做出错误行为。
+        let json = r#"{"id":"t","name":"n","kind":"teleporter","createdAt":1}"#;
+        assert!(serde_json::from_str::<Timer>(json).is_err());
+    }
+
+    #[test]
+    fn 时间戳是合理的毫秒值() {
+        let now = now_ms();
+
+        // 2020-01-01 与 2100-01-01 的毫秒时间戳，用来兜住"误用秒"这类错误
+        assert!(now > 1_577_836_800_000, "时间戳过小，可能误用了秒");
+        assert!(now < 4_102_444_800_000, "时间戳过大");
+    }
+
+    #[test]
+    fn 完整数据能往返序列化() {
+        let t = Timer {
+            id: "t".into(),
+            name: "开会".into(),
+            kind: TimerKind::Pomodoro,
+            ends_at: Some(1_800_000_000_000),
+            remaining_ms: None,
+            duration_ms: Some(1_500_000),
+            phase: Some(PomodoroPhase::Break),
+            focus_minutes: 25,
+            break_minutes: 5,
+            rounds: 3,
+            elapsed_ms: 0,
+            running_since: None,
+            laps: vec![100, 200],
+            fired: false,
+            created_at: 1_700_000_000_000,
+        };
+
+        let json = serde_json::to_string(&t).expect("序列化");
+        let back: Timer = serde_json::from_str(&json).expect("反序列化");
+
+        assert_eq!(back.id, t.id);
+        assert_eq!(back.kind, t.kind);
+        assert_eq!(back.ends_at, t.ends_at);
+        assert_eq!(back.duration_ms, t.duration_ms);
+        assert_eq!(back.phase, t.phase);
+        assert_eq!(back.rounds, t.rounds);
+        assert_eq!(back.laps, t.laps);
+    }
+}

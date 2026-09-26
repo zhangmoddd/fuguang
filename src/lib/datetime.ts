@@ -186,8 +186,21 @@ export function nextOccurrence(current: number, repeat: RepeatValue): number | n
 /**
  * 从"现在"出发，算出某个重复规则的首次提醒时刻。
  *
- * 用于用户刚设好提醒时：如果填的时刻已经过了，就按规则推到下一次，
- * 而不是立刻弹一条过期提醒。
+ * 用于两处：
+ * 1. 用户刚设好提醒时 —— 如果填的时刻已经过了，按规则推到下一次，
+ *    而不是立刻弹一条过期提醒
+ * 2. 重复提醒推进时的兜底 —— 系统时钟被回拨或长期休眠后，
+ *    `nextOccurrence` 的结果可能仍在过去
+ *
+ * # 不变量：返回结果必定在 `now` 之后（`repeat === "none"` 除外）
+ *
+ * 这条不变量不能破。因为调度线程每 500ms 检查一次"到点没到点"，
+ * 一旦返回一个过去时刻，提醒就会**反复触发**——用户会看到弹窗风暴。
+ *
+ * 所以循环上限给得很宽（两万次，覆盖五十多年的每日提醒），
+ * 且循环耗尽时还有一层兜底，绝不允许把过去时刻返回出去。
+ * 单次循环只是一次日期运算，即使跑满上限也在一毫秒量级，
+ * 而且只有"填了一个很久以前的时刻"才会走到这里。
  */
 export function firstOccurrence(
   wanted: number,
@@ -195,15 +208,18 @@ export function firstOccurrence(
   now: number = Date.now(),
 ): number {
   if (wanted > now) return wanted;
+  // 不重复的提醒没有"下一次"可言：用户既然要这个时刻，就让他立刻收到
   if (repeat === "none") return wanted;
 
-  // 从用户填的时刻开始往后推，直到落在未来
   let candidate = wanted;
-  for (let i = 0; i < 400; i++) {
+  for (let i = 0; i < 20_000; i++) {
     const next = nextOccurrence(candidate, repeat);
-    if (next === null) return wanted;
+    if (next === null) break;
     candidate = next;
     if (candidate > now) return candidate;
   }
-  return candidate;
+
+  // 兜底：从"现在"重新起算。仍然保证落在未来。
+  const fromNow = nextOccurrence(now, repeat);
+  return fromNow !== null && fromNow > now ? fromNow : now + 1;
 }

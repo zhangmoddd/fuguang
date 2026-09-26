@@ -198,3 +198,108 @@ fn base64_encode(data: &[u8]) -> String {
     }
     out
 }
+
+// ===============================================================
+// 测试
+//
+// base64 是自己手写的，而且它编码的是**图标像素**——
+// 一旦编错，表现是"图标花了"或"图标根本不显示"，
+// 前端只会静默降级成内置图标，用户完全不会知道发生了什么。
+//
+// 所以这里用 RFC 4648 的标准测试向量来验证，而不是自己编自己解
+// （那样即使两边同时错也能"通过"）。
+// ===============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 空输入编码成空串() {
+        assert_eq!(base64_encode(&[]), "");
+    }
+
+    #[test]
+    fn 符合官方标准测试向量() {
+        // 这三组是 RFC 4648 §10 的官方测试向量，
+        // 覆盖了"不需要补位""补一个 =""补两个 ="三种情况
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn 高位字节不会出错() {
+        // 图标像素里大量出现 0xFF 这类字节。
+        // 如果位运算写错（例如用了 i8 而不是 u32），这里会先炸。
+        assert_eq!(base64_encode(&[0xFF, 0xFE, 0xFD]), "//79");
+        assert_eq!(base64_encode(&[0x00, 0x00, 0x00]), "AAAA");
+        assert_eq!(base64_encode(&[0xFF, 0xFF, 0xFF]), "////");
+        assert_eq!(base64_encode(&[0x80, 0x00, 0x00]), "gAAA");
+    }
+
+    #[test]
+    fn 输出长度总是四的倍数() {
+        // base64 的定义要求如此；长度不对说明补位逻辑有问题，
+        // 前端的 atob 会直接抛异常
+        for len in 0..40usize {
+            let data = vec![0xABu8; len];
+            let encoded = base64_encode(&data);
+            assert_eq!(
+                encoded.len() % 4,
+                0,
+                "长度 {len} 的输入编码后长度不是 4 的倍数：{encoded}"
+            );
+            // 期望长度：每 3 字节 4 字符，不足的按 4 取整
+            assert_eq!(encoded.len(), (len + 2) / 3 * 4);
+        }
+    }
+
+    #[test]
+    fn 只包含合法字符与补位符() {
+        let data: Vec<u8> = (0..=255u8).collect();
+        let encoded = base64_encode(&data);
+
+        // `=` 只允许出现在末尾，且最多两个
+        let body = encoded.trim_end_matches('=');
+        assert!(encoded.len() - body.len() <= 2, "补位符过多");
+        assert!(!body.contains('='), "补位符只能出现在末尾");
+
+        for ch in body.chars() {
+            assert!(
+                ch.is_ascii_alphanumeric() || ch == '+' || ch == '/',
+                "出现非法 base64 字符：{ch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 图标数据的序列化字段名是驼峰() {
+        // 前端按 `rgbaBase64` 读取，字段名不一致会导致图标永远显示不出来
+        let icon = IconData {
+            width: 2,
+            height: 2,
+            rgba_base64: "AAAA".into(),
+        };
+
+        let json = serde_json::to_string(&icon).expect("序列化");
+
+        assert!(json.contains("\"rgbaBase64\""), "实际：{json}");
+        assert!(json.contains("\"width\""));
+        assert!(!json.contains("rgba_base64"));
+    }
+
+    #[test]
+    fn 一个真实尺寸的图标编码后长度符合预期() {
+        // 32x32 的 RGBA 图标 = 4096 字节
+        let pixels = vec![0x7Fu8; 32 * 32 * 4];
+        let encoded = base64_encode(&pixels);
+
+        // 4096 / 3 = 1365 组余 1 字节，所以 1366*4 = 5464 字符
+        assert_eq!(encoded.len(), 5464);
+        assert!(encoded.ends_with("=="), "4096 不能被 3 整除，末尾应有补位");
+    }
+}

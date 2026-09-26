@@ -1,0 +1,97 @@
+# ============================================================
+# 持续集成
+#
+# 每次 push 与 PR 都跑一遍：类型检查、测试、编译。
+# 目的是让"仓库是绿的"这件事随时可验证 —— 而不是等发布时才发现坏了。
+#
+# 注意这里**两个时区都要跑测试**：中国时区没有夏令时，
+# 只跑默认时区的话，datetime 里的夏令时断言会全部跳过，
+# 等于那部分逻辑完全没被验证。详见 README 的「测试」章节。
+# ============================================================
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连续 push 时取消上一次未跑完的任务，省 runner 时间
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI 上不需要增量编译产物，关掉能省缓存体积
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  frontend:
+    name: 前端 · 类型检查与测试
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npx tsc -b --force
+
+      - name: 测试（默认时区）
+        run: npm test
+
+      # 关键：换到有夏令时的时区再跑一遍。
+      # 不加这一步，夏令时相关的断言在 CI 上永远是被 skip 的。
+      - name: 测试（夏令时时区）
+        run: npm run test:dst
+
+      - name: 生产构建
+        run: npx vite build
+
+  backend:
+    name: Rust · 测试与编译
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Tauri 编译时需要前端产物已存在（generate_context! 会读取 dist 目录），
+      # 所以这里必须先构建前端，不能只跑 cargo。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建前端产物
+        run: npx vite build
+
+      - name: 单元测试
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      - name: 编译检查
+        working-directory: src-tauri
+        run: cargo build
+
+      - name: Clippy（只报错不警告，避免 CI 被风格问题刷红）
+        working-directory: src-tauri
+        run: cargo clippy -- -D warnings
+        continue-on-error: true

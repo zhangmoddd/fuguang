@@ -1,6 +1,6 @@
 # 浮光
 
-> 轻量 Windows 桌面悬浮工具箱 —— 一个 9 MB 的小球，解决电脑上那些反复做的琐事。
+> 轻量 Windows 桌面悬浮工具箱 —— 一个 1.3 MB 的安装包，解决电脑上那些反复做的琐事。
 
 浮光常驻在屏幕边缘，是一个可以拖动、可以吸附的小球。
 左键点开主面板，右键弹出快捷菜单。所有功能都收在这个面板里，不用去任务栏找图标。
@@ -172,15 +172,33 @@ Windows 用户可以直接双击仓库里的 bat 脚本，不用敲命令：
 | 项目 | 值 |
 |---|---|
 | 框架 | Tauri 2 + React 18 + TypeScript + Vite |
-| 发布体积 | **约 9 MB 单文件 exe**（开 LTO + opt-level=s + strip） |
-| 安装后占用 | 约 12 MB（exe + WebView2 由系统提供，不重复打包） |
+| **单文件 exe** | **3.74 MB**（实测） |
+| **NSIS 安装包** | **1.32 MB**（实测，压缩后，这是用户实际下载的东西） |
+| 安装后占用 | 约 5.7 MB（exe + 开始菜单快捷方式；WebView2 由系统提供，不重复打包） |
 | 数据占用 | 1000 条文本片段约 300 KB |
-| 内存占用 | 空闲约 45 MB（复用系统 WebView2，不像 Electron 每个实例塞一个浏览器） |
+| 内存占用 | 正式版约 22 MB，开发模式约 45 MB |
 | 前端产物 | JS 231 KB / gzip 70 KB，CSS 20 KB / gzip 4 KB |
 
-编译缓存 `src-tauri/target/` 在开发模式下实测会涨到 **6.6 GB**（带完整调试信息），
-但它已被 `.gitignore` 排除，不进仓库、不随发布分发。
-想回收磁盘双击 `4-清理编译缓存.bat`，代价是下次编译变慢。
+> 以上体积与内存都是**实测值**，不是估算。
+> 曾经这里写的是"约 9 MB"，那是从同类项目抄来的数字、没有验证过；
+> 实测后发现单文件 exe 只有 3.74 MB、安装包只有 1.32 MB，已更正。
+
+体积能压到这么小，靠的是 `Cargo.toml` 里这几项（都只影响发布构建，不影响开发时的增量编译速度）：
+
+```toml
+[profile.release]
+opt-level = "s"   # 优先优化体积而不是速度
+lto = true        # 跨 crate 内联与死代码消除
+codegen-units = 1 # 让 LTO 能看到全部代码
+panic = "abort"   # 去掉 unwind 表
+strip = true      # 剥掉符号
+```
+
+对照：同一份代码的 debug 构建是 **15.17 MB**。
+
+编译缓存 `src-tauri/target/` 已被 `.gitignore` 排除，不进仓库、不随发布分发。
+想回收磁盘双击 `4-清理编译缓存.bat`，代价是下次编译变慢
+（release 全量编译实测 10 分钟）。
 
 ---
 
@@ -348,6 +366,52 @@ npm run check         # 类型检查 + 测试
 > `Copy-Item` 会**保留原文件的修改时间**，还原后文件比编译产物还旧，
 > cargo 会认为"没变化"而继续复用变异版本的缓存。
 > 表现为"明明还原了，测试还是红的"。解法是还原后手动刷新文件 mtime。
+
+---
+
+## 发布流程
+
+### 本地验证打包
+
+```bash
+npm run desktop:build
+```
+
+产物：
+
+| 文件 | 说明 |
+|---|---|
+| `src-tauri/target/release/fuguang.exe` | 单文件绿色版，可直接运行 |
+| `src-tauri/target/release/bundle/nsis/*.exe` | NSIS 安装包，发给普通用户 |
+
+### 自动出包
+
+仓库里有两个 GitHub Actions 工作流：
+
+| 工作流 | 触发时机 | 做什么 |
+|---|---|---|
+| `.github/workflows/ci.yml` | 每次 push 与 PR | 类型检查、两个时区跑前端测试、Rust 测试、编译检查 |
+| `.github/workflows/release.yml` | 打 `v*` tag，或手动触发 | 跑全部测试 → 构建安装包 → 创建 Release（草稿） |
+
+发一个版本：
+
+```bash
+# 1. 改版本号（三处要一致）
+#    package.json / src-tauri/Cargo.toml / src-tauri/tauri.conf.json
+# 2. 更新 CHANGELOG.md
+# 3. 提交并打 tag
+git commit -am "chore: 发布 v0.2.0"
+git tag v0.2.0
+git push origin main --tags
+```
+
+几点刻意的设计：
+
+- **测试不过就不出包**。release 工作流在构建前会跑全部测试，
+  包括换到有夏令时的时区再跑一遍。宁可不出包，也不要把坏版本发出去。
+- **Release 默认是草稿**。自动构建出的安装包没人手动试过，
+  先发草稿、人工确认能装能跑，再点发布。
+- **安装包和裸 exe 都会作为 artifact 上传**，即使 Release 还是草稿也能单独下载来试。
 
 ---
 

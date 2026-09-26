@@ -1,0 +1,110 @@
+# ============================================================
+# 自动发布
+#
+# 打一个形如 v0.2.0 的 tag 并 push，就会：
+#   1. 跑全部测试（测试不过就不出包，避免把坏版本发出去）
+#   2. 构建 Windows 安装包（NSIS）
+#   3. 创建 GitHub Release 并附上安装包
+#
+# 也支持在 Actions 页面手动触发（workflow_dispatch），
+# 用来在正式打 tag 前先验证打包流程本身是通的。
+# ============================================================
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: 构建并发布 Windows 安装包
+    runs-on: windows-latest
+
+    # tauri-action 需要写权限才能创建 Release
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npx tsc -b --force
+
+      # 出包前必须过测试。宁可不出包，也不要把坏版本发出去。
+      - name: 测试（默认时区）
+        run: npm test
+
+      - name: 测试（夏令时时区）
+        run: npm run test:dst
+
+      - name: Rust 单元测试
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      - name: 构建并发布
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # 用 tag 名作为 Release 标题；手动触发时给一个占位名
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}-manual', github.run_number) }}
+          releaseName: 浮光 ${{ github.ref_type == 'tag' && github.ref_name || '手动构建' }}
+          # 先发成草稿，人工确认安装包没问题后再点发布
+          releaseDraft: true
+          prerelease: false
+          releaseBody: |
+            ## 安装
+
+            下载下面的 `浮光_x.x.x_x64-setup.exe`，双击安装。
+            不需要装 Node.js、不需要 Rust、不需要 WebView2 运行库（Windows 10/11 自带）。
+
+            安装后从开始菜单启动，屏幕右侧会出现一个蓝色小球。
+
+            ## 使用提示
+
+            - **左键点小球**展开主面板，**右键**弹出快捷菜单，**按住可拖动**
+            - 面板里按 `Esc` 收起，按 `1`~`9` 快速切换页签
+            - 数据存在 `%APPDATA%\浮光\`，纯 JSON 文本，可以直接备份或手动编辑
+            - 卸载不会删除数据；想彻底清理请手动删掉那个文件夹
+
+            ## 这个版本有什么
+
+            详见 [CHANGELOG](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)。
+
+            ## 已知限制
+
+            - 主面板打开时会取得焦点，你原来程序里的光标会暂时看不见
+              （粘贴那一刻会还回去，插入位置不受影响）
+            - 数据未加密，敏感内容只有列表遮罩这一层视觉保护
+            - 暂无全局热键，只能通过小球或托盘唤出面板
+
+            完整列表见 [README 的「已知限制」](https://github.com/${{ github.repository }}#已知限制)。
+
+      - name: 上传构建产物（即使 Release 是草稿也能单独下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuguang-windows-installer
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/fuguang.exe
+          if-no-files-found: error
+          retention-days: 30

@@ -1,6 +1,7 @@
 /* ============================================================
    浮光 · 样式
-   设计取向：深色半透明玻璃感，低对比、不抢眼，符合「常驻悬浮小工具」的定位。
+   设计取向：浅色、干净、低干扰。白底配深灰字（不用纯黑），
+   长时间看文档和搜索结果不刺眼；蓝色作为唯一强调色。
    窗口是 transparent 的，所以所有圆角与投影都靠 CSS 画。
    ============================================================ */
 
@@ -9,21 +10,33 @@
      刻意接近不透明：浮光常驻在其他窗口之上，如果背景太透，
      桌面上的文字、数字、图表会透过来和面板内容混在一起，搜索和阅读都很累。
      留一点点透明度 + backdrop-filter 只为保住边缘的玻璃质感。 */
-  --bg: rgba(23, 25, 31, 0.985);
-  --bg-solid: #17191f;
-  --bg-raised: rgba(255, 255, 255, 0.055);
-  --bg-hover: rgba(255, 255, 255, 0.09);
-  --border: rgba(255, 255, 255, 0.1);
-  --border-strong: rgba(255, 255, 255, 0.16);
+  --bg: rgba(255, 255, 255, 0.985);
+  --bg-solid: #ffffff;
 
-  --text: #e8eaf0;
-  --text-dim: #9aa0b0;
-  --text-faint: #6b7183;
+  /* 抬起面与悬停面：浅色主题下用「加深」而不是「提亮」来表示层级。
+     深色主题里是白色低透明度叠加，这里必须换成黑色低透明度，否则看不出层次。
+     数值比深色主题略大：白底上 3% 的黑几乎不可见，按钮会显得没有实体感。 */
+  --bg-raised: rgba(0, 0, 0, 0.045);
+  --bg-hover: rgba(0, 0, 0, 0.078);
+  --border: rgba(0, 0, 0, 0.1);
+  --border-strong: rgba(0, 0, 0, 0.16);
 
-  --accent: #5b9dff;
-  --accent-soft: rgba(91, 157, 255, 0.16);
-  --danger: #ff6b6b;
-  --success: #4ec9a0;
+  /* 正文用深灰 #1f2430 而不是纯黑：纯黑在白底上对比过硬，看久了发涩。
+     三级文字层次（白底对比度）：正文 15.5 / 次要 6.2 / 弱化 4.8。 */
+  --text: #1f2430;
+  --text-dim: #5a6270;
+  --text-faint: #6b7280;
+
+  /* 强调蓝比深色主题下深得多：#5b9dff 这种浅蓝在白底上对比度不足，读不清。
+     #1d4ed8 在白底 6.7:1、在悬停面 5.6:1，两种背景上都满足正文可读性。
+     下面这些值不是随手挑的，都过了 WCAG 对比度检查：
+       危险 #d92d20 = 4.8:1   成功 #0b7a58 = 5.3:1
+     星标琥珀 #b8791a = 3.6:1（图标，门槛 3.0）
+     改色时请重新算一遍对比度，浅色主题下很容易配出「看着有颜色但读不清」的组合。 */
+  --accent: #1d4ed8;
+  --accent-soft: rgba(29, 78, 216, 0.1);
+  --danger: #d92d20;
+  --success: #0b7a58;
 
   --radius: 12px;
   --radius-sm: 8px;
@@ -66,11 +79,11 @@ textarea {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.16);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.24);
+  background: rgba(0, 0, 0, 0.28);
 }
 
 /* ============================================================
@@ -99,16 +112,19 @@ textarea {
   justify-content: center;
   cursor: grab;
   background: radial-gradient(circle at 32% 28%, #6aa8ff 0%, #3d6fd6 55%, #2b4fa0 100%);
+  /* 投影比深色主题下轻：浅色桌面上重投影会显得很脏。
+     再加一圈很淡的白边，让蓝球在白色/浅色壁纸上也能和背景分开。 */
   box-shadow:
-    0 3px 14px rgba(0, 0, 0, 0.45),
+    0 2px 10px rgba(0, 0, 0, 0.28),
     inset 0 1px 1px rgba(255, 255, 255, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.55);
   transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
 
 .ball:hover {
   transform: scale(1.06);
   box-shadow:
-    0 5px 18px rgba(0, 0, 0, 0.5),
+    0 4px 16px rgba(0, 0, 0, 0.34),
     inset 0 1px 1px rgba(255, 255, 255, 0.45);
 }
 
@@ -195,7 +211,7 @@ textarea {
 }
 
 .iconbtn--danger:hover {
-  background: rgba(255, 107, 107, 0.16);
+  background: rgba(217, 45, 32, 0.12);
   color: var(--danger);
 }
 
@@ -244,7 +260,7 @@ textarea {
   font-size: 9px;
   padding: 1px 4px;
   border-radius: 4px;
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.06);
   color: var(--text-faint);
 }
 
@@ -287,12 +303,12 @@ textarea {
 
 .btn--primary {
   background: var(--accent-soft);
-  border-color: rgba(91, 157, 255, 0.4);
+  border-color: rgba(29, 78, 216, 0.42);
   color: var(--accent);
 }
 
 .btn--primary:hover {
-  background: rgba(91, 157, 255, 0.26);
+  background: rgba(29, 78, 216, 0.16);
 }
 
 /* ============================================================
@@ -357,8 +373,8 @@ textarea {
   gap: 6px;
   margin: 0 10px 6px;
   padding: 6px 9px;
-  background: rgba(78, 201, 160, 0.13);
-  border: 1px solid rgba(78, 201, 160, 0.3);
+  background: rgba(11, 122, 88, 0.1);
+  border: 1px solid rgba(11, 122, 88, 0.28);
   border-radius: var(--radius-sm);
   color: var(--success);
   font-size: 12px;
@@ -368,8 +384,8 @@ textarea {
 .snip__error {
   margin: 0 10px 6px;
   padding: 6px 9px;
-  background: rgba(255, 107, 107, 0.13);
-  border: 1px solid rgba(255, 107, 107, 0.3);
+  background: rgba(217, 45, 32, 0.08);
+  border: 1px solid rgba(217, 45, 32, 0.26);
   border-radius: var(--radius-sm);
   color: var(--danger);
   font-size: 12px;
@@ -414,7 +430,7 @@ textarea {
 }
 
 .card__star {
-  color: #ffc857;
+  color: #b8791a;
   flex-shrink: 0;
 }
 
@@ -430,7 +446,7 @@ textarea {
   font-size: 10px;
   padding: 1px 5px;
   border-radius: 4px;
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.055);
   color: var(--text-faint);
   flex-shrink: 0;
 }
@@ -511,7 +527,7 @@ textarea {
 
 .field__input {
   width: 100%;
-  background: rgba(0, 0, 0, 0.28);
+  background: rgba(0, 0, 0, 0.04);
   border: 1px solid var(--border);
   border-radius: 7px;
   padding: 6px 8px;
@@ -521,7 +537,7 @@ textarea {
 }
 
 .field__input:focus {
-  border-color: rgba(91, 157, 255, 0.55);
+  border-color: rgba(29, 78, 216, 0.55);
 }
 
 .field__input--area {
@@ -611,7 +627,7 @@ textarea {
   background: var(--bg-solid);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
-  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
 }
 
 .alert__icon {
@@ -651,7 +667,7 @@ textarea {
   gap: 5px;
   padding: 7px 14px;
   background: var(--accent-soft);
-  border: 1px solid rgba(91, 157, 255, 0.4);
+  border: 1px solid rgba(29, 78, 216, 0.42);
   border-radius: 8px;
   color: var(--accent);
   font-size: 12.5px;
@@ -661,5 +677,5 @@ textarea {
 }
 
 .alert__ok:hover {
-  background: rgba(91, 157, 255, 0.26);
+  background: rgba(29, 78, 216, 0.16);
 }

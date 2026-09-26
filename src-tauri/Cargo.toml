@@ -1,0 +1,49 @@
+[package]
+name = "fuguang"
+version = "0.1.0"
+description = "浮光 - 轻量 Windows 桌面悬浮工具箱"
+authors = ["fuguang contributors"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+# Tauri 2 要求移动端使用 cdylib/staticlib；桌面端用 rlib 让 main.rs 调用。
+name = "fuguang_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    # 剪贴板读写（CF_UNICODETEXT）
+    "Win32_System_DataExchange",
+    # 全局内存分配（剪贴板需要 HGLOBAL）
+    "Win32_System_Memory",
+    # 线程 ID 查询与 AttachThreadInput（把焦点还给目标窗口的关键）
+    "Win32_System_Threading",
+    # 基础窗口/线程 API
+    "Win32_Foundation",
+    # 模拟 Ctrl+V
+    "Win32_UI_Input_KeyboardAndMouse",
+    # 取前台窗口、设置前台窗口、取窗口标题
+    "Win32_UI_WindowsAndMessaging",
+    # 打开文件夹、ShellExecute
+    "Win32_UI_Shell",
+] }
+
+# 发布构建体积优化：用户下载的就是这个 exe，尽量压小。
+# 开发构建不受影响，仍然保持增量编译速度。
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

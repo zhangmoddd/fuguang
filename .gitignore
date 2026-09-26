@@ -1,0 +1,49 @@
+# ============================================================
+# 浮光 · Git 忽略规则
+#
+# 重点：src-tauri/target 是 Rust 编译缓存，实测会涨到 1.7 GB 以上。
+# 它绝对不能进仓库，否则一次 push 就是几个 GB，仓库直接废掉。
+# ============================================================
+
+# --- Rust 编译产物（体积元凶）---
+/src-tauri/target/
+**/*.rs.bk
+*.pdb
+
+# --- 前端依赖与构建产物 ---
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# TypeScript 增量编译缓存（每个项目会生成两个，属于本地产物）
+*.tsbuildinfo
+
+# --- Tauri 生成的中间文件 ---
+/src-tauri/gen/schemas/
+
+# --- 编辑器与系统文件 ---
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# --- Windows 系统文件 ---
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- 日志与临时文件 ---
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tmp
+
+# --- 用户数据（浮光的数据在 %APPDATA%\浮光，正常不会出现在这里，
+#     但开发时如果手动建了 data 目录也不要提交）---
+/data/

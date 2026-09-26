@@ -1,0 +1,31 @@
+{
+  "name": "fuguang",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "浮光 - 轻量 Windows 桌面悬浮工具箱",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.2.0",
+    "@tauri-apps/plugin-opener": "^2.2.5",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "@tauri-apps/cli": "^2.8.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}

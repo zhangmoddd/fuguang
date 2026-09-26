@@ -213,6 +213,18 @@ pub struct Settings {
     /// 提醒弹窗是否播放提示音。
     #[serde(default = "default_true")]
     pub alert_sound: bool,
+
+    /// 是否启用全局热键唤出面板。
+    ///
+    /// 默认开启：不开的话这个功能根本不会被发现，
+    /// 而它恰恰是"不点小球也能用"的关键。组合键选了冲突概率很低的
+    /// `Ctrl+Shift+Space`，真的撞上了设置页会明确报错。
+    #[serde(default = "default_true")]
+    pub hotkey_enabled: bool,
+
+    /// 全局热键组合，例如 `Ctrl+Shift+Space`。
+    #[serde(default = "default_hotkey")]
+    pub hotkey: String,
 }
 
 fn default_restore_delay() -> u64 {
@@ -220,6 +232,9 @@ fn default_restore_delay() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_hotkey() -> String {
+    "Ctrl+Shift+Space".into()
 }
 
 impl Default for Settings {
@@ -229,6 +244,8 @@ impl Default for Settings {
             paste_restore_delay_ms: default_restore_delay(),
             panel_always_on_top: true,
             alert_sound: true,
+            hotkey_enabled: true,
+            hotkey: default_hotkey(),
         }
     }
 }
@@ -343,6 +360,31 @@ mod tests {
         assert!(s.alert_sound, "提示音默认开着");
         assert!(s.panel_always_on_top);
         assert_eq!(s.paste_restore_delay_ms, 120);
+        // 热键默认开启：不开的话这个功能根本不会被发现
+        assert!(s.hotkey_enabled);
+        assert_eq!(s.hotkey, "Ctrl+Shift+Space");
+    }
+
+    #[test]
+    fn 老版本设置文件缺少热键字段时用默认值() {
+        // 场景：用户在热键功能上线之前就已经在用了，settings.json 里没有这两个字段
+        let json = r#"{
+            "autostart": true,
+            "pasteRestoreDelayMs": 200,
+            "panelAlwaysOnTop": false,
+            "alertSound": false
+        }"#;
+
+        let s: Settings = serde_json::from_str(json).expect("老设置必须能解析");
+
+        // 用户显式设过的值必须保留
+        assert!(s.autostart);
+        assert_eq!(s.paste_restore_delay_ms, 200);
+        assert!(!s.panel_always_on_top);
+        assert!(!s.alert_sound);
+        // 没设过的字段补默认值
+        assert!(s.hotkey_enabled);
+        assert_eq!(s.hotkey, "Ctrl+Shift+Space");
     }
 
     #[test]

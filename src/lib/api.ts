@@ -117,6 +117,10 @@ export interface Settings {
   pasteRestoreDelayMs: number;
   panelAlwaysOnTop: boolean;
   alertSound: boolean;
+  /** 是否启用全局热键唤出面板。 */
+  hotkeyEnabled: boolean;
+  /** 全局热键组合，例如 `Ctrl+Shift+Space`。 */
+  hotkey: string;
 }
 
 // ===============================================================
@@ -176,6 +180,20 @@ export const api = {
   autostartGet: () => invoke<boolean>("autostart_get"),
   autostartSet: (enabled: boolean) => invoke<void>("autostart_set", { enabled }),
   currentExe: () => invoke<string>("current_exe"),
+
+  // ---- 全局热键 ----
+  /**
+   * 取**当前实际生效**的热键文本。
+   *
+   * 注意这不是设置里存的值：注册可能失败（组合键被别的程序占用），
+   * 这时存着却没生效。要显示真实状态就必须用这个。
+   */
+  hotkeyCurrent: () => invoke<string | null>("hotkey_current"),
+  /** 应用热键设置。注册失败会返回可读的中文原因，必须显示给用户。 */
+  hotkeyApply: (enabled: boolean, combo: string) =>
+    invoke<void>("hotkey_apply", { enabled, combo }),
+  /** 只校验组合键文本是否合法，不实际注册。用于输入时的即时提示。 */
+  hotkeyValidate: (combo: string) => invoke<string>("hotkey_validate", { combo }),
 };
 
 // ===============================================================

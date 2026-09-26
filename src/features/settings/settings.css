@@ -171,3 +171,49 @@
   font-size: 11px;
   line-height: 1.55;
 }
+
+/* ---------- 全局热键录制器 ---------- */
+
+.settings__hotkey {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 24px;
+}
+
+/* 做成按钮而不是 input：录制时它不接收文本输入，
+   只是"按下组合键"的落点，用按钮语义更准确（也能聚焦以接收 keydown）。 */
+.settings__recorder {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  padding: 6px 9px;
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+  cursor: pointer;
+  outline: none;
+}
+
+.settings__recorder:hover {
+  border-color: var(--border-strong);
+}
+
+/* 录制中用强调色描边 + 虚线，让"正在等待按键"这件事一眼可见 */
+.settings__recorder--recording {
+  border-color: var(--accent);
+  border-style: dashed;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.settings__code--inline {
+  display: inline;
+  padding: 2px 5px;
+  font-size: 11.5px;
+  color: var(--accent);
+}
+

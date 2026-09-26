@@ -7,6 +7,7 @@
 //! - [`launcher`]  启动外部程序、打开文件夹与网址
 //! - [`linkicon`]  从 exe/文件提取图标
 //! - [`autostart`] 开机自启（注册表）
+//! - [`hotkey`]    全局热键唤出面板
 //!
 //! 数据与调度
 //! - [`models`]     数据模型（时间语义见该文件顶部）
@@ -23,6 +24,7 @@
 mod autostart;
 mod ballmenu;
 mod commands;
+mod hotkey;
 mod launcher;
 mod linkicon;
 mod models;
@@ -83,6 +85,9 @@ pub fn run() {
             commands::autostart_get,
             commands::autostart_set,
             commands::current_exe,
+            commands::hotkey_current,
+            commands::hotkey_apply,
+            commands::hotkey_validate,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -102,6 +107,24 @@ pub fn run() {
 
             // 启动调度线程：倒计时、番茄钟、备忘录提醒都靠它
             scheduler::start(handle.clone());
+
+            // 启动全局热键线程，并按保存的设置注册组合键。
+            // 顺序不能反：apply 需要先拿到热键线程的 id 才能唤醒它。
+            hotkey::start(handle.clone());
+            {
+                let store = handle.state::<state::Store>();
+                let (enabled, combo) = {
+                    let st = store.lock();
+                    (st.settings.hotkey_enabled, st.settings.hotkey.clone())
+                };
+                if enabled {
+                    if let Err(err) = hotkey::apply(Some(&combo)) {
+                        // 不阻断启动：热键只是"快捷方式"，
+                        // 小球和托盘仍然可用，用户能在设置页里改一个没冲突的组合。
+                        eprintln!("[浮光] 全局热键「{combo}」注册失败：{err}");
+                    }
+                }
+            }
 
             // 启动前台窗口跟踪线程。
             // 目的：记住「用户上一次真正在用的窗口」，这样点击文本片段时

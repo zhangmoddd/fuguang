@@ -26,7 +26,7 @@ use tauri::{AppHandle, Manager};
 use crate::linkicon::IconData;
 use crate::models::{Link, Memo, Settings, Timer};
 use crate::state::{self, Store};
-use crate::{autostart, ballmenu, launcher, linkicon, platform, storage, windows};
+use crate::{autostart, ballmenu, hotkey, launcher, linkicon, platform, storage, windows};
 
 // ===============================================================
 // 窗口与进程
@@ -386,4 +386,53 @@ pub async fn autostart_set(app: AppHandle, enabled: bool) -> Result<(), String> 
 #[tauri::command]
 pub async fn current_exe() -> Result<String, String> {
     autostart::current_exe_path()
+}
+
+// ===============================================================
+// 全局热键
+// ===============================================================
+
+/// 取**当前实际生效**的热键文本。
+///
+/// 刻意不返回设置里存的值，而是返回真正注册成功的那个。
+/// 因为注册可能失败（组合键被别的程序占用），
+/// 这时设置里存着、实际却没生效——只显示存的值会骗用户。
+#[tauri::command]
+pub async fn hotkey_current() -> Option<String> {
+    hotkey::current()
+}
+
+/// 应用热键设置。
+///
+/// `enabled` 为 false 时注销；为 true 时按 `combo` 注册。
+/// 注册失败会返回明确的中文原因，**调用方必须把它显示给用户**，
+/// 不能静默失效——否则用户会以为热键开着，然后一直按一直没反应。
+#[tauri::command]
+pub async fn hotkey_apply(
+    app: AppHandle,
+    enabled: bool,
+    combo: String,
+) -> Result<(), String> {
+    hotkey::apply(if enabled { Some(combo.as_str()) } else { None })?;
+
+    // 注册成功后再落盘，避免"存了一个用不了的组合键"
+    let saved = {
+        let store = app.state::<Store>();
+        let mut st = store.lock();
+        st.settings.hotkey_enabled = enabled;
+        if enabled {
+            st.settings.hotkey = combo;
+        }
+        st.settings.clone()
+    };
+    state::save_settings(&app, &saved)
+}
+
+/// 校验一个热键文本是否合法，不实际注册。
+///
+/// 设置页用它做即时提示，让用户在按下组合键的当下就知道能不能用，
+/// 而不是等到点保存才报错。
+#[tauri::command]
+pub async fn hotkey_validate(combo: String) -> Result<String, String> {
+    hotkey::parse(&combo).map(|c| c.label)
 }

@@ -1,32 +1,40 @@
 @echo off
-chcp 65001 >nul
 setlocal
 
-rem ============================================================
-rem  浮光 · 直接启动（跑已编译好的正式版 exe）
+rem ===========================================================
+rem  Fuguang - Run Release Build
 rem
-rem  不启动开发服务器、不编译，启动最快。
-rem  前提是你已经跑过一次「2-重新编译.bat」。
-rem ============================================================
+rem  Starts the already-compiled release exe. No dev server, no
+rem  compilation, fastest startup.
+rem
+rem  Requires that you ran the rebuild script (script 2) at least
+rem  once before.
+rem
+rem  ---------------------------------------------------------
+rem  IMPORTANT FOR CONTRIBUTORS
+rem  ASCII-only + CRLF on purpose. See the dev-mode script
+rem  header for the full reason.
+rem  ---------------------------------------------------------
+rem ===========================================================
 
 cd /d "%~dp0"
 
 set "EXE=%~dp0src-tauri\target\release\fuguang.exe"
 
 if not exist "%EXE%" (
-    echo ============================================================
-    echo  还没有编译好的正式版。
+    echo ===========================================================
+    echo  No release build found yet.
     echo.
-    echo  请先双击「2-重新编译.bat」编译一次，
-    echo  之后再回到这里就能秒启动了。
+    echo  Please run the rebuild script once to compile it,
+    echo  then come back here for instant startup.
     echo.
-    echo  如果你只是想改代码看效果，
-    echo  请双击「1-开发模式.bat」。
-    echo ============================================================
+    echo  If you only want to code and see changes live,
+    echo  run the dev-mode script instead.
+    echo ===========================================================
     pause
     exit /b 1
 )
 
-echo 正在启动浮光...
+echo Starting Fuguang...
 start "" "%EXE%"
 exit /b 0

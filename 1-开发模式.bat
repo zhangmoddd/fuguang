@@ -1,49 +1,59 @@
 @echo off
-chcp 65001 >nul
 setlocal
 
-rem ============================================================
-rem  浮光 · 开发模式
+rem ===========================================================
+rem  Fuguang - Development Mode
 rem
-rem  这是你日常最常用的入口。
-rem  它跑的是真正的桌面程序（真悬浮窗、真全局按键），
-rem  但前端代码改动会热更新——存盘窗口自己就变，不需要重新编译 exe。
+rem  This is the one you use every day.
 rem
-rem  只有 Rust 代码（src-tauri\src 下的 .rs 文件）改了才会触发重新编译，
-rem  而且是增量编译，通常几秒到几十秒，不会像第一次那样等十几分钟。
-rem ============================================================
+rem  It runs the REAL desktop app (real floating window, real
+rem  global input), but the frontend hot-reloads: save a file
+rem  under src\ and the window updates by itself. No exe build.
+rem
+rem  Only changes under src-tauri\src\ (Rust) trigger a rebuild,
+rem  and that is incremental - seconds, not the first-time minutes.
+rem
+rem  ---------------------------------------------------------
+rem  IMPORTANT FOR CONTRIBUTORS
+rem  This file is deliberately ASCII-only and uses CRLF line
+rem  endings. Batch files on Chinese Windows get garbled or hang
+rem  when they mix UTF-8 text with chcp, and LF-only endings break
+rem  if-blocks and goto labels. Keep both properties when editing.
+rem  ---------------------------------------------------------
+rem ===========================================================
 
 cd /d "%~dp0"
 
 where npm >nul 2>nul
 if errorlevel 1 (
-    echo [错误] 没有找到 npm，请先安装 Node.js：https://nodejs.org/
+    echo [ERROR] npm not found. Please install Node.js first:
+    echo         https://nodejs.org/
     pause
     exit /b 1
 )
 
 if not exist "node_modules" (
-    echo [1/2] 首次运行，正在安装前端依赖，请稍等...
+    echo [1/2] First run: installing frontend dependencies...
     call npm install
     if errorlevel 1 (
-        echo [错误] 依赖安装失败。
+        echo [ERROR] npm install failed.
         pause
         exit /b 1
     )
 )
 
 echo.
-echo ============================================================
-echo  正在启动浮光开发模式
+echo ===========================================================
+echo  Starting Fuguang in DEVELOPMENT mode
 echo.
-echo  · 修改 src\ 下的前端代码：存盘即生效，不用重启
-echo  · 修改 src-tauri\src\ 下的 Rust 代码：会自动重新编译
-echo  · 关掉这个黑窗口就等于退出浮光
-echo ============================================================
+echo   edit  src\          -^> saved = applied instantly
+echo   edit  src-tauri\src -^> triggers an incremental rebuild
+echo   close this window   -^> quits Fuguang
+echo ===========================================================
 echo.
 
 call npm run desktop:dev
 
 echo.
-echo 浮光已退出。
+echo Fuguang has exited.
 pause

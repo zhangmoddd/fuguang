@@ -1,0 +1,33 @@
+# ============================================================
+# 换行符策略
+#
+# 这个文件不是可选项。Git 的 core.autocrlf 会在检出时转换换行符，
+# 如果不管，别人克隆仓库后 .bat 可能被转成 LF，
+# 于是又变成「双击没反应」。见 README「踩过的坑」第 9 条。
+#
+# ⚠️ 顺序很重要：.gitattributes 里**后面的规则覆盖前面的**。
+#    所以通用的 `* text=auto` 必须写在前面，
+#    针对 .bat 的 CRLF 规则必须写在后面，否则会被通配规则吃掉。
+# ============================================================
+
+# 1) 通用规则：交给 Git 自动判断文本/二进制，文本统一 LF
+* text=auto eol=lf
+
+# 2) 特例：Windows 批处理文件无论用户怎么配置 Git，检出时都必须是 CRLF。
+#    这条必须排在通用规则之后才生效。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 3) 二进制文件不要做任何换行转换
+*.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.exe binary
+*.dll binary
+*.pdb binary

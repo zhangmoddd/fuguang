@@ -617,22 +617,32 @@ textarea {
    提醒弹窗
    ============================================================ */
 
+/* 布局从"横向一行"改成"上图标+标题 / 中间内容 / 右下按钮"。
+   原因：错过提醒的汇总最多会列 8 条，横向布局装不下，
+   而且横向时内容区没有明确的滚动边界。 */
 .alert {
   width: 100%;
   height: 100%;
   display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 18px;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 18px;
   background: var(--bg-solid);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
 }
 
+.alert__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
 .alert__icon {
-  width: 42px;
-  height: 42px;
+  width: 34px;
+  height: 34px;
   border-radius: 50%;
   display: flex;
   align-items: center;
@@ -642,30 +652,38 @@ textarea {
   flex-shrink: 0;
 }
 
+/* 内容区可滚动：汇总提醒可能很长，不能把按钮顶出窗口 */
 .alert__content {
   flex: 1;
-  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .alert__title {
   font-size: 14px;
   font-weight: 600;
-  margin-bottom: 5px;
   word-break: break-word;
 }
 
 .alert__body {
   font-size: 12.5px;
   color: var(--text-dim);
-  line-height: 1.55;
+  line-height: 1.7;
   word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.alert__actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-shrink: 0;
 }
 
 .alert__ok {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 7px 14px;
+  padding: 7px 16px;
   background: var(--accent-soft);
   border: 1px solid rgba(29, 78, 216, 0.42);
   border-radius: 8px;

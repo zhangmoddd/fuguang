@@ -1,32 +1,838 @@
 /**
- * 计时器功能（第一版为占位，显示已确定的设计规格）。
+ * 计时器功能：倒计时 / 番茄钟 / 秒表。
  *
- * 已确定的设计决策（实现时按这些做，不要重新发明）：
- * - 三种模式：倒计时 / 番茄钟 / 秒表
- * - 倒计时存「绝对结束时刻」而不是剩余秒数，关机重启后仍然准确
- * - 结束后弹置顶提醒窗 + 提示音，且不抢焦点
- * - 支持多路倒计时并行，每条可命名、可暂停/继续/重置
+ * # 为什么前端只管显示，不管计时
+ *
+ * 面板平时是隐藏的，隐藏的 WebView 里 `setInterval` 会被系统降频
+ * （见 `src-tauri/src/scheduler.rs` 顶部的说明）。如果让前端自己数秒，
+ * 倒计时会越走越慢、提醒会漏。
+ *
+ * 所以权威时钟在 Rust 侧，前端只做两件事：
+ * 1. 把「开始 / 暂停 / 重置」算成**绝对时刻**写回去（`timerSave`）
+ * 2. 每 100ms 用 `Date.now()` 重画一次剩余时间
+ *
+ * 两边共用同一个系统时钟，不做任何"剩余秒数"的传递，也就不会各算一套。
+ *
+ * # 三种模式共用一个 Timer 结构
+ *
+ * 靠 `kind` 区分，各自只用自己那部分字段（字段语义见 `src/lib/api.ts`）。
+ * 它们混在同一个列表里，每条都有用户自己起的名字，运行中的排在最前面。
  */
-import { Clock } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Clock,
+  Flag,
+  Pause,
+  Play,
+  Plus,
+  RotateCcw,
+  Square,
+  Trash2,
+} from "lucide-react";
 
+import { api, newId, onStateChanged } from "../../lib/api";
+import type { PomodoroPhase, Timer, TimerKind } from "../../lib/api";
+import { formatDuration, formatMoment, formatStopwatch } from "../../lib/datetime";
 import type { FeatureModule } from "../registry";
 
+import "./timer.css";
+
+/** 重画间隔。取 100ms 而不是 1s：秒表带百分秒，一秒一跳会明显发顿。 */
+const TICK_MS = 100;
+
+/**
+ * 老数据（`durationMs` 为 null）的兜底时长。
+ *
+ * `durationMs` 是后补的字段：在它出现之前建的倒计时反序列化出来是 null，
+ * 那种情况只能猜一个——暂停中的用剩余值，否则按 5 分钟算。
+ * 新数据一律走 `durationMs`，不会再猜。
+ */
+const LEGACY_COUNTDOWN_MS = 5 * 60_000;
+
+/** 卡片当前处于哪个状态。四种状态决定按钮组合，也决定排序。 */
+type CardState = "idle" | "running" | "paused" | "done";
+
+const KIND_LABEL: Record<TimerKind, string> = {
+  countdown: "倒计时",
+  pomodoro: "番茄钟",
+  stopwatch: "秒表",
+};
+
+const STATE_LABEL: Record<CardState, string> = {
+  idle: "未开始",
+  running: "运行中",
+  paused: "已暂停",
+  done: "已完成",
+};
+
+/** 新建表单里的快捷时长，单位分钟。 */
+const QUICK_MINUTES = [5, 10, 25, 60];
+
+// ===============================================================
+// 纯函数：状态判断与时间换算
+// ===============================================================
+
+/**
+ * 这条计时器是否"正在走"。
+ *
+ * 秒表看 `runningSince`，倒计时与番茄钟看 `endsAt`。
+ * `fired` 的倒计时在 Rust 侧已经把 `endsAt` 清空了，这里不用额外判断。
+ */
+function isRunning(t: Timer): boolean {
+  if (t.kind === "stopwatch") return t.runningSince !== null;
+  return t.endsAt !== null && !t.fired;
+}
+
+/** 排序：运行中的排最前，其余按创建时间倒序（刚新建的在上面）。 */
+function sortTimers(list: Timer[]): Timer[] {
+  return [...list].sort((a, b) => {
+    const ra = isRunning(a) ? 1 : 0;
+    const rb = isRunning(b) ? 1 : 0;
+    if (ra !== rb) return rb - ra;
+    return b.createdAt - a.createdAt;
+  });
+}
+
+/** 把一条计时器并进列表：已存在就替换，否则插到最前面。 */
+function upsert(list: Timer[], timer: Timer): Timer[] {
+  return list.some((t) => t.id === timer.id)
+    ? list.map((t) => (t.id === timer.id ? timer : t))
+    : [timer, ...list];
+}
+
+/** 倒计时 / 番茄钟还剩多少毫秒：运行中按 `endsAt` 现算，暂停时用存下来的值。 */
+function remainingOf(t: Timer, now: number): number {
+  if (t.endsAt !== null) return Math.max(0, t.endsAt - now);
+  return Math.max(0, t.remainingMs ?? 0);
+}
+
+/** 番茄钟当前阶段的时长。`phase` 为空按专注算（新建时写的就是 focus）。 */
+function phaseMs(t: Timer): number {
+  return (t.phase === "break" ? t.breakMinutes : t.focusMinutes) * 60_000;
+}
+
+/**
+ * 倒计时的设定时长。
+ *
+ * 正常就是 `durationMs`——它是持久化字段，所以「重置」和「重新开始」
+ * 都能拿回用户当初设的时长，软件重启也不会丢。
+ * 只有老数据（该字段为 null）才需要临时猜一个值。
+ */
+function durationOf(t: Timer): number {
+  if (t.durationMs !== null && t.durationMs > 0) return t.durationMs;
+  if (t.remainingMs !== null && t.remainingMs > 0) return t.remainingMs;
+  return LEGACY_COUNTDOWN_MS;
+}
+
+/** 秒表已用毫秒 = 已累计的那部分 + 正在跑的这一段。 */
+function elapsedOf(t: Timer, now: number): number {
+  const running = t.runningSince === null ? 0 : Math.max(0, now - t.runningSince);
+  return t.elapsedMs + running;
+}
+
+/**
+ * 判断卡片状态。
+ *
+ * 注意「未开始」和「暂停中」在字段上很像（都是 `endsAt` 为空），
+ * 区别只在 `remainingMs` 有没有值：有值说明跑过一段、被暂停了。
+ */
+function stateOf(t: Timer): CardState {
+  if (t.kind === "stopwatch") {
+    if (t.runningSince !== null) return "running";
+    return t.elapsedMs > 0 ? "paused" : "idle";
+  }
+  // fired 只对倒计时有意义：番茄钟到点时 Rust 会在同一个 tick 里
+  // 把 phase / endsAt / fired 一起改好，不会停在"已完成"上
+  // （见 src-tauri/src/scheduler.rs 的 Pomodoro 分支）。
+  if (t.kind === "countdown" && t.fired) return "done";
+  if (t.endsAt !== null) return "running";
+  return t.remainingMs !== null ? "paused" : "idle";
+}
+
+/** 卡片中间那行大号时间。 */
+function mainTime(t: Timer, state: CardState, now: number): string {
+  if (t.kind === "stopwatch") return formatStopwatch(elapsedOf(t, now));
+  // 未开始的两种计时器显示"将会有多长"，比显示 00:00 有用：
+  // 重置之后用户就是靠这个数字确认设定时长还在
+  if (state === "idle") {
+    return formatDuration(t.kind === "pomodoro" ? phaseMs(t) : durationOf(t));
+  }
+  return formatDuration(remainingOf(t, now));
+}
+
+/** 卡片上的小字：各模式自己有用的附加信息。 */
+function metaOf(t: Timer, state: CardState): string {
+  if (t.kind === "countdown") {
+    // 把设定时长显示出来：用户重置之后能一眼确认"我要倒多久"没丢。
+    // durationMs 为 null 的老数据不显示，免得把一个猜出来的值当成用户设定。
+    const preset = t.durationMs === null ? "" : `设定 ${formatDuration(t.durationMs)}`;
+    // 倒计时存的就是绝对结束时刻，运行中还要告诉用户"几点结束"
+    if (state === "running" && t.endsAt !== null) {
+      const ends = `结束于 ${formatMoment(t.endsAt)}`;
+      return preset ? `${ends} · ${preset}` : ends;
+    }
+    if (state === "idle") return preset ? `${preset} · 尚未开始` : "";
+    return preset;
+  }
+  if (t.kind === "pomodoro") {
+    const phase = t.phase === "break" ? "休息" : "专注";
+    return `${phase}阶段 · ${t.focusMinutes} 分专注 / ${t.breakMinutes} 分休息 · 已完成 ${t.rounds} 轮`;
+  }
+  return t.laps.length > 0 ? `共 ${t.laps.length} 次计次` : "";
+}
+
+/** 用户没填名字时，按模式给一个能一眼看懂的名字。 */
+function defaultName(
+  kind: TimerKind,
+  countdownMs: number,
+  focusMinutes: number,
+  breakMinutes: number,
+): string {
+  if (kind === "countdown") return `倒计时 ${formatDuration(countdownMs)}`;
+  if (kind === "pomodoro") return `番茄钟 ${focusMinutes}/${breakMinutes}`;
+  return "秒表";
+}
+
+// ===============================================================
+// 主界面
+// ===============================================================
+
 export function TimerPanel() {
+  const [timers, setTimers] = useState<Timer[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+
+  /**
+   * 所有卡片共用的"现在"。
+   *
+   * 放在组件里统一推进，而不是每条卡片各自开一个定时器：
+   * 同一个时刻重算，列表里几条计时器不会出现零点几秒的互相错位。
+   */
+  const [now, setNow] = useState(() => Date.now());
+
+  /** 后端事件的退订函数。 */
+  const unlisten = useRef<(() => void) | null>(null);
+
+  /** 重新从后端拉全量列表。 */
+  const reload = useCallback(async () => {
+    try {
+      setTimers(await api.timersList());
+      setError(null);
+    } catch (err) {
+      setError(`读取失败：${String(err)}`);
+    }
+  }, []);
+
+  // 首次加载 + 订阅后端变化
+  useEffect(() => {
+    let disposed = false;
+
+    void (async () => {
+      try {
+        const list = await api.timersList();
+        if (!disposed) {
+          setTimers(list);
+          setError(null);
+        }
+      } catch (err) {
+        if (!disposed) setError(`读取失败：${String(err)}`);
+      } finally {
+        if (!disposed) setLoading(false);
+      }
+    })();
+
+    // Rust 到点后会自己改数据（倒计时标记完成、番茄钟翻阶段），
+    // 不订阅的话界面会一直停在旧状态，看起来像卡住了
+    void onStateChanged((what) => {
+      if (what.includes("timers")) void reload();
+    }).then((off) => {
+      // 订阅是异步的：回调到达时组件可能已经卸载，
+      // 那就立刻退订，否则监听器会一直挂在后端上
+      if (disposed) off();
+      else unlisten.current = off;
+    });
+
+    return () => {
+      disposed = true;
+      unlisten.current?.();
+      unlisten.current = null;
+    };
+  }, [reload]);
+
+  // 每 100ms 推进一次"现在"，驱动所有卡片重画
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), TICK_MS);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const ordered = useMemo(() => sortTimers(timers), [timers]);
+
+  /**
+   * 每条计时器的写入队列。
+   *
+   * 每次 `timerSave` 带的是**完整快照**，而 Tauri 的 async 命令是在异步运行时上
+   * 并发执行的：连续点「计次」连发两条命令时，后发的那条有可能先落库，
+   * 于是后端留下旧快照（少一次计次）。按 id 串起来写，落库顺序就与点击顺序一致。
+   */
+  const writeQueue = useRef<Map<string, Promise<void>>>(new Map());
+
+  /**
+   * 落盘一条计时器。
+   *
+   * 先改本地再发命令：点「开始」要立刻看到变化，不能等一次 IPC 往返。
+   * 万一命令失败，就把后端数据重新拉回来，避免界面显示一个其实没存下的状态。
+   */
+  const saveTimer = (timer: Timer) => {
+    setTimers((prev) => upsert(prev, timer));
+
+    const previous = writeQueue.current.get(timer.id) ?? Promise.resolve();
+    const queued = previous
+      // 上一条失败已经在自己的 catch 里处理过，这里只保证队列不断
+      .catch(() => undefined)
+      .then(() => api.timerSave(timer))
+      .then(
+        () => setError(null),
+        (err) => {
+          setError(`保存失败：${String(err)}`);
+          void reload();
+        },
+      )
+      .finally(() => {
+        // 只有队尾还是自己时才清理，否则会把后来者的记录删掉
+        if (writeQueue.current.get(timer.id) === queued) {
+          writeQueue.current.delete(timer.id);
+        }
+      });
+
+    writeQueue.current.set(timer.id, queued);
+  };
+
+  const removeTimer = async (id: string) => {
+    setTimers((prev) => prev.filter((t) => t.id !== id));
+    try {
+      await api.timerRemove(id);
+      setError(null);
+    } catch (err) {
+      setError(`删除失败：${String(err)}`);
+      void reload();
+    }
+  };
+
+  // ---- 倒计时 ----
+
+  /**
+   * 开始。也用于已完成（`fired`）的「重新开始」：两者都是"按设定时长重新跑一轮"。
+   *
+   * `fired` 必须清掉：Rust 只在 `fired === false` 时才会为这条再弹提醒。
+   */
+  const startCountdown = (t: Timer) => {
+    saveTimer({
+      ...t,
+      endsAt: Date.now() + durationOf(t),
+      remainingMs: null,
+      fired: false,
+    });
+  };
+
+  /**
+   * 重置：回到「未开始」，但 `durationMs` 原样保留。
+   *
+   * 重置要清的是"这一轮的进度"，不是"用户当初设了多久"——
+   * 丢掉时长的话，下次「开始」就只能瞎猜一个默认值。
+   */
+  const resetCountdown = (t: Timer) => {
+    saveTimer({ ...t, endsAt: null, remainingMs: null, fired: false });
+  };
+
+  // ---- 倒计时与番茄钟共用的暂停 / 继续 ----
+
+  /**
+   * 暂停：把剩余毫秒写进 `remainingMs`，`endsAt` 置空。
+   * 存"还剩多少"而不是"暂停了多久"，是因为继续时只需要拿它加当前时刻。
+   */
+  const pauseTimer = (t: Timer) => {
+    const left = Math.max(0, (t.endsAt ?? Date.now()) - Date.now());
+    saveTimer({ ...t, endsAt: null, remainingMs: left });
+  };
+
+  /** 继续：剩余毫秒换算成新的绝对结束时刻。 */
+  const resumeTimer = (t: Timer) => {
+    saveTimer({
+      ...t,
+      endsAt: Date.now() + Math.max(0, t.remainingMs ?? 0),
+      remainingMs: null,
+    });
+  };
+
+  // ---- 番茄钟 ----
+
+  /**
+   * 开始一个番茄钟。
+   *
+   * 只负责"从当前阶段开始跑"：阶段切换是 Rust 到点后自己做的
+   * （见 `src-tauri/src/scheduler.rs`），前端绝不自己翻阶段，
+   * 否则两边各翻一次会直接跳过休息。
+   */
+  const startPomodoro = (t: Timer) => {
+    const phase: PomodoroPhase = t.phase ?? "focus";
+    const length = (phase === "break" ? t.breakMinutes : t.focusMinutes) * 60_000;
+    saveTimer({
+      ...t,
+      phase,
+      endsAt: Date.now() + length,
+      remainingMs: null,
+      fired: false,
+    });
+  };
+
+  /** 停止：回到「专注、未开始」。已完成轮数保留，它是这一次的成绩。 */
+  const stopPomodoro = (t: Timer) => {
+    saveTimer({ ...t, phase: "focus", endsAt: null, remainingMs: null, fired: false });
+  };
+
+  // ---- 秒表 ----
+
+  const startStopwatch = (t: Timer) => {
+    saveTimer({ ...t, runningSince: Date.now() });
+  };
+
+  /**
+   * 暂停秒表：把正在跑的这一段并进 `elapsedMs`。
+   * `elapsedMs` 只存"已经攒下的"，正在跑的那段永远靠 `runningSince` 现算，
+   * 这样即使界面被降频，恢复时也不会少算。
+   */
+  const pauseStopwatch = (t: Timer) => {
+    const running = t.runningSince === null ? 0 : Math.max(0, Date.now() - t.runningSince);
+    saveTimer({ ...t, elapsedMs: t.elapsedMs + running, runningSince: null });
+  };
+
+  /** 计次：把当前的已用时间记一笔。存的是累计值，不是分段差值。 */
+  const lapStopwatch = (t: Timer) => {
+    saveTimer({ ...t, laps: [...t.laps, elapsedOf(t, Date.now())] });
+  };
+
+  const resetStopwatch = (t: Timer) => {
+    saveTimer({ ...t, elapsedMs: 0, runningSince: null, laps: [] });
+  };
+
+  /** 新建完成：收起表单并落盘。时长等信息已经在表单里写进 Timer 了。 */
+  const createTimer = (timer: Timer) => {
+    setCreating(false);
+    saveTimer(timer);
+  };
+
   return (
-    <div className="placeholder">
-      <Clock size={28} />
-      <h3>计时器 · 开发中</h3>
-      <p>这一版先把「文本片段」这条链路跑通，计时器排在下一个。</p>
-      <ul>
-        <li>倒计时（多路并行、可命名、可暂停）</li>
-        <li>番茄钟（专注 + 休息自动循环）</li>
-        <li>秒表（计次记录）</li>
-        <li>结束后置顶弹窗 + 提示音，不打断当前输入</li>
-      </ul>
+    <div className="tmr">
+      <div className="tmr__toolbar">
+        <span className="tmr__count">共 {timers.length} 条</span>
+        <button className="btn btn--primary" onClick={() => setCreating((v) => !v)}>
+          <Plus size={13} />
+          新建
+        </button>
+      </div>
+
+      {creating && <TimerCreator onCancel={() => setCreating(false)} onCreate={createTimer} />}
+
+      {error && <div className="tmr__error">{error}</div>}
+
+      <div className="tmr__list">
+        {loading && <div className="tmr__empty">正在读取数据…</div>}
+
+        {!loading && ordered.length === 0 && (
+          <div className="tmr__empty">
+            还没有任何计时器。
+            <br />
+            点右上角「新建」加一个：煮蛋的倒计时、一个番茄钟，或者一块秒表。
+          </div>
+        )}
+
+        {ordered.map((t) => {
+          const state = stateOf(t);
+          const meta = metaOf(t, state);
+          return (
+            <article
+              key={t.id}
+              className={`card tmr__card${state === "running" ? " tmr__card--running" : ""}`}
+            >
+              <div className="tmr__head">
+                <span className="tmr__name">{t.name}</span>
+                <span className="tmr__kind">{KIND_LABEL[t.kind]}</span>
+                <span className={`tmr__state tmr__state--${state}`}>{STATE_LABEL[state]}</span>
+              </div>
+
+              <div className={`tmr__time tmr__time--${state}`}>{mainTime(t, state, now)}</div>
+
+              {meta && <div className="tmr__meta">{meta}</div>}
+
+              {t.kind === "stopwatch" && t.laps.length > 0 && (
+                <div className="tmr__laps">
+                  {/* 倒序取最近的几次：计时进行中，用户关心的是刚按下的那一次 */}
+                  {t.laps
+                    .slice(-5)
+                    .reverse()
+                    .map((ms, i) => (
+                      <span key={t.laps.length - i} className="tmr__lap">
+                        <em className="tmr__lap-index">#{t.laps.length - i}</em>
+                        {formatStopwatch(ms)}
+                      </span>
+                    ))}
+                </div>
+              )}
+
+              <div className="card__actions tmr__actions">
+                {t.kind === "countdown" && (
+                  <>
+                    {state === "idle" && (
+                      <button
+                        className="btn btn--primary"
+                        onClick={() => startCountdown(t)}
+                        title="按设定的时长开始"
+                      >
+                        <Play size={12} />
+                        开始
+                      </button>
+                    )}
+                    {state === "running" && (
+                      <>
+                        <button className="btn" onClick={() => pauseTimer(t)} title="暂停，剩余时间会被记住">
+                          <Pause size={12} />
+                          暂停
+                        </button>
+                        <button className="btn" onClick={() => resetCountdown(t)} title="清空进度，回到未开始">
+                          <RotateCcw size={12} />
+                          重置
+                        </button>
+                      </>
+                    )}
+                    {state === "paused" && (
+                      <>
+                        <button className="btn btn--primary" onClick={() => resumeTimer(t)} title="从暂停处接着走">
+                          <Play size={12} />
+                          继续
+                        </button>
+                        <button className="btn" onClick={() => resetCountdown(t)} title="清空进度，回到未开始">
+                          <RotateCcw size={12} />
+                          重置
+                        </button>
+                      </>
+                    )}
+                    {state === "done" && (
+                      <button
+                        className="btn btn--primary"
+                        onClick={() => startCountdown(t)}
+                        title="按原来的时长再来一次"
+                      >
+                        <Play size={12} />
+                        重新开始
+                      </button>
+                    )}
+                  </>
+                )}
+
+                {t.kind === "pomodoro" && (
+                  <>
+                    {state === "idle" && (
+                      <button
+                        className="btn btn--primary"
+                        onClick={() => startPomodoro(t)}
+                        title="开始当前阶段，到点后由后端自动切换专注/休息"
+                      >
+                        <Play size={12} />
+                        开始
+                      </button>
+                    )}
+                    {state === "running" && (
+                      <>
+                        <button className="btn" onClick={() => pauseTimer(t)} title="暂停，剩余时间会被记住">
+                          <Pause size={12} />
+                          暂停
+                        </button>
+                        <button className="btn" onClick={() => stopPomodoro(t)} title="停止这一轮，回到专注阶段">
+                          <Square size={12} />
+                          停止
+                        </button>
+                      </>
+                    )}
+                    {state === "paused" && (
+                      <>
+                        <button className="btn btn--primary" onClick={() => resumeTimer(t)} title="从暂停处接着走">
+                          <Play size={12} />
+                          继续
+                        </button>
+                        <button className="btn" onClick={() => stopPomodoro(t)} title="停止这一轮，回到专注阶段">
+                          <Square size={12} />
+                          停止
+                        </button>
+                      </>
+                    )}
+                  </>
+                )}
+
+                {t.kind === "stopwatch" && (
+                  <>
+                    {state === "idle" && (
+                      <button className="btn btn--primary" onClick={() => startStopwatch(t)} title="开始计时">
+                        <Play size={12} />
+                        开始
+                      </button>
+                    )}
+                    {state === "running" && (
+                      <>
+                        <button className="btn" onClick={() => pauseStopwatch(t)} title="暂停计时">
+                          <Pause size={12} />
+                          暂停
+                        </button>
+                        <button className="btn" onClick={() => lapStopwatch(t)} title="记下当前用时">
+                          <Flag size={12} />
+                          计次
+                        </button>
+                      </>
+                    )}
+                    {state === "paused" && (
+                      <>
+                        <button className="btn btn--primary" onClick={() => startStopwatch(t)} title="接着计时">
+                          <Play size={12} />
+                          继续
+                        </button>
+                        <button className="btn" onClick={() => resetStopwatch(t)} title="清零并清空计次">
+                          <RotateCcw size={12} />
+                          重置
+                        </button>
+                      </>
+                    )}
+                  </>
+                )}
+
+                <button
+                  className="iconbtn iconbtn--danger tmr__delete"
+                  onClick={() => void removeTimer(t.id)}
+                  title="删除"
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
+            </article>
+          );
+        })}
+      </div>
     </div>
   );
 }
 
+// ===============================================================
+// 新建表单
+// ===============================================================
+
+/**
+ * 新建计时器的表单。
+ *
+ * 三种模式共用一套输入框，靠 `kind` 决定显示哪几个：
+ * 时长只在倒计时和番茄钟上有意义，秒表只需要名字。
+ *
+ * 倒计时的时长会被写进 `durationMs` 持久化下来，所以「重置」之后
+ * 再「开始」用的还是用户当初填的这个时长，不靠任何内存记忆。
+ */
+function TimerCreator({
+  onCreate,
+  onCancel,
+}: {
+  onCreate: (timer: Timer) => void;
+  onCancel: () => void;
+}) {
+  const [kind, setKind] = useState<TimerKind>("countdown");
+  const [name, setName] = useState("");
+  // 时长用字符串存：输入框允许中途为空（清空重输），数字类型做不到这一点
+  const [hours, setHours] = useState("0");
+  const [minutes, setMinutes] = useState("5");
+  const [seconds, setSeconds] = useState("0");
+  const [focus, setFocus] = useState("25");
+  const [rest, setRest] = useState("5");
+  const nameRef = useRef<HTMLInputElement>(null);
+
+  // 打开表单就聚焦名字：填名字是唯一的必填项
+  useEffect(() => {
+    nameRef.current?.focus();
+  }, []);
+
+  /** 把输入框里的字符串转成非负整数，空串或乱输入都算 0。 */
+  const toInt = (value: string): number => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  };
+
+  const countdownMs = (toInt(hours) * 3600 + toInt(minutes) * 60 + toInt(seconds)) * 1000;
+  const focusMinutes = toInt(focus);
+  const restMinutes = toInt(rest);
+
+  const valid =
+    kind === "countdown"
+      ? countdownMs > 0
+      : kind === "pomodoro"
+        ? focusMinutes > 0 && restMinutes > 0
+        : true;
+
+  /** 快捷时长：直接改写时/分/秒三个输入框，用户还能接着微调。 */
+  const useQuick = (totalMinutes: number) => {
+    setHours(String(Math.floor(totalMinutes / 60)));
+    setMinutes(String(totalMinutes % 60));
+    setSeconds("0");
+  };
+
+  const submit = () => {
+    const createdAt = Date.now();
+    const timer: Timer = {
+      id: newId(),
+      name: name.trim() || defaultName(kind, countdownMs, focusMinutes, restMinutes),
+      kind,
+      // 倒计时一建好就直接开跑：用户填了时长就是想让它开始倒，
+      // 再要求点一次「开始」是多余的一步（想停下点「重置」即可回到未开始）。
+      // 另外两种模式新建出来是「未开始」，等用户点「开始」。
+      endsAt: kind === "countdown" ? createdAt + countdownMs : null,
+      remainingMs: null,
+      // 倒计时的设定时长要单独存：重置、重新开始都要靠它拿回用户填的时长，
+      // 而 remainingMs 到点后会被 Rust 清成 0，不能当设定值用
+      durationMs: kind === "countdown" ? countdownMs : null,
+      phase: kind === "pomodoro" ? "focus" : null,
+      // 番茄钟之外的两种模式用不到这两个字段，给默认值即可
+      focusMinutes: kind === "pomodoro" ? focusMinutes : 25,
+      breakMinutes: kind === "pomodoro" ? restMinutes : 5,
+      rounds: 0,
+      elapsedMs: 0,
+      runningSince: null,
+      laps: [],
+      fired: false,
+      createdAt,
+    };
+    onCreate(timer);
+  };
+
+  return (
+    <div className="tmr__creator">
+      <div className="tmr__creator-head">新建计时器</div>
+
+      <div className="tmr__kinds">
+        {(["countdown", "pomodoro", "stopwatch"] as TimerKind[]).map((k) => (
+          <button
+            key={k}
+            className={`btn tmr__kindbtn${k === kind ? " tmr__kindbtn--on" : ""}`}
+            onClick={() => setKind(k)}
+          >
+            {KIND_LABEL[k]}
+          </button>
+        ))}
+      </div>
+
+      <label className="field">
+        <span className="field__label">
+          名字
+          <em className="field__hint">留空会按模式自动起一个</em>
+        </span>
+        <input
+          ref={nameRef}
+          className="field__input"
+          value={name}
+          placeholder="例如：煮蛋、开会、跑步"
+          onChange={(e) => setName(e.target.value)}
+        />
+      </label>
+
+      {kind === "countdown" && (
+        <>
+          <div className="field">
+            <span className="field__label">
+              时长
+              <em className="field__hint">时 / 分 / 秒</em>
+            </span>
+            <div className="tmr__segment">
+              <input
+                className="field__input"
+                type="number"
+                min={0}
+                value={hours}
+                onChange={(e) => setHours(e.target.value)}
+              />
+              <span className="tmr__unit">时</span>
+              <input
+                className="field__input"
+                type="number"
+                min={0}
+                value={minutes}
+                onChange={(e) => setMinutes(e.target.value)}
+              />
+              <span className="tmr__unit">分</span>
+              <input
+                className="field__input"
+                type="number"
+                min={0}
+                value={seconds}
+                onChange={(e) => setSeconds(e.target.value)}
+              />
+              <span className="tmr__unit">秒</span>
+            </div>
+          </div>
+
+          <div className="tmr__quickrow">
+            {QUICK_MINUTES.map((m) => (
+              <button key={m} className="btn tmr__quick" onClick={() => useQuick(m)}>
+                {m === 60 ? "1 小时" : `${m} 分钟`}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      {kind === "pomodoro" && (
+        <div className="field">
+          <span className="field__label">
+            节奏
+            <em className="field__hint">到点后由后端自动在专注与休息之间循环</em>
+          </span>
+          <div className="tmr__segment">
+            <span className="tmr__unit">专注</span>
+            <input
+              className="field__input"
+              type="number"
+              min={1}
+              value={focus}
+              onChange={(e) => setFocus(e.target.value)}
+            />
+            <span className="tmr__unit">分 · 休息</span>
+            <input
+              className="field__input"
+              type="number"
+              min={1}
+              value={rest}
+              onChange={(e) => setRest(e.target.value)}
+            />
+            <span className="tmr__unit">分</span>
+          </div>
+        </div>
+      )}
+
+      {kind === "stopwatch" && (
+        <div className="tmr__hint">秒表只需要一个名字，开始后可以随时计次。</div>
+      )}
+
+      <div className="tmr__creator-actions">
+        <button className="btn" onClick={onCancel}>
+          取消
+        </button>
+        <button
+          className="btn btn--primary"
+          onClick={submit}
+          disabled={!valid}
+          title={valid ? "" : "时长需要大于 0"}
+        >
+          {/* 倒计时是"建好即开始"，按钮上写清楚，免得用户以为还要再点一次开始 */}
+          {kind === "countdown" ? "创建并开始" : "创建"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** 注册到功能表。 */
 export const TimerFeature: FeatureModule = {
   id: "timer",
   title: "计时",
@@ -34,5 +840,4 @@ export const TimerFeature: FeatureModule = {
   icon: Clock,
   order: 20,
   component: TimerPanel,
-  wip: true,
 };

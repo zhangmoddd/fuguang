@@ -1,16 +1,21 @@
 /**
  * 提醒弹窗窗口。
  *
- * 第一版只用于「计时结束」和「粘贴失败」这类即时提示，
- * 备忘录的定时提醒在后续版本复用同一个窗口。
+ * 用于计时结束、番茄钟阶段切换、备忘录定时提醒、以及开机时补发错过的提醒。
  *
- * 内容通过 URL query 传入（由 Rust 侧 `show_alert` 拼接），
- * 这样连续弹出多个提醒时不会因为共享全局状态而串内容。
+ * # 内容怎么来的
+ *
+ * 两条路径，缺一不可：
+ * 1. **首次创建**时 Rust 把内容拼进 URL query，前端挂载时读一次。
+ *    这是兜底：第一次弹窗时事件可能在前端挂载完成之前就发出来了。
+ * 2. **窗口复用**时 Rust 通过 `alert:content` 事件推送新内容。
+ *    窗口已存在时只调 `show()` 会显示上一条提醒的旧文字，所以必须走事件。
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Bell, Check } from "lucide-react";
 
-import { api } from "../lib/api";
+import { api, onAlertContent } from "../lib/api";
 
 /** 从 hash 里解析 query 参数。 */
 function readParams(): { title: string; body: string } {
@@ -27,18 +32,39 @@ function readParams(): { title: string; body: string } {
 
 export function AlertWindow() {
   const [info, setInfo] = useState(readParams);
+  /** 用户是否在设置里关掉了提示音。 */
+  const soundEnabled = useRef(true);
 
-  // hash 变化时刷新内容（同一个窗口被复用弹出第二条提醒时）
+  // 读一次设置，决定要不要响
   useEffect(() => {
-    const onHash = () => setInfo(readParams());
-    window.addEventListener("hashchange", onHash);
-    return () => window.removeEventListener("hashchange", onHash);
+    void (async () => {
+      try {
+        const s = await api.settingsGet();
+        soundEnabled.current = s.alertSound;
+      } catch {
+        // 读不到设置就按"响"处理，提醒比安静更重要
+      }
+    })();
+  }, []);
+
+  // 接收复用窗口时推送的新内容
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void onAlertContent((payload) => {
+      setInfo({ title: payload.title, body: payload.body });
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
   }, []);
 
   /** 播放提示音。
+   *
    *  用 WebAudio 合成而不是打包音频文件：省掉几百 KB 体积，
    *  而且不需要处理资源路径，用户也不会看到额外的 mp3 文件。 */
   useEffect(() => {
+    if (!soundEnabled.current) return;
+
     try {
       // 兼容旧 WebView2：AudioContext 缺失时退回 webkit 前缀版本
       const w = window as unknown as {
@@ -68,27 +94,33 @@ export function AlertWindow() {
     } catch {
       // 音频不可用不影响提醒本身，静默忽略
     }
-  }, []);
+  }, [info.title, info.body]);
 
   const close = async () => {
-    const { getCurrentWindow } = await import("@tauri-apps/api/window");
     await getCurrentWindow().close();
   };
 
   return (
     <div className="alert">
-      <div className="alert__icon">
-        <Bell size={20} />
-      </div>
-      <div className="alert__content">
+      {/* 标题行：图标 + 标题 */}
+      <div className="alert__head">
+        <div className="alert__icon">
+          <Bell size={18} />
+        </div>
         <div className="alert__title">{info.title}</div>
+      </div>
+
+      {/* 内容区可滚动：错过提醒的汇总可能列很多条 */}
+      <div className="alert__content">
         {info.body && <div className="alert__body">{info.body}</div>}
       </div>
-      <button className="alert__ok" onClick={() => void close()}>
-        <Check size={14} />
-        知道了
-      </button>
-      <button className="alert__x" onClick={() => void api.quit()} title="退出浮光" hidden />
+
+      <div className="alert__actions">
+        <button className="alert__ok" onClick={() => void close()}>
+          <Check size={14} />
+          知道了
+        </button>
+      </div>
     </div>
   );
 }

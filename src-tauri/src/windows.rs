@@ -214,14 +214,19 @@ pub fn toggle_panel(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 创建提醒弹窗。
+/// 弹出提醒窗。
 ///
-/// `title` / `body` 会通过 URL query 传给前端，前端读取后渲染。
-/// 用 query 而不是全局状态，是为了多个提醒连续弹出时不会互相覆盖内容。
+/// # 内容怎么传
 ///
-/// 第一版暂无调用方，见 [`ALERT`] 上的说明。
-#[allow(dead_code)]
+/// 窗口已存在时**不能**只调 `show()` —— 那样会显示上一条提醒的旧文字。
+/// 这里走事件推送：前端监听 `alert:content`，收到就换掉内容。
+///
+/// 首次创建时同时把内容塞进 URL query，作为兜底：
+/// 万一事件在前端挂载完成之前就发出去了（首次弹窗存在这个竞态），
+/// 前端仍能从 query 里读到正确内容。
 pub fn show_alert(app: &AppHandle, title: &str, body: &str) -> tauri::Result<()> {
+    use tauri::Emitter;
+
     let url = format!(
         "index.html#/alert?title={}&body={}",
         urlencode(title),
@@ -229,7 +234,11 @@ pub fn show_alert(app: &AppHandle, title: &str, body: &str) -> tauri::Result<()>
     );
 
     if let Some(win) = app.get_webview_window(ALERT) {
-        // 已存在则直接更新内容并重新显示
+        // 先推内容再显示，避免用户看到旧内容闪一下
+        let _ = win.emit(
+            "alert:content",
+            serde_json::json!({ "title": title, "body": body }),
+        );
         win.show()?;
         win.set_focus()?;
         return Ok(());
@@ -237,7 +246,9 @@ pub fn show_alert(app: &AppHandle, title: &str, body: &str) -> tauri::Result<()>
 
     let win = WebviewWindowBuilder::new(app, ALERT, WebviewUrl::App(url.into()))
         .title("浮光·提醒")
-        .inner_size(340.0, 170.0)
+        // 尺寸按"错过提醒汇总"这种最长内容来定：列表最多列 8 条，
+        // 再高就靠弹窗内部滚动，而不是把窗口撑到屏幕上放不下。
+        .inner_size(420.0, 300.0)
         .resizable(false)
         .maximizable(false)
         .minimizable(false)

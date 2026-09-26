@@ -17,6 +17,7 @@ import { SnippetsFeature } from "./snippets";
 import { TimerFeature } from "./timer";
 import { MemoFeature } from "./memo";
 import { LinksFeature } from "./links";
+import { SettingsFeature } from "./settings";
 
 /** 一个功能模块的声明。 */
 export interface FeatureModule {
@@ -53,6 +54,7 @@ export const FEATURES: FeatureModule[] = [
   TimerFeature,
   MemoFeature,
   LinksFeature,
+  SettingsFeature,
 ];
 
 /** 按 order 排好序的功能列表，主面板直接用这个。 */
@@ -65,5 +67,10 @@ export function findFeature(id: string): FeatureModule | undefined {
   return FEATURES.find((f) => f.id === id);
 }
 
-/** 面板默认打开的功能：优先文本片段，因为它是第一版唯一完整的功能。 */
+/**
+ * 面板默认打开的功能。
+ *
+ * 选文本片段：它是使用频率最高的一个（每次要输入账号、地址、模板都会用），
+ * 而计时器和备忘录是"设好就不用管"的类型。
+ */
 export const DEFAULT_FEATURE_ID = "snippets";

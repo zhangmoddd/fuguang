@@ -12,6 +12,7 @@
  * 原生菜单不占窗口空间，还会在靠近屏幕边缘时自动翻转回屏幕内。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { api } from "../lib/api";
 
@@ -50,9 +51,7 @@ export function BallWindow() {
 
       // 超过阈值：认定用户在拖动，交给系统原生拖动，后续移动由 Windows 接管。
       d.moved = true;
-      void import("@tauri-apps/api/window").then(({ getCurrentWindow }) =>
-        getCurrentWindow().startDragging(),
-      );
+      void getCurrentWindow().startDragging();
     };
 
     const onUp = async () => {

@@ -1,0 +1,262 @@
+/* ============================================================
+   快捷链接
+   设计取向：一面「格子墙」。面板只有 420px 宽，所以格子走紧凑路线：
+   4 列、图标 40px、名字最多两行，扫一眼就能认出是哪个。
+   颜色全部取自 styles.css 的 :root 变量，这里不出现任何硬编码色值，
+   以后换主题（比如加深色）只需要改变量。
+   ============================================================ */
+
+.links {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+/* ---- 添加栏 ---- */
+
+.links__addbar {
+  display: flex;
+  gap: 5px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+/* 四个入口平分一行：等宽比按内容撑开更好点，误点率低 */
+.links__addbar .btn {
+  flex: 1;
+  justify-content: center;
+  padding: 5px 6px;
+}
+
+/* ---- 网址表单 ---- */
+
+.links__urlform {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.links__urlform-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+/* ---- 提示条 ---- */
+
+.links__notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 8px 10px 0;
+  padding: 6px 9px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--success);
+  font-size: 12px;
+  line-height: 1.5;
+  flex-shrink: 0;
+}
+
+.links__notice svg {
+  flex-shrink: 0;
+  /* 提示可能两行，图标跟着第一行文字对齐 */
+  margin-top: 1px;
+}
+
+.links__notice span {
+  word-break: break-word;
+}
+
+/* 错误用中性底 + 危险色文字/描边。
+   底色刻意不做成红色调：浅色主题里大面积浅红会显得很脏，
+   而且这条提示常常要停留很久（等用户读完原因）。 */
+.links__notice--error {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* ---- 网格 ---- */
+
+.links__grid {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 9px 10px 10px;
+  display: grid;
+  /* auto-fill + minmax：420px 的面板正好排 4 列，窗口被拉伸时自动变多，
+     不需要写任何 JS 去算列数 */
+  grid-template-columns: repeat(auto-fill, minmax(86px, 1fr));
+  gap: 6px;
+  align-content: start;
+}
+
+/* 拖拽悬停：整块区域变蓝，明确告诉用户「松手就加进来」。
+   没有这个反馈的话，拖到一半的用户不知道这里收不收文件。 */
+.links__grid--drop {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+/* 空状态与加载提示：grid 子项默认只占一格，必须显式跨满整行 */
+.links__empty,
+.links__hint {
+  grid-column: 1 / -1;
+  padding: 30px 14px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.links__empty svg {
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+
+.links__empty p {
+  margin-bottom: 4px;
+}
+
+/* ---- 格子 ---- */
+
+.links__tile {
+  position: relative;
+  display: flex;
+  height: 92px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.links__tile:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+/* 正在启动：压暗表示「已经在处理了」，抑制连点 */
+.links__tile--busy {
+  opacity: 0.55;
+}
+
+.links__tile-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 10px 6px;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* 只有可点的那层给手型光标；重命名时这层是普通容器，不该看起来能点 */
+.links__open {
+  cursor: pointer;
+}
+
+.links__open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.links__glyph {
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+  flex-shrink: 0;
+  /* 图标不该吃掉点击：整块格子才是热区 */
+  pointer-events: none;
+}
+
+/* 内置图标比真实图标「重」，缩一圈视觉重量才相当（box-sizing 是 border-box，padding 往内收） */
+.links__glyph--builtin {
+  padding: 7px;
+  color: var(--text-dim);
+}
+
+.links__name {
+  max-width: 100%;
+  font-size: 11.5px;
+  line-height: 1.35;
+  text-align: center;
+  /* 两行截断：中文文件夹名和 "Visual Studio Code" 这类名字一行放不下，
+     给两行能多一倍信息；超过两行才省略号，格子高度也就不会参差 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
+}
+
+/* 就地重命名：不做弹窗，改个名字不该打断视线 */
+.links__rename {
+  width: 100%;
+  background: var(--bg-solid);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 3px 5px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11.5px;
+  text-align: center;
+  outline: none;
+}
+
+/* ---- 悬停操作 ---- */
+
+.links__actions {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  display: flex;
+  gap: 1px;
+  opacity: 0;
+  /* 用 visibility 而不是 display 来隐藏：
+     display 切换会让布局变化，鼠标下方的元素一变，:hover 判定就可能抖动，
+     两个按钮会一闪一闪。visibility 不改变布局，最稳。 */
+  visibility: hidden;
+  transition: opacity 0.1s ease;
+}
+
+.links__tile:hover .links__actions,
+.links__tile:focus-within .links__actions {
+  opacity: 1;
+  visibility: visible;
+}
+
+.links__actions .iconbtn {
+  width: 20px;
+  height: 20px;
+  /* 压在图标右上角，必须有实底，否则和图标叠在一起看不清 */
+  background: var(--bg-solid);
+  border: 1px solid var(--border);
+}
+
+/* 覆盖通用 .iconbtn:hover 的透明底：这里要的是实底，否则会透出下面的图标 */
+.links__actions .iconbtn:hover {
+  background: var(--bg-hover);
+}
+
+/* ---- 底部说明 ---- */
+
+.links__footer {
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 11px;
+  text-align: center;
+  flex-shrink: 0;
+}

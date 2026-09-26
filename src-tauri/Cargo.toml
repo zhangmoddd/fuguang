@@ -29,14 +29,22 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Memory",
     # 线程 ID 查询与 AttachThreadInput（把焦点还给目标窗口的关键）
     "Win32_System_Threading",
+    # 开机自启：读写 HKCU 的 Run 键
+    # RegCreateKeyExW 的签名里用到 SECURITY_ATTRIBUTES，所以还需要 Win32_Security
+    "Win32_System_Registry",
+    "Win32_Security",
     # 基础窗口/线程 API
     "Win32_Foundation",
     # 模拟 Ctrl+V
     "Win32_UI_Input_KeyboardAndMouse",
-    # 取前台窗口、设置前台窗口、取窗口标题
+    # 取前台窗口、设置前台窗口、取窗口标题、GetIconInfo/DestroyIcon
     "Win32_UI_WindowsAndMessaging",
-    # 打开文件夹、ShellExecute
+    # 打开文件夹、SHGetFileInfoW（提取快捷链接的图标）
     "Win32_UI_Shell",
+    # SHGetFileInfoW 签名里用到 FILE_FLAGS_AND_ATTRIBUTES
+    "Win32_Storage_FileSystem",
+    # 图标位图转 RGBA 需要 GDI
+    "Win32_Graphics_Gdi",
 ] }
 
 # 发布构建体积优化：用户下载的就是这个 exe，尽量压小。

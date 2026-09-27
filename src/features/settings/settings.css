@@ -172,6 +172,21 @@
   line-height: 1.55;
 }
 
+/* 危险动作按钮：退出这类操作要一眼看出和普通按钮不同，避免误点。
+   用描边 + 红字而不是实心红底 —— 实心红底太像"确认删除"的强提示，
+   这里只是"请留意"，不需要那么强的视觉重量。 */
+.btn--danger {
+  align-self: flex-start;
+  color: var(--danger);
+  border-color: rgba(217, 45, 32, 0.35);
+  background: rgba(217, 45, 32, 0.06);
+}
+
+.btn--danger:hover {
+  background: rgba(217, 45, 32, 0.12);
+  border-color: rgba(217, 45, 32, 0.5);
+}
+
 /* ---------- 字号选择 ---------- */
 
 .settings__sizes {

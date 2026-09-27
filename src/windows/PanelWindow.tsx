@@ -6,7 +6,7 @@
  * 所以以后新增功能不需要改动这个文件。
  */
 import { useEffect, useMemo, useState } from "react";
-import { Minus, Pin, PinOff, X } from "lucide-react";
+import { Pin, PinOff, X } from "lucide-react";
 
 import { DEFAULT_FEATURE_ID, sortedFeatures } from "../features/registry";
 import { api } from "../lib/api";
@@ -75,10 +75,18 @@ export function PanelWindow() {
           >
             {pinned ? <Pin size={13} /> : <PinOff size={13} />}
           </button>
+
+          {/*
+            ✕ 只收起面板，不退出软件。
+            
+            这里踩过一个坑：最初 ✕ 绑的是"退出浮光"，结果用户按窗口惯例
+            点它想关面板，整个软件被杀掉了，悬浮球也跟着消失。
+            ✕ 在任何窗口里都意味着"关掉这个窗口"，把它绑成"杀进程"是危险的错配。
+            
+            退出软件改到设置页底部，以及小球的右键菜单和托盘菜单里 ——
+            那几处是用户明确表达"我要退出"的地方。
+          */}
           <button className="iconbtn" onClick={() => void api.hidePanel()} title="收起面板">
-            <Minus size={13} />
-          </button>
-          <button className="iconbtn iconbtn--danger" onClick={() => void api.quit()} title="退出浮光">
             <X size={13} />
           </button>
         </div>

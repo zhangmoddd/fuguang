@@ -11,7 +11,7 @@
  * Rust 只负责比较 `now` 和目标时刻。原因见 `src-tauri/src/models.rs`。
  */
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 /** 粘贴结果，与 Rust 侧 `platform::PasteOutcome` 一一对应。 */
 export interface PasteOutcome {
@@ -228,6 +228,24 @@ export function onAlertContent(
   cb: (payload: { title: string; body: string }) => void,
 ): Promise<UnlistenFn> {
   return listen<{ title: string; body: string }>("alert:content", (e) => cb(e.payload));
+}
+
+/**
+ * 广播「设置变了」。
+ *
+ * 为什么需要跨窗口事件：小球、主面板、提醒弹窗是**三个独立的窗口**，
+ * 各自有自己的 DOM。在主面板里改 CSS 变量，小球那个窗口完全不知道——
+ * 实测就是这个原因导致"换了配色但球不变色"。
+ *
+ * 所以设置改动后广播一次，关心外观的窗口各自重新套用。
+ */
+export async function emitSettingsChanged(settings: Settings): Promise<void> {
+  await emit("settings-changed", settings);
+}
+
+/** 订阅设置变更。返回取消订阅函数，组件卸载时必须调用。 */
+export function onSettingsChanged(cb: (settings: Settings) => void): Promise<UnlistenFn> {
+  return listen<Settings>("settings-changed", (e) => cb(e.payload));
 }
 
 /** 生成一个足够唯一的 id。本地单机场景时间戳 + 随机数已足够。 */

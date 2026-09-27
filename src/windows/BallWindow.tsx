@@ -14,13 +14,40 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import { api } from "../lib/api";
+import { api, onSettingsChanged } from "../lib/api";
+import { applyBallTheme } from "../lib/ball-theme";
 
 export function BallWindow() {
   const [busy, setBusy] = useState(false);
 
   /** 拖动状态。用 ref 而不是 state，避免拖动过程中触发重渲染。 */
   const drag = useRef<{ startX: number; startY: number; moved: boolean } | null>(null);
+
+  /**
+   * 订阅设置变更，实时套用悬浮球配色。
+   *
+   * 必须有这个订阅：小球和主面板是**两个独立窗口**，
+   * 在设置页里改 CSS 变量只影响设置页自己的 DOM，
+   * 小球那个窗口完全不知道 —— 实测就是这个原因导致"换了配色但球不变色"。
+   *
+   * 启动时的首次套用在 `main.tsx` 里做（读一次设置），
+   * 这里只负责"之后被改动了"的情况。
+   */
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+
+    void onSettingsChanged((s) => applyBallTheme(s.ballTheme)).then((fn) => {
+      // 订阅是异步建立的，可能还没建立组件就卸载了
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   /**
    * 指针按下：先记下起点，但**不立即**进入拖动。

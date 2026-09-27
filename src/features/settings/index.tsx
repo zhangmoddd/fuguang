@@ -22,7 +22,7 @@ import {
   Type,
 } from "lucide-react";
 
-import { api, type Settings } from "../../lib/api";
+import { api, emitSettingsChanged, type Settings } from "../../lib/api";
 import { BALL_THEMES, applyBallTheme } from "../../lib/ball-theme";
 import { FONT_SIZE_PRESETS, applyFontSize } from "../../lib/ui-scale";
 import type { FeatureModule } from "../registry";
@@ -101,13 +101,25 @@ export function SettingsPanel() {
     return () => window.clearTimeout(t);
   }, [savedHint]);
 
+  /**
+   * 保存设置并广播给其他窗口。
+   *
+   * 广播这一步不能省：小球、主面板、提醒弹窗是**三个独立窗口**，
+   * 各自有自己的 DOM。在主面板里改 CSS 变量，小球那个窗口完全不知道——
+   * 实测就是这个原因导致"换了配色但球不变色"。
+   */
+  const saveSettings = async (next: Settings) => {
+    await api.settingsSave(next);
+    await emitSettingsChanged(next);
+  };
+
   /** 保存一项设置。 */
   const patch = async (changes: Partial<Settings>) => {
     if (!settings) return;
     const next = { ...settings, ...changes };
     setSettings(next);
     try {
-      await api.settingsSave(next);
+      await saveSettings(next);
       setSavedHint("已保存");
     } catch (err) {
       setError(String(err));
@@ -172,7 +184,7 @@ export function SettingsPanel() {
     applyFontSize(px);
     if (settings) setSettings({ ...settings, fontSizePx: px });
     try {
-      await api.settingsSave({ ...settings!, fontSizePx: px });
+      await saveSettings({ ...settings!, fontSizePx: px });
       setError(null);
     } catch (err) {
       setError(String(err));
@@ -189,7 +201,7 @@ export function SettingsPanel() {
     applyBallTheme(id);
     if (settings) setSettings({ ...settings, ballTheme: id });
     try {
-      await api.settingsSave({ ...settings!, ballTheme: id });
+      await saveSettings({ ...settings!, ballTheme: id });
       setError(null);
     } catch (err) {
       setError(String(err));
@@ -495,6 +507,31 @@ export function SettingsPanel() {
             JSON 里是明文。这是刻意的取舍：加密意味着一旦忘记密码，数据就永久找不回来了。
           </span>
         </div>
+      </section>
+
+      <section className="settings__group">
+        <h4 className="settings__group-title">退出</h4>
+
+        {/*
+          退出放在这里，而不是面板标题栏的 ✕。
+          ✕ 在窗口里的惯例是"关掉这个窗口"，把它绑成"杀进程"会让用户
+          按直觉点一下就丢掉整个软件（实测被用户踩到过）。
+          这里、小球的右键菜单、托盘菜单，才是用户明确表达"我要退出"的地方。
+        */}
+        <div className="settings__note">
+          退出后悬浮球和托盘图标都会消失，<strong>计时器和提醒也会停止</strong>。
+          数据不会丢，下次启动照旧。
+          <br />
+          想再启动：开始菜单里搜「浮光」，或双击程序本体。
+        </div>
+
+        <button
+          className="btn btn--danger"
+          onClick={() => void api.quit()}
+        >
+          <Power size={13} />
+          退出浮光
+        </button>
       </section>
     </div>
   );

@@ -18,9 +18,11 @@ import {
   Power,
   RotateCcw,
   Settings as SettingsIcon,
+  Type,
 } from "lucide-react";
 
 import { api, type Settings } from "../../lib/api";
+import { FONT_SIZE_PRESETS, applyFontSize } from "../../lib/ui-scale";
 import type { FeatureModule } from "../registry";
 
 import "./settings.css";
@@ -158,6 +160,23 @@ export function SettingsPanel() {
     }
   };
 
+  /**
+   * 改字号。
+   *
+   * 先本地套用再保存：改字号是"所见即所得"的操作，
+   * 等一次 IPC 往返再变会有明显延迟感。
+   */
+  const setFontSize = async (px: number) => {
+    applyFontSize(px);
+    if (settings) setSettings({ ...settings, fontSizePx: px });
+    try {
+      await api.settingsSave({ ...settings!, fontSizePx: px });
+      setError(null);
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
   /** 录制热键时的键盘处理。 */
   const onRecorderKeyDown = (e: React.KeyboardEvent) => {
     if (!recording) return;
@@ -199,6 +218,40 @@ export function SettingsPanel() {
     <div className="settings">
       {error && <div className="settings__error">{error}</div>}
       {savedHint && <div className="settings__saved">{savedHint}</div>}
+
+      <section className="settings__group">
+        <h4 className="settings__group-title">界面</h4>
+
+        <div className="settings__row">
+          <Type size={15} className="settings__icon" />
+          <span className="settings__label">
+            字体大小
+            <em className="settings__hint">
+              整个界面一起变：主面板、提醒弹窗、各个功能页。
+              面板宽度是固定的，所以只给了几档试好的预设
+            </em>
+          </span>
+        </div>
+
+        <div className="settings__sizes">
+          {FONT_SIZE_PRESETS.map((preset) => {
+            const active = settings.fontSizePx === preset.value;
+            return (
+              <button
+                key={preset.value}
+                type="button"
+                className={`settings__size${active ? " settings__size--active" : ""}`}
+                onClick={() => void setFontSize(preset.value)}
+                title={`${preset.value}px`}
+              >
+                {/* 每一档用它自己的字号显示，这样不用点就能看出差别 */}
+                <span style={{ fontSize: `${preset.value}px` }}>{preset.label}</span>
+                <em className="settings__size-px">{preset.value}px</em>
+              </button>
+            );
+          })}
+        </div>
+      </section>
 
       <section className="settings__group">
         <h4 className="settings__group-title">启动</h4>

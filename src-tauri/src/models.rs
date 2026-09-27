@@ -225,7 +225,20 @@ pub struct Settings {
     /// 全局热键组合，例如 `Ctrl+Shift+Space`。
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
+
+    /// 界面基准字号（像素）。
+    ///
+    /// 前端把它设成 CSS 变量 `--fs-base`，整个界面的字号都由它推导。
+    /// 面板宽度是固定的 420px，字号太大就会到处换行、按钮挤成一团，
+    /// 所以只允许 `FONT_SIZE_MIN..=FONT_SIZE_MAX` 之间（见 [`Settings::clamp`]）。
+    #[serde(default = "default_font_size")]
+    pub font_size_px: u32,
 }
+
+/// 界面字号的下限。再小就真的看不清了。
+pub const FONT_SIZE_MIN: u32 = 12;
+/// 界面字号的上限。再大面板里就放不下了。
+pub const FONT_SIZE_MAX: u32 = 18;
 
 fn default_restore_delay() -> u64 {
     120
@@ -235,6 +248,25 @@ fn default_true() -> bool {
 }
 fn default_hotkey() -> String {
     "Ctrl+Shift+Space".into()
+}
+fn default_font_size() -> u32 {
+    13
+}
+
+impl Settings {
+    /// 把各项取值夹到合法区间。
+    ///
+    /// 数据文件是纯文本、用户可以手动编辑，也可能被别的工具改坏。
+    /// 所以**每次从外部拿到的设置都要过一遍这里**，
+    /// 否则一个手写的 `"fontSizePx": 200` 就能让界面彻底没法用。
+    pub fn clamp(&mut self) {
+        self.font_size_px = self.font_size_px.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX);
+        // 剪贴板还原延时的合理区间：0 会让慢程序粘不上，太大则长时间占着剪贴板
+        self.paste_restore_delay_ms = self.paste_restore_delay_ms.min(2_000);
+        if self.hotkey.trim().is_empty() {
+            self.hotkey = default_hotkey();
+        }
+    }
 }
 
 impl Default for Settings {
@@ -246,6 +278,7 @@ impl Default for Settings {
             alert_sound: true,
             hotkey_enabled: true,
             hotkey: default_hotkey(),
+            font_size_px: default_font_size(),
         }
     }
 }
@@ -362,6 +395,59 @@ mod tests {
         assert_eq!(s.paste_restore_delay_ms, 120);
         // 热键默认开启：不开的话这个功能根本不会被发现
         assert!(s.hotkey_enabled);
+        assert_eq!(s.hotkey, "Ctrl+Shift+Space");
+        assert_eq!(s.font_size_px, 13, "默认字号");
+    }
+
+    #[test]
+    fn 字号被夹到合法区间() {
+        // 场景：用户手动编辑了 settings.json，或者被别的工具改坏。
+        // 不夹的话界面会彻底没法用（字号 200 会撑爆固定 420px 的面板）。
+        let mut too_big = Settings {
+            font_size_px: 200,
+            ..Settings::default()
+        };
+        too_big.clamp();
+        assert_eq!(too_big.font_size_px, FONT_SIZE_MAX);
+
+        let mut too_small = Settings {
+            font_size_px: 1,
+            ..Settings::default()
+        };
+        too_small.clamp();
+        assert_eq!(too_small.font_size_px, FONT_SIZE_MIN);
+    }
+
+    #[test]
+    fn 合法范围内的字号不被改动() {
+        for size in FONT_SIZE_MIN..=FONT_SIZE_MAX {
+            let mut s = Settings {
+                font_size_px: size,
+                ..Settings::default()
+            };
+            s.clamp();
+            assert_eq!(s.font_size_px, size, "合法值不该被改动");
+        }
+    }
+
+    #[test]
+    fn 剪贴板延时被限制在上限内() {
+        let mut s = Settings {
+            paste_restore_delay_ms: 999_999,
+            ..Settings::default()
+        };
+        s.clamp();
+        assert_eq!(s.paste_restore_delay_ms, 2_000);
+    }
+
+    #[test]
+    fn 空的热键会被补回默认值() {
+        // 空字符串传给 RegisterHotKey 会失败，与其让它报错不如补默认值
+        let mut s = Settings {
+            hotkey: "   ".into(),
+            ..Settings::default()
+        };
+        s.clamp();
         assert_eq!(s.hotkey, "Ctrl+Shift+Space");
     }
 

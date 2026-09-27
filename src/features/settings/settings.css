@@ -16,7 +16,7 @@
   padding: 24px;
   text-align: center;
   color: var(--text-faint);
-  font-size: 12.5px;
+  font-size: var(--fs-md);
 }
 
 .settings__error {
@@ -25,7 +25,7 @@
   border: 1px solid rgba(217, 45, 32, 0.26);
   border-radius: var(--radius-sm);
   color: var(--danger);
-  font-size: 12px;
+  font-size: var(--fs-md);
   line-height: 1.5;
 }
 
@@ -35,7 +35,7 @@
   border: 1px solid rgba(11, 122, 88, 0.28);
   border-radius: var(--radius-sm);
   color: var(--success);
-  font-size: 12px;
+  font-size: var(--fs-md);
 }
 
 .settings__group {
@@ -46,7 +46,7 @@
 
 /* 分组标题用一条细线引出，比加背景块更轻，符合"设置页"的密度 */
 .settings__group-title {
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--text-faint);
   letter-spacing: 0.5px;
@@ -70,7 +70,7 @@
 .settings__label {
   flex: 1;
   min-width: 0;
-  font-size: 12.5px;
+  font-size: var(--fs-md);
   color: var(--text);
   display: flex;
   flex-direction: column;
@@ -79,7 +79,7 @@
 
 .settings__hint {
   font-style: normal;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--text-faint);
   line-height: 1.55;
 }
@@ -107,7 +107,7 @@
   border-radius: 6px;
   padding: 4px 6px;
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--fs-md);
   font-family: inherit;
   outline: none;
   text-align: right;
@@ -118,12 +118,12 @@
 }
 
 .settings__unit {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--text-faint);
 }
 
 .settings__note {
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   color: var(--text-dim);
   line-height: 1.65;
   display: flex;
@@ -160,7 +160,7 @@
   border: 1px solid var(--border);
   border-radius: 6px;
   font-family: Consolas, "Cascadia Mono", monospace;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--text-dim);
   word-break: break-all;
   user-select: text;
@@ -168,8 +168,60 @@
 
 .settings__warn {
   color: var(--danger);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   line-height: 1.55;
+}
+
+/* ---------- 字号选择 ---------- */
+
+.settings__sizes {
+  display: grid;
+  /* 四档等宽铺满，而不是按内容宽度挤在一起——
+     每档文字大小不同，按内容排会显得参差不齐 */
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  padding-left: 24px;
+}
+
+.settings__size {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  /* 固定高度：每档字号不同，不固定的话按钮会高低不一 */
+  height: 52px;
+  padding: 4px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.settings__size:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+.settings__size--active {
+  background: var(--accent-soft);
+  border-color: rgba(29, 78, 216, 0.42);
+  color: var(--accent);
+}
+
+/* 像素值用固定的小字，不跟随预览字号，
+   否则"特大"那一档的标注会把按钮挤爆 */
+.settings__size-px {
+  font-style: normal;
+  font-size: 9px;
+  color: var(--text-faint);
+  line-height: 1;
+}
+
+.settings__size--active .settings__size-px {
+  color: var(--accent);
 }
 
 /* ---------- 全局热键录制器 ---------- */
@@ -193,7 +245,7 @@
   border-radius: 6px;
   color: var(--text);
   font-family: Consolas, "Cascadia Mono", monospace;
-  font-size: 12px;
+  font-size: var(--fs-md);
   cursor: pointer;
   outline: none;
 }
@@ -213,7 +265,7 @@
 .settings__code--inline {
   display: inline;
   padding: 2px 5px;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   color: var(--accent);
 }
 

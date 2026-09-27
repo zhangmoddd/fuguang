@@ -21,7 +21,7 @@
 }
 
 .tmr__count {
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   color: var(--text-faint);
 }
 
@@ -37,7 +37,7 @@
   border: 1px solid var(--danger);
   border-radius: var(--radius-sm);
   color: var(--danger);
-  font-size: 12px;
+  font-size: var(--fs-md);
   flex-shrink: 0;
 }
 
@@ -55,7 +55,7 @@
   padding: 32px 16px;
   text-align: center;
   color: var(--text-faint);
-  font-size: 12.5px;
+  font-size: var(--fs-md);
   line-height: 1.7;
 }
 
@@ -84,14 +84,14 @@
 
 .tmr__name {
   font-weight: 600;
-  font-size: 12.5px;
+  font-size: var(--fs-md);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .tmr__kind {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   padding: 1px 5px;
   border-radius: 4px;
   background: var(--bg-hover);
@@ -101,7 +101,7 @@
 
 .tmr__state {
   margin-left: auto;
-  font-size: 10.5px;
+  font-size: var(--fs-xs);
   color: var(--text-faint);
   flex-shrink: 0;
 }
@@ -117,7 +117,7 @@
 /* 大号时间。
    tabular-nums 让每个数字等宽：秒位每 100ms 跳一次，不用等宽数字整行会左右抖。 */
 .tmr__time {
-  font-size: 26px;
+  font-size: var(--fs-2xl);
   font-weight: 600;
   line-height: 1.15;
   letter-spacing: 0.5px;
@@ -138,7 +138,7 @@
 }
 
 .tmr__meta {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--text-faint);
   line-height: 1.5;
   word-break: break-word;
@@ -154,7 +154,7 @@
 }
 
 .tmr__lap {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
 }
@@ -192,7 +192,7 @@
 
 .tmr__creator-head {
   font-weight: 600;
-  font-size: 12.5px;
+  font-size: var(--fs-md);
   color: var(--text-dim);
 }
 
@@ -225,7 +225,7 @@
 }
 
 .tmr__unit {
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   color: var(--text-faint);
   flex-shrink: 0;
 }
@@ -241,7 +241,7 @@
 }
 
 .tmr__hint {
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   color: var(--text-faint);
   line-height: 1.6;
 }

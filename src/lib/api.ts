@@ -121,6 +121,13 @@ export interface Settings {
   hotkeyEnabled: boolean;
   /** 全局热键组合，例如 `Ctrl+Shift+Space`。 */
   hotkey: string;
+  /**
+   * 界面基准字号（像素）。
+   *
+   * 会被设成 CSS 变量 `--fs-base`，整个界面的字号都由它推导。
+   * Rust 侧保存时会夹到 12~18 之间，见 `lib/ui-scale.ts`。
+   */
+  fontSizePx: number;
 }
 
 // ===============================================================

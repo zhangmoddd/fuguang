@@ -34,7 +34,7 @@
 }
 
 .memo__dayname {
-  font-size: 13.5px;
+  font-size: var(--fs-base);
   font-weight: 600;
   color: var(--text);
   white-space: nowrap;
@@ -45,7 +45,7 @@
 
 /* 「今天」这种相对说法会盖住具体日期，下面补一行 YYYY-MM-DD 兜底 */
 .memo__daykey {
-  font-size: 10.5px;
+  font-size: var(--fs-xs);
   color: var(--text-faint);
 }
 
@@ -58,7 +58,7 @@
 
 .memo__today {
   padding: 5px 8px;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
 }
 
 /* ---- 日期跳转 ---- */
@@ -80,12 +80,12 @@
   width: auto;
   flex: 1;
   min-width: 0;
-  font-size: 12px;
+  font-size: var(--fs-md);
   padding: 4px 6px;
 }
 
 .memo__count {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--text-faint);
   white-space: nowrap;
   flex-shrink: 0;
@@ -102,7 +102,7 @@
 }
 
 .memo__hint {
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -125,7 +125,7 @@
   border: 1px solid rgba(11, 122, 88, 0.28);
   border-radius: var(--radius-sm);
   color: var(--success);
-  font-size: 12px;
+  font-size: var(--fs-md);
   flex-shrink: 0;
 }
 
@@ -136,7 +136,7 @@
   border: 1px solid rgba(217, 45, 32, 0.26);
   border-radius: var(--radius-sm);
   color: var(--danger);
-  font-size: 12px;
+  font-size: var(--fs-md);
   flex-shrink: 0;
 }
 
@@ -156,7 +156,7 @@
   padding: 32px 14px;
   text-align: center;
   color: var(--text-faint);
-  font-size: 12.5px;
+  font-size: var(--fs-md);
   line-height: 1.8;
 }
 
@@ -182,14 +182,14 @@
 
 .memo__title {
   font-weight: 600;
-  font-size: 12.5px;
+  font-size: var(--fs-md);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .memo__tag {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   padding: 1px 5px;
   border-radius: 4px;
   background: rgba(0, 0, 0, 0.055);
@@ -198,7 +198,7 @@
 }
 
 .memo__body {
-  font-size: 12px;
+  font-size: var(--fs-md);
   color: var(--text-dim);
   line-height: 1.55;
   word-break: break-all;
@@ -217,7 +217,7 @@
   border-radius: 6px;
   background: var(--accent-soft);
   color: var(--accent);
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
 }
 
 .memo__remind--off {
@@ -241,7 +241,7 @@
 
 .memo__repeat {
   margin-left: auto;
-  font-size: 10px;
+  font-size: var(--fs-xs);
   padding: 1px 5px;
   border-radius: 4px;
   background: rgba(29, 78, 216, 0.14);
@@ -256,7 +256,7 @@
 
 /* 「记于 X」放最左边：它和提醒时间是两回事，需要一直可见 */
 .memo__recorded {
-  font-size: 10.5px;
+  font-size: var(--fs-xs);
   color: var(--text-faint);
   margin-right: auto;
   overflow: hidden;
@@ -283,7 +283,7 @@
 }
 
 .memo__sectiontitle {
-  font-size: 12px;
+  font-size: var(--fs-md);
   font-weight: 600;
   color: var(--text);
 }
@@ -303,6 +303,6 @@
   border-radius: 6px;
   background: var(--accent-soft);
   color: var(--accent);
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
 }

@@ -44,11 +44,16 @@ impl Store {
     ///
     /// 单个文件损坏不会导致启动失败：`storage::read_json` 会备份坏文件并返回默认值。
     pub fn load(app: &AppHandle) -> Self {
+        // 设置要过一遍夹取：文件是纯文本、用户可能手动编辑，
+        // 一个手写的极端值（比如字号 200）就能让界面彻底没法用。
+        let mut settings: Settings = storage::read_json(app, FILE_SETTINGS, Settings::default());
+        settings.clamp();
+
         let state = AppState {
             timers: storage::read_json(app, FILE_TIMERS, Vec::new()),
             memos: storage::read_json(app, FILE_MEMOS, Vec::new()),
             links: storage::read_json(app, FILE_LINKS, Vec::new()),
-            settings: storage::read_json(app, FILE_SETTINGS, Settings::default()),
+            settings,
         };
         Store {
             inner: Mutex::new(state),

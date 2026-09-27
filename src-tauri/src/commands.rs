@@ -347,8 +347,12 @@ pub async fn settings_get(app: AppHandle) -> Settings {
 }
 
 /// 保存设置。
+///
+/// 存之前必须夹取取值范围：前端理论上可以传任何数字过来，
+/// 一个越界的字号会让界面彻底没法用。
 #[tauri::command]
-pub async fn settings_save(app: AppHandle, settings: Settings) -> Result<(), String> {
+pub async fn settings_save(app: AppHandle, mut settings: Settings) -> Result<(), String> {
+    settings.clamp();
     let saved = {
         let store = app.state::<Store>();
         let mut st = store.lock();

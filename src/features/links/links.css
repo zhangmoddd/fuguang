@@ -59,7 +59,7 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   color: var(--success);
-  font-size: 12px;
+  font-size: var(--fs-md);
   line-height: 1.5;
   flex-shrink: 0;
 }
@@ -111,7 +111,7 @@
   padding: 30px 14px;
   text-align: center;
   color: var(--text-faint);
-  font-size: 12.5px;
+  font-size: var(--fs-md);
   line-height: 1.7;
 }
 
@@ -189,7 +189,7 @@
 
 .links__name {
   max-width: 100%;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   line-height: 1.35;
   text-align: center;
   /* 两行截断：中文文件夹名和 "Visual Studio Code" 这类名字一行放不下，
@@ -210,7 +210,7 @@
   padding: 3px 5px;
   color: var(--text);
   font-family: inherit;
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   text-align: center;
   outline: none;
 }
@@ -256,7 +256,7 @@
   padding: 6px 10px;
   border-top: 1px solid var(--border);
   color: var(--text-faint);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   text-align: center;
   flex-shrink: 0;
 }

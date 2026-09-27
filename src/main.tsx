@@ -7,6 +7,8 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 
+import { api } from "./lib/api";
+import { applyFontSize } from "./lib/ui-scale";
 import { AlertWindow } from "./windows/AlertWindow";
 import { BallWindow } from "./windows/BallWindow";
 import { PanelWindow } from "./windows/PanelWindow";
@@ -21,6 +23,21 @@ function resolveWindow(): React.ComponentType {
 }
 
 const Root = resolveWindow();
+
+/**
+ * 尽早套用用户设的字号。
+ *
+ * 必须在**渲染之前**发起：设置是异步读的，晚一步就会先按默认字号画一帧
+ * 再跳变，看起来像闪了一下。
+ *
+ * 读失败也不管——用 CSS 里的默认值即可，字号不该成为打不开界面的原因。
+ */
+void api
+  .settingsGet()
+  .then((s) => applyFontSize(s.fontSizePx))
+  .catch(() => {
+    /* 用默认字号 */
+  });
 
 /**
  * 全局关掉 WebView2 自带的右键菜单。

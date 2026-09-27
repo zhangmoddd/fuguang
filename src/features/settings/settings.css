@@ -224,6 +224,67 @@
   color: var(--accent);
 }
 
+/* ---------- 悬浮球配色 ---------- */
+
+/* 和第二组设置拉开距离，不然两块会挤在一起看不清是一组 */
+.settings__row--spaced {
+  margin-top: 4px;
+}
+
+.settings__balls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding-left: 24px;
+}
+
+.settings__ball {
+  padding: 3px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  cursor: pointer;
+  line-height: 0;
+}
+
+.settings__ball:hover {
+  border-color: var(--border-strong);
+}
+
+.settings__ball--active {
+  border-color: var(--accent);
+}
+
+/* 缩小的球体本体。用真实的底色/描边/投影，所见即所得。 */
+.settings__ball-dot {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border-width: 1px;
+  border-style: solid;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 缩略图上的投影要弱化，否则一堆小球挤在一起会很脏 */
+  filter: saturate(1);
+}
+
+/* 和悬浮球本体一样：PNG 当遮罩，颜色由 background-color 给。
+   遮罩图由 styles.css 的 :root 统一定义（见那里的说明：写多份会被内联多份）。 */
+.settings__ball-mark {
+  display: block;
+  width: 60%;
+  aspect-ratio: 156 / 104;
+  -webkit-mask-image: var(--logo-mark-mask);
+  mask-image: var(--logo-mark-mask);
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+}
+
 /* ---------- 全局热键录制器 ---------- */
 
 .settings__hotkey {

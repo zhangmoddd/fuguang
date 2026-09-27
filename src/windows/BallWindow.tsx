@@ -14,7 +14,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import logoMark from "../assets/logo-mark.png";
 import { api } from "../lib/api";
 
 export function BallWindow() {
@@ -92,7 +91,9 @@ export function BallWindow() {
         onContextMenu={onContextMenu}
         title="左键打开面板 · 右键快捷菜单 · 按住可拖动"
       >
-        <img className="ball__mark" src={logoMark} alt="" draggable={false} />
+        {/* 标志的图形来自 CSS 里的 mask（见 styles.css 的 .ball__mark），
+            颜色由 --ball-mark 决定。所以这里不需要 img，也不需要传资源。 */}
+        <span className="ball__mark" />
       </div>
     </div>
   );

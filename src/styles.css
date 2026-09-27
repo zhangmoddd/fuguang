@@ -61,6 +61,12 @@
   --fs-lg: calc(var(--fs-base) + 1px);
   --fs-xl: calc(var(--fs-base) + 6px);
   --fs-2xl: calc(var(--fs-base) + 13px);
+
+  /* 悬浮球标志的遮罩图。
+     只在这里定义一次 —— 下面有 4 处要用它（球体本身 + 设置页的配色缩略图，
+     每处都要写 -webkit- 与标准两个属性）。每写一次 url()，Vite 就会把这张图
+     内联一份；4 份会让 CSS 白白多出 15 KB。抽成变量后只剩一份。 */
+  --logo-mark-mask: url("./assets/logo-mark.png");
 }
 
 * {
@@ -130,21 +136,19 @@ textarea {
   align-items: center;
   justify-content: center;
   cursor: grab;
-  background: radial-gradient(circle at 32% 28%, #6aa8ff 0%, #3d6fd6 55%, #2b4fa0 100%);
-  /* 投影比深色主题下轻：浅色桌面上重投影会显得很脏。
-     再加一圈很淡的白边，让蓝球在白色/浅色壁纸上也能和背景分开。 */
-  box-shadow:
-    0 2px 10px rgba(0, 0, 0, 0.28),
-    inset 0 1px 1px rgba(255, 255, 255, 0.35);
-  border: 1px solid rgba(255, 255, 255, 0.55);
+  /* 配色全部走变量，由 lib/ball-theme.ts 按用户选择写进来。
+     这里的默认值对应"白底蓝标"，保证 JS 还没跑起来时也是对的。 */
+  background: var(--ball-bg, #ffffff);
+  border: 1px solid var(--ball-border, rgba(0, 0, 0, 0.14));
+  box-shadow: var(--ball-shadow, 0 2px 10px rgba(0, 0, 0, 0.26));
   transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
 
 .ball:hover {
   transform: scale(1.06);
-  box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.34),
-    inset 0 1px 1px rgba(255, 255, 255, 0.45);
+  /* 悬停时把投影加大一档。不能直接改 --ball-shadow（那是配色的一部分），
+     所以在这里叠一层额外的投影。 */
+  filter: drop-shadow(0 3px 6px rgba(0, 0, 0, 0.22));
 }
 
 .ball:active {
@@ -157,18 +161,22 @@ textarea {
 }
 
 .ball__mark {
-  /* 图形资源是 156×104（宽高比约 1.5:1），不是正方形。
-     所以**必须**用固定宽度 + 自动高度，不能写 width/height 都是 100%——
-     那会把图形纵向拉伸变形。
-
-     宽度取球直径的 60%：这是实测下来"够大但不顶到圆边"的比例。 */
+  /* 标志资源是白色 PNG，但配色需要它变成蓝色/白色/任意色。
+     做法是把 PNG 当遮罩（只取 alpha 通道），再用 background-color 上色。
+     这样一份资源就能配所有配色，不用为每种颜色单独存图。 */
+  display: block;
   width: 60%;
-  height: auto;
-  /* contain 兜底：万一以后换了别的宽高比的资源，也不会被拉变形 */
-  object-fit: contain;
+  aspect-ratio: 156 / 104; /* 与资源实际宽高比一致，避免拉伸 */
+  background-color: var(--ball-mark, #1d4ed8);
+  -webkit-mask-image: var(--logo-mark-mask);
+  mask-image: var(--logo-mark-mask);
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
   pointer-events: none;
-  /* 资源里已经带了柔光，这里只补一点点厚度，别叠太多 */
-  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.2));
 }
 
 /* 右键菜单改用系统原生菜单（见 src-tauri/src/ballmenu.rs），

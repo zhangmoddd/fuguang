@@ -8,6 +8,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 
 import { api } from "./lib/api";
+import { applyBallTheme } from "./lib/ball-theme";
 import { applyFontSize } from "./lib/ui-scale";
 import { AlertWindow } from "./windows/AlertWindow";
 import { BallWindow } from "./windows/BallWindow";
@@ -25,18 +26,21 @@ function resolveWindow(): React.ComponentType {
 const Root = resolveWindow();
 
 /**
- * 尽早套用用户设的字号。
+ * 尽早套用用户的界面偏好（字号、悬浮球配色）。
  *
- * 必须在**渲染之前**发起：设置是异步读的，晚一步就会先按默认字号画一帧
+ * 必须在**渲染之前**发起：设置是异步读的，晚一步就会先按默认样式画一帧
  * 再跳变，看起来像闪了一下。
  *
- * 读失败也不管——用 CSS 里的默认值即可，字号不该成为打不开界面的原因。
+ * 读失败也不管——用 CSS 里的默认值即可，外观偏好不该成为打不开界面的原因。
  */
 void api
   .settingsGet()
-  .then((s) => applyFontSize(s.fontSizePx))
+  .then((s) => {
+    applyFontSize(s.fontSizePx);
+    applyBallTheme(s.ballTheme);
+  })
   .catch(() => {
-    /* 用默认字号 */
+    /* 用默认样式 */
   });
 
 /**

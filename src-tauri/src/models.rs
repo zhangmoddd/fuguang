@@ -233,6 +233,33 @@ pub struct Settings {
     /// 所以只允许 `FONT_SIZE_MIN..=FONT_SIZE_MAX` 之间（见 [`Settings::clamp`]）。
     #[serde(default = "default_font_size")]
     pub font_size_px: u32,
+
+    /// 悬浮球的配色方案 id。
+    ///
+    /// 存 id 而不是具体颜色：每个配色需要**同时**决定底色、标志颜色、描边，
+    /// 三者必须配套（深色底配白标、浅色底配深标），
+    /// 让用户自由填颜色很容易配出"标志和底色糊在一起"的组合。
+    #[serde(default = "default_ball_theme")]
+    pub ball_theme: String,
+}
+
+/// 悬浮球可选配色。与前端 `src/lib/ball-theme.ts` 里的 id 一一对应。
+///
+/// 两边都要有：Rust 侧用于校验（防止手改数据文件写入无效 id），
+/// 前端侧用于渲染。新增配色时两边都要加。
+pub const BALL_THEMES: [&str; 7] = [
+    "white",
+    "soft-blue",
+    "graphite",
+    "dark",
+    "purple",
+    "teal",
+    "classic-blue",
+];
+
+fn default_ball_theme() -> String {
+    // 默认白底蓝标：与软件的浅色主题一致
+    "white".into()
 }
 
 /// 界面字号的下限。再小就真的看不清了。
@@ -266,6 +293,11 @@ impl Settings {
         if self.hotkey.trim().is_empty() {
             self.hotkey = default_hotkey();
         }
+        // 无效的配色 id 会让前端拿不到任何样式，球会变成没有底色的一团。
+        // 认不出来就退回默认值，而不是让它空着。
+        if !BALL_THEMES.contains(&self.ball_theme.as_str()) {
+            self.ball_theme = default_ball_theme();
+        }
     }
 }
 
@@ -279,6 +311,7 @@ impl Default for Settings {
             hotkey_enabled: true,
             hotkey: default_hotkey(),
             font_size_px: default_font_size(),
+            ball_theme: default_ball_theme(),
         }
     }
 }
@@ -449,6 +482,38 @@ mod tests {
         };
         s.clamp();
         assert_eq!(s.hotkey, "Ctrl+Shift+Space");
+    }
+
+    #[test]
+    fn 悬浮球配色默认是白底蓝标() {
+        let s: Settings = serde_json::from_str("{}").expect("空设置必须能解析");
+        assert_eq!(s.ball_theme, "white");
+    }
+
+    #[test]
+    fn 无效的悬浮球配色会退回默认值() {
+        // 场景：用户手动改了 settings.json，或者以后删掉了某个配色方案。
+        // 不校验的话前端查不到对应样式，球会变成没有底色的一团。
+        let mut s = Settings {
+            ball_theme: "neon-pink".into(),
+            ..Settings::default()
+        };
+        s.clamp();
+        assert_eq!(s.ball_theme, "white");
+    }
+
+    #[test]
+    fn 全部合法配色都能通过校验() {
+        // 这条保证 Rust 侧的白名单和前端实际提供的配色不会脱节：
+        // 前端多给了一个而这里没加，用户选了就会被悄悄改回默认值
+        for theme in BALL_THEMES {
+            let mut s = Settings {
+                ball_theme: theme.into(),
+                ..Settings::default()
+            };
+            s.clamp();
+            assert_eq!(s.ball_theme, theme, "合法配色不该被改动：{theme}");
+        }
     }
 
     #[test]

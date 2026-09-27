@@ -14,6 +14,7 @@ import {
   Command,
   FolderOpen,
   Info,
+  Palette,
   Pin,
   Power,
   RotateCcw,
@@ -22,6 +23,7 @@ import {
 } from "lucide-react";
 
 import { api, type Settings } from "../../lib/api";
+import { BALL_THEMES, applyBallTheme } from "../../lib/ball-theme";
 import { FONT_SIZE_PRESETS, applyFontSize } from "../../lib/ui-scale";
 import type { FeatureModule } from "../registry";
 
@@ -177,6 +179,23 @@ export function SettingsPanel() {
     }
   };
 
+  /**
+   * 改悬浮球配色。
+   *
+   * 同样是先本地套用再保存——配色是"所见即所得"的操作，
+   * 等一次 IPC 往返再变会有明显延迟感。
+   */
+  const setBallTheme = async (id: string) => {
+    applyBallTheme(id);
+    if (settings) setSettings({ ...settings, ballTheme: id });
+    try {
+      await api.settingsSave({ ...settings!, ballTheme: id });
+      setError(null);
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
   /** 录制热键时的键盘处理。 */
   const onRecorderKeyDown = (e: React.KeyboardEvent) => {
     if (!recording) return;
@@ -247,6 +266,47 @@ export function SettingsPanel() {
                 {/* 每一档用它自己的字号显示，这样不用点就能看出差别 */}
                 <span style={{ fontSize: `${preset.value}px` }}>{preset.label}</span>
                 <em className="settings__size-px">{preset.value}px</em>
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="settings__row settings__row--spaced">
+          <Palette size={15} className="settings__icon" />
+          <span className="settings__label">
+            悬浮球配色
+            <em className="settings__hint">
+              只影响屏幕上那个小球。深色底配白标志、浅色底配深标志，
+              所以这里给的是成对的方案，不能单独挑颜色
+            </em>
+          </span>
+        </div>
+
+        <div className="settings__balls">
+          {BALL_THEMES.map((theme) => {
+            const active = settings.ballTheme === theme.id;
+            return (
+              <button
+                key={theme.id}
+                type="button"
+                className={`settings__ball${active ? " settings__ball--active" : ""}`}
+                onClick={() => void setBallTheme(theme.id)}
+                title={theme.label}
+              >
+                {/* 直接按配色画出小球本体，所见即所得 */}
+                <span
+                  className="settings__ball-dot"
+                  style={{
+                    background: theme.background,
+                    borderColor: theme.border,
+                    boxShadow: theme.shadow,
+                  }}
+                >
+                  <span
+                    className="settings__ball-mark"
+                    style={{ backgroundColor: theme.mark }}
+                  />
+                </span>
               </button>
             );
           })}

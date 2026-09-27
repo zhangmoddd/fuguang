@@ -28,6 +28,13 @@ rem ===========================================================
 
 cd /d "%~dp0"
 
+rem Turn off the console's QuickEdit mode. See the dev-mode script header
+rem for the full explanation: a stray click in this window silently
+rem suspends the build.
+if exist "tools\console-quiet.ps1" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "tools\console-quiet.ps1" >nul 2>nul
+)
+
 echo ===========================================================
 echo  Building Fuguang RELEASE
 echo ===========================================================

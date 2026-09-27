@@ -24,6 +24,25 @@ rem ===========================================================
 
 cd /d "%~dp0"
 
+rem -----------------------------------------------------------
+rem  Turn off the console's "QuickEdit mode".
+rem
+rem  With QuickEdit on (the Windows default), a single click inside
+rem  this window starts a text selection, and Windows then SUSPENDS
+rem  whatever process is writing to the console. The build just stops
+rem  mid-way with no further output -- it looks exactly like a hang.
+rem  Pressing Enter releases it.
+rem
+rem  Since compiling takes minutes, users WILL click this window.
+rem  Turning it off removes the trap. Copying still works through the
+rem  right-click "Mark" menu.
+rem
+rem  Failures are ignored: the worst case is the old behaviour.
+rem -----------------------------------------------------------
+if exist "tools\console-quiet.ps1" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "tools\console-quiet.ps1" >nul 2>nul
+)
+
 where npm >nul 2>nul
 if errorlevel 1 (
     echo [ERROR] npm not found. Please install Node.js first:

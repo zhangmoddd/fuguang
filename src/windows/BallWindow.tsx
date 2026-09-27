@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
+import logoMark from "../assets/logo-mark.png";
 import { api } from "../lib/api";
 
 export function BallWindow() {
@@ -91,7 +92,7 @@ export function BallWindow() {
         onContextMenu={onContextMenu}
         title="左键打开面板 · 右键快捷菜单 · 按住可拖动"
       >
-        <span className="ball__glyph">浮</span>
+        <img className="ball__mark" src={logoMark} alt="" draggable={false} />
       </div>
     </div>
   );

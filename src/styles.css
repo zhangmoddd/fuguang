@@ -156,16 +156,19 @@ textarea {
   opacity: 0.6;
 }
 
-.ball__glyph {
-  /* 刻意**不**跟随字号设置。
-     小球是固定 52px 的圆（尺寸还和 Rust 侧的 BALL_DIAMETER 对齐），
-     字跟着放大到"特大"档就会顶到圆边甚至溢出。
-     它是 logo 而不是需要阅读的正文，保持稳定更好。 */
-  font-size: 19px;
-  font-weight: 600;
-  color: #fff;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+.ball__mark {
+  /* 图形资源是 156×104（宽高比约 1.5:1），不是正方形。
+     所以**必须**用固定宽度 + 自动高度，不能写 width/height 都是 100%——
+     那会把图形纵向拉伸变形。
+
+     宽度取球直径的 60%：这是实测下来"够大但不顶到圆边"的比例。 */
+  width: 60%;
+  height: auto;
+  /* contain 兜底：万一以后换了别的宽高比的资源，也不会被拉变形 */
+  object-fit: contain;
   pointer-events: none;
+  /* 资源里已经带了柔光，这里只补一点点厚度，别叠太多 */
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.2));
 }
 
 /* 右键菜单改用系统原生菜单（见 src-tauri/src/ballmenu.rs），

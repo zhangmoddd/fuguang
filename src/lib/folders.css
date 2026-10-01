@@ -268,6 +268,7 @@
 }
 
 .folderpick__row {
+  position: relative; /* 层级引导线要相对它绝对定位 */
   display: flex;
   align-items: center;
   gap: 6px;
@@ -286,6 +287,40 @@
 
 .folderpick__row:hover {
   background: var(--bg-hover);
+}
+
+/* 「顶层」是根：加粗 + 下面一条分隔线，让它和下面的文件夹明显不是一级。
+   不加这个的话它和顶层文件夹的缩进一样，看起来是平级的（用户就是这么反馈的）。 */
+.folderpick__row--root {
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  border-radius: 6px 6px 0 0;
+  margin-bottom: 2px;
+}
+
+/* 根行右边那句说明。它是解释性的，不该抢名字的注意力，所以压暗、变小。
+   `min-width: 0` 是必须的：flex 项默认 `min-width: auto`，压不到内容宽度以下，
+   那句说明会把整行撑出浮层（`white-space: nowrap` 时更明显）。 */
+.folderpick__aside {
+  margin-left: auto;
+  min-width: 0;
+  font-style: normal;
+  font-weight: 400;
+  font-size: var(--fs-2xs);
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 每一级祖先一条竖线，顺着它就能看出"这是谁的子级"。
+   只靠 16px 的缩进，深一层和深两层几乎看不出区别。 */
+.folderpick__guide {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border-strong);
+  pointer-events: none;
 }
 
 /* 条目当前所在的层：标出来，避免用户选了个"原地不动"的目标还以为没生效 */

@@ -512,7 +512,23 @@ export interface FolderPickerProps {
  *
  * 树控件要维护展开/收起状态，而文件夹通常只有几十个。压平 + 缩进一次就能看全，
  * 少一层交互，也少一份要维护的状态。
+ *
+ * # 但「压平 + 缩进」光靠几像素的缩进是不够的
+ *
+ * 原来的写法里「顶层」和顶层文件夹的缩进**完全一样**，看起来是平级的 ——
+ * 用户根本看不出「顶层」是所有文件夹的父级，也看不出哪几个文件夹是子级。
+ * 现在三件事一起做：
+ * 1. 「顶层」单独一行、加粗、下面一条分隔线，明确它是根；
+ * 2. 所有文件夹从「顶层」再缩进一级；
+ * 3. 每一级祖先画一条竖引导线，能顺着线看出「它是谁的子级」。
  */
+
+/** 「顶层」那一行的左内边距。 */
+const ROOT_INDENT = 9;
+/** 文件夹相对「顶层」再缩进多少，以及每深一级再加多少。 */
+const FOLDER_INDENT = 26;
+const INDENT_STEP = 16;
+
 export function FolderPicker({ folders, current, onPick, onClose }: FolderPickerProps) {
   const flat = useMemo(() => flattenFolders(folders), [folders]);
 
@@ -536,11 +552,18 @@ export function FolderPicker({ folders, current, onPick, onClose }: FolderPicker
         <div className="folderpick__list">
           <button
             type="button"
-            className={`folderpick__row${current === null ? " folderpick__row--on" : ""}`}
+            className={`folderpick__row folderpick__row--root${
+              current === null ? " folderpick__row--on" : ""
+            }`}
+            style={{ paddingLeft: ROOT_INDENT }}
             onClick={() => onPick(null)}
+            title="所有文件夹都在这一层下面"
           >
             <Home size={12} className="folderpick__icon" />
             顶层
+            <em className="folderpick__aside">
+              {flat.length > 0 ? `下面 ${flat.length} 个文件夹都在它里面` : "还没有子文件夹"}
+            </em>
           </button>
 
           {flat.map(({ folder, depth }) => (
@@ -549,10 +572,21 @@ export function FolderPicker({ folders, current, onPick, onClose }: FolderPicker
               key={folder.id}
               className={`folderpick__row${current === folder.id ? " folderpick__row--on" : ""}`}
               // 缩进表示层级。用 padding 而不是 margin：整行都保持可点
-              style={{ paddingLeft: 9 + depth * 14 }}
+              style={{ paddingLeft: FOLDER_INDENT + depth * INDENT_STEP }}
               onClick={() => onPick(folder.id)}
               title={folder.note || folder.name}
             >
+              {/* 每一级祖先一条竖引导线。位置取"上一级与这一级的中间"，
+                  这样线正好落在缩进台阶上，能顺着它看出父子关系。 */}
+              {Array.from({ length: depth }, (_, i) => (
+                <span
+                  key={i}
+                  className="folderpick__guide"
+                  style={{
+                    left: FOLDER_INDENT - INDENT_STEP / 2 + i * INDENT_STEP,
+                  }}
+                />
+              ))}
               <FolderIcon size={12} className="folderpick__icon" />
               {folder.name}
             </button>

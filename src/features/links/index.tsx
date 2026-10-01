@@ -25,7 +25,7 @@
  * 4. **图标是装饰品，提取失败一律静默降级**成按 kind 区分的内置图标。
  *    Rust 侧也约定「任何失败都返回 null，绝不 panic」，两边口径一致。
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
   AppWindow,
@@ -35,6 +35,7 @@ import {
   FolderInput,
   Globe,
   Link2,
+  MoreHorizontal,
   Pencil,
   Terminal,
   Trash2,
@@ -56,6 +57,7 @@ import {
 import { FolderBar, FolderEditor, FolderPicker, FolderTiles, useFolders } from "../../lib/folders-ui";
 import { allPaths } from "../../lib/dialog";
 import { useDragSort } from "../../lib/drag-drop";
+import { placeMenu } from "../../lib/menu-position";
 import { useZoom } from "../../lib/zoom";
 import type { FeatureModule } from "../registry";
 
@@ -308,6 +310,13 @@ export function LinksPanel() {
   /** 正在编辑启动参数的那条链接。 */
   const [argsId, setArgsId] = useState<string | null>(null);
   const [argsText, setArgsText] = useState("");
+  /**
+   * 右上角「⋯」菜单：是哪一条、以及那个按钮的矩形（用来把菜单贴着它展开）。
+   *
+   * 存矩形而不是存"上/下"两个坐标：面板宽度固定 420，但格子可能在任意一行，
+   * 菜单要按按钮的实际位置决定往上还是往下翻。
+   */
+  const [menu, setMenu] = useState<{ id: string; rect: DOMRect } | null>(null);
 
   /**
    * 重命名是否已被取消（按了 Esc）。
@@ -452,9 +461,11 @@ export function LinksPanel() {
       }
       void reorderLinks(draggedId, spot.id, spot.before);
     },
-    // 链接格子的本体就是一个按钮（点了就打开），所以不能沿用"排除所有按钮"的默认值，
-    // 只排除那一排悬停操作按钮和就地重命名/参数输入框
-    ignoreSelector: ".links__actions, input",
+    // 只排除那一排悬停操作按钮和就地编辑框。
+    // 页面这一层只是**追加**排除项，真正兜底的是 drag-drop 里的控件底线
+    // （见 CONTROL_SELECTOR）：格子本体是个按钮、但显式标了拖拽抓手，
+    // 所以它仍然能拖；「⋯」和输入框没有抓手，老老实实是控件。
+    ignoreSelector: ".links__more, input",
   });
 
   // 成功提示看一眼就够，2.4 秒自动消失；
@@ -709,6 +720,7 @@ export function LinksPanel() {
   };
 
   const startRename = (link: LinkItem) => {
+    setMenu(null);
     renameAborted.current = false;
     renamingRef.current = link.id;
     setRenamingId(link.id);
@@ -738,6 +750,7 @@ export function LinksPanel() {
   };
 
   const startArgs = (link: LinkItem) => {
+    setMenu(null);
     argsAborted.current = false;
     argsEditingRef.current = link.id;
     setArgsId(link.id);
@@ -770,6 +783,15 @@ export function LinksPanel() {
   };
 
   // ---- 渲染 ----
+
+  /**
+   * 「⋯」菜单要操作的那条链接。
+   *
+   * 每次都从 `links` 里现查，而不是把整条存进 `menu`：存下来的话，
+   * 菜单开着的时候数据一变（重命名提交、图标提取回来）它就成了一份陈旧快照。
+   * 查不到（被删了）就当菜单没开。
+   */
+  const menuLink = menu ? links.find((l) => l.id === menu.id) ?? null : null;
 
   return (
     <div
@@ -944,62 +966,63 @@ export function LinksPanel() {
             </div>
           )}
 
-        {visible.map((link) => (
-          <article
-            key={link.id}
-            className={[
-              "links__tile",
-              busyId === link.id ? "links__tile--busy" : "",
-              drag.draggingId === link.id ? "drag-source" : "",
-              drag.overClass(link.id),
-            ]
-              .filter(Boolean)
-              .join(" ")}
-            title={link.args ? `${link.target}\n参数：${link.args}` : link.target}
-            {...drag.itemProps(link.id)}
-          >
-            {argsId === link.id ? (
-              <div className="links__tile-body">
+        {visible.map((link) => {
+          /**
+           * 就地编辑（重命名 / 启动参数）：**整行宽**。
+           *
+           * 原来是挤在格子里的一个小输入框 —— 默认档位一格只有 86~95px 宽，
+           * 稍微长一点的名字根本看不全（用户反馈「重命名也一样看不完全文字」）。
+           * 改成占满一整行（`grid-column: 1 / -1`）之后，输入框有 400px 可用，
+           * 而且位置就在原来那一格上，不会找不到自己在改哪一条。
+           */
+          const editing = renamingId === link.id || argsId === link.id;
+          if (editing) {
+            const isArgs = argsId === link.id;
+            return (
+              <div className="links__editor" key={link.id}>
                 <LinkGlyph link={link} />
                 <input
-                  className="links__rename"
+                  className="links__editinput"
                   autoFocus
-                  value={argsText}
-                  placeholder="启动参数"
-                  title="例如 --profile work；留空表示不带参数"
-                  onChange={(e) => setArgsText(e.target.value)}
+                  value={isArgs ? argsText : renameText}
+                  placeholder={isArgs ? "启动参数，例如 --profile work" : "名字"}
+                  title={isArgs ? "留空表示不带参数" : undefined}
+                  onChange={(e) =>
+                    isArgs ? setArgsText(e.target.value) : setRenameText(e.target.value)
+                  }
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") void commitArgs(link);
-                    if (e.key === "Escape") {
-                      // 同重命名：Esc 只取消这次输入，别触发主面板的「收起面板」
-                      e.stopPropagation();
-                      cancelArgs();
+                    if (e.key === "Enter") {
+                      void (isArgs ? commitArgs(link) : commitRename(link));
                     }
-                  }}
-                  onBlur={() => void commitArgs(link)}
-                />
-              </div>
-            ) : renamingId === link.id ? (
-              <div className="links__tile-body">
-                <LinkGlyph link={link} />
-                <input
-                  className="links__rename"
-                  autoFocus
-                  value={renameText}
-                  onChange={(e) => setRenameText(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void commitRename(link);
                     if (e.key === "Escape") {
                       // 主面板把 Esc 当「收起面板」的全局快捷键（见 PanelWindow.tsx）。
-                      // 重命名时按 Esc 的意图只是取消输入，所以别让它冒泡到 window。
+                      // 这里按 Esc 的意图只是取消这次输入，所以别让它冒泡到 window。
                       e.stopPropagation();
-                      cancelRename();
+                      if (isArgs) cancelArgs();
+                      else cancelRename();
                     }
                   }}
-                  onBlur={() => void commitRename(link)}
+                  onBlur={() => void (isArgs ? commitArgs(link) : commitRename(link))}
                 />
+                <em className="links__edithint">回车保存 · Esc 取消</em>
               </div>
-            ) : (
+            );
+          }
+
+          return (
+            <article
+              key={link.id}
+              className={[
+                "links__tile",
+                busyId === link.id ? "links__tile--busy" : "",
+                drag.draggingId === link.id ? "drag-source" : "",
+                drag.overClass(link.id),
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              title={link.args ? `${link.target}\n参数：${link.args}` : link.target}
+              {...drag.itemProps(link.id)}
+            >
               <button
                 // 拖拽抓手：这个按钮就是链接格子的可拖区域。
                 // **必须显式标出来** —— drag-drop 里有一条内置的控件底线会拦掉
@@ -1019,40 +1042,25 @@ export function LinksPanel() {
                 <LinkGlyph link={link} />
                 <span className="links__name">{link.name}</span>
               </button>
-            )}
 
-            {/* 悬停才出现：平时不抢视线，鼠标移上来才给这几个修改性/破坏性操作 */}
-            <div className="links__actions">
+              {/* 悬停才出现。**只占右上角 20px**：
+                  原来这里是一排四个图标按钮（加起来 83px），而格子默认只有
+                  86~95px 宽 —— 鼠标一移上去按钮就铺满整格，把图标和名字压在
+                  下面（用户反馈「放上去第一个字都有点看不清」）。
+                  收成一个「⋯」之后，格子的内容始终看得见。 */}
               <button
-                className="iconbtn"
-                onClick={() => setMovingId(link.id)}
-                title="移动到文件夹"
+                className="iconbtn links__more"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setMenu({ id: link.id, rect: e.currentTarget.getBoundingClientRect() });
+                }}
+                title="更多操作"
               >
-                <FolderInput size={12} />
+                <MoreHorizontal size={13} />
               </button>
-              {/* 启动参数只对程序和文件有意义；网址加了也没人消费 */}
-              {link.kind !== "url" && (
-                <button
-                  className="iconbtn"
-                  onClick={() => startArgs(link)}
-                  title="启动参数（例如 --profile work）"
-                >
-                  <Terminal size={12} />
-                </button>
-              )}
-              <button className="iconbtn" onClick={() => startRename(link)} title="重命名">
-                <Pencil size={12} />
-              </button>
-              <button
-                className="iconbtn iconbtn--danger"
-                onClick={() => void remove(link)}
-                title="删除"
-              >
-                <Trash2 size={12} />
-              </button>
-            </div>
-          </article>
-        ))}
+            </article>
+          );
+        })}
       </div>
 
       {dragAvailable && !loading && links.length > 0 && (
@@ -1071,6 +1079,159 @@ export function LinksPanel() {
           onClose={() => setMovingId(null)}
         />
       )}
+
+      {menu && menuLink && (
+        <LinkMenu
+          link={menuLink}
+          anchor={menu.rect}
+          onClose={() => setMenu(null)}
+          onMove={() => {
+            setMenu(null);
+            setMovingId(menuLink.id);
+          }}
+          onArgs={() => startArgs(menuLink)}
+          onRename={() => startRename(menuLink)}
+          onRemove={() => {
+            setMenu(null);
+            void remove(menuLink);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ===============================================================
+// 「⋯」菜单
+// ===============================================================
+
+/**
+ * 格子右上角那个「⋯」点开的小菜单。
+ *
+ * # 为什么不再是一排四个图标按钮
+ *
+ * 链接页默认档位一格只有 86~95px 宽，而四个 20px 的按钮加起来 83px ——
+ * 鼠标一移上去，按钮几乎铺满整格，把图标和名字压在下面（用户反馈
+ * 「放上去第一个字都有点看不清」）。收成一个「⋯」之后悬停只占右上角 20px。
+ *
+ * # 为什么菜单里写文字而不是只放图标
+ *
+ * 图标按钮的问题是**得先悬停看 tooltip 才知道是什么**，而那个 tooltip 又会
+ * 盖住格子的名字。写成「移动到文件夹 / 启动参数 / 重命名 / 删除」之后一眼就
+ * 知道有什么可用 —— 用户原来就问过「这个启动参数是什么」。
+ *
+ * # 为什么不用整屏遮罩
+ *
+ * 四个动作的小菜单用遮罩把面板压暗太重了（`FolderPicker` 用遮罩是因为它
+ * 是"选一个目标"的模态选择）。这里改成在 document 上挂一个捕获阶段的
+ * `pointerdown`，点到菜单外面就关 —— 和 `FolderEditor` 同一个做法。
+ * 挂监听是在渲染之后的 effect 里，所以**不会**被"点开菜单的那一次 pointerdown"
+ * 立刻关掉。
+ */
+function LinkMenu({
+  link,
+  anchor,
+  onClose,
+  onMove,
+  onArgs,
+  onRename,
+  onRemove,
+}: {
+  link: LinkItem;
+  anchor: DOMRect;
+  onClose: () => void;
+  onMove: () => void;
+  onArgs: () => void;
+  onRename: () => void;
+  onRemove: () => void;
+}) {
+  const boxRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+
+  useEffect(() => {
+    const onDown = (e: PointerEvent) => {
+      const box = boxRef.current;
+      if (box && !box.contains(e.target as Node)) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // 同就地编辑：Esc 只关这一层，别连带把整个面板收起来
+      e.stopPropagation();
+      onClose();
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("keydown", onKey, true);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("keydown", onKey, true);
+    };
+  }, [onClose]);
+
+  /**
+   * 贴住「⋯」按钮定位，但不许出面板。
+   *
+   * 必须**量完之后**再摆：菜单高度取决于有没有「启动参数」那一行
+   * （网址没有），写死高度会让最后一行的菜单翻错方向。
+   * 用 `useLayoutEffect` 是为了在浏览器绘制之前就摆好，用户看不到闪一下。
+   * 坐标怎么算是纯函数（`lib/menu-position.ts`），有单测兜着边缘情况。
+   */
+  useLayoutEffect(() => {
+    const box = boxRef.current;
+    if (!box) return;
+    const rect = box.getBoundingClientRect();
+    setPos(
+      placeMenu(
+        anchor,
+        { width: rect.width, height: rect.height },
+        { width: window.innerWidth, height: window.innerHeight },
+      ),
+    );
+  }, [anchor]);
+
+  return (
+    <div
+      className="linkmenu"
+      ref={boxRef}
+      // 量之前先藏起来，避免"先出现在左上角再跳过去"
+      style={{ left: pos?.left ?? 0, top: pos?.top ?? 0, visibility: pos ? "visible" : "hidden" }}
+      // 菜单内部的点击不该冒泡到别处（例如格子的"点开"）
+      onClick={(e) => e.stopPropagation()}
+    >
+      {/* 把整条名字显示出来：格子里的名字最多两行、会被截断，
+          这里是用户唯一能看到全名的地方 */}
+      <div className="linkmenu__title" title={link.target}>
+        {link.name}
+      </div>
+
+      <button type="button" className="linkmenu__row" onClick={onMove}>
+        <FolderInput size={13} />
+        移动到文件夹
+      </button>
+
+      {/* 启动参数只对程序和文件有意义；网址加了也没人消费 */}
+      {link.kind !== "url" && (
+        <button type="button" className="linkmenu__row" onClick={onArgs}>
+          <Terminal size={13} />
+          启动参数
+          <em className="linkmenu__aside">
+            {link.args ? link.args : "给程序加命令行参数"}
+          </em>
+        </button>
+      )}
+
+      <button type="button" className="linkmenu__row" onClick={onRename}>
+        <Pencil size={13} />
+        重命名
+      </button>
+
+      <button
+        type="button"
+        className="linkmenu__row linkmenu__row--danger"
+        onClick={onRemove}
+      >
+        <Trash2 size={13} />
+        删除
+      </button>
     </div>
   );
 }

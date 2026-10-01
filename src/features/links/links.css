@@ -233,61 +233,166 @@
   word-break: break-all;
 }
 
-/* 就地重命名：不做弹窗，改个名字不该打断视线 */
-.links__rename {
-  width: 100%;
+/* ---- 就地编辑（重命名 / 启动参数）----
+   占满一整行而不是挤在格子里：默认档位一格只有 86~95px 宽，
+   稍微长一点的名字根本看不全（用户反馈「重命名也一样看不完全文字」）。
+   整行宽有 400px，而且位置就在原来那一格上，不会找不到自己在改哪一条。 */
+
+.links__editor {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
   background: var(--bg-solid);
   border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+}
+
+.links__editor .links__glyph {
+  /* 编辑器是横排的，图标不该跟着格子的缩放档位变大变小 */
+  width: 22px;
+  height: 22px;
+  padding: 0;
+}
+
+.links__editinput {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-solid);
+  border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 3px 5px;
+  padding: 5px 7px;
   color: var(--text);
   font-family: inherit;
-  font-size: var(--fs-sm);
-  text-align: center;
+  font-size: var(--fs-md);
   outline: none;
 }
 
-/* ---- 悬停操作 ---- */
+.links__editinput:focus {
+  border-color: var(--accent);
+}
 
-.links__actions {
+/* 「回车保存 · Esc 取消」这句提示：不说的话，光标停在框里不动会让人以为卡住了 */
+.links__edithint {
+  font-style: normal;
+  font-size: var(--fs-2xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* ---- 「⋯」更多操作 ---- */
+
+/* 只占右上角 20px。原来这里是一排四个图标按钮（加起来 83px），
+   而格子默认只有 86~95px 宽 —— 悬停时按钮铺满整格，把图标和名字压在下面。 */
+.links__more {
   position: absolute;
   top: 2px;
   right: 2px;
-  display: flex;
-  gap: 1px;
+  width: calc(20px * var(--tile-scale, 1));
+  height: calc(20px * var(--tile-scale, 1));
+  /* 压在图标上，必须有实底，否则和图标叠在一起看不清 */
+  background: var(--bg-solid);
+  border: 1px solid var(--border);
   opacity: 0;
   /* 用 visibility 而不是 display 来隐藏：
-     display 切换会让布局变化，鼠标下方的元素一变，:hover 判定就可能抖动，
-     两个按钮会一闪一闪。visibility 不改变布局，最稳。 */
+     display 切换会让布局变化，鼠标下方的元素一变，:hover 判定就可能抖动。 */
   visibility: hidden;
   transition: opacity 0.1s ease;
 }
 
-.links__tile:hover .links__actions,
-.links__tile:focus-within .links__actions {
+.links__tile:hover .links__more,
+.links__tile:focus-within .links__more {
   opacity: 1;
   visibility: visible;
 }
 
-.links__actions .iconbtn {
-  /* 跟着缩放一起变。不缩的话小档位下这一排按钮会比格子还宽，
-     而 .links__tile 是 overflow: hidden，最左边那个会被直接裁掉。 */
-  width: calc(20px * var(--tile-scale, 1));
-  height: calc(20px * var(--tile-scale, 1));
-  /* 压在图标右上角，必须有实底，否则和图标叠在一起看不清 */
-  background: var(--bg-solid);
-  border: 1px solid var(--border);
+/* 覆盖通用 .iconbtn:hover 的透明底：这里要实底，否则会透出下面的图标 */
+.links__more:hover {
+  background: var(--bg-hover);
 }
 
 /* lucide 的尺寸是写死在 svg 属性上的，CSS 能覆盖它 */
-.links__actions .iconbtn svg {
-  width: calc(12px * var(--tile-scale, 1));
-  height: calc(12px * var(--tile-scale, 1));
+.links__more svg {
+  width: calc(13px * var(--tile-scale, 1));
+  height: calc(13px * var(--tile-scale, 1));
 }
 
-/* 覆盖通用 .iconbtn:hover 的透明底：这里要的是实底，否则会透出下面的图标 */
-.links__actions .iconbtn:hover {
+/* ---- 「⋯」菜单 ----
+   贴住按钮定位，但用 `position: fixed`：面板里到处都是 `overflow: auto`
+   的滚动容器，absolute 会被祖先裁掉（`FolderPicker` 用居中浮层是同一个原因）。 */
+
+.linkmenu {
+  position: fixed;
+  z-index: 60;
+  min-width: 186px;
+  max-width: 260px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  background: var(--bg-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
+}
+
+/* 完整名字。格子里的名字最多两行、会被截断，这里是唯一能看到全名的地方 */
+.linkmenu__title {
+  padding: 5px 8px 6px;
+  margin-bottom: 3px;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-dim);
+  /* 长名字要能换行显示全，而不是截断 —— 显示全名正是它存在的理由 */
+  word-break: break-all;
+}
+
+.linkmenu__row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 8px;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-md);
+  text-align: left;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.linkmenu__row:hover {
   background: var(--bg-hover);
+}
+
+.linkmenu__row svg {
+  flex-shrink: 0;
+  color: var(--text-dim);
+}
+
+.linkmenu__row--danger,
+.linkmenu__row--danger svg {
+  color: var(--danger);
+}
+
+.linkmenu__row--danger:hover {
+  background: rgba(217, 45, 32, 0.12);
+}
+
+/* 行尾的说明（例如当前填的启动参数）。不该把整行撑宽，所以允许收缩省略 */
+.linkmenu__aside {
+  margin-left: auto;
+  min-width: 0;
+  font-style: normal;
+  font-size: var(--fs-2xs);
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---- 底部说明 ---- */

@@ -37,7 +37,6 @@ import {
   Link2,
   MoreHorizontal,
   Pencil,
-  Terminal,
   Trash2,
   TriangleAlert,
   X,
@@ -307,8 +306,15 @@ export function LinksPanel() {
   const [notice, setNotice] = useState<Notice | null>(null);
   /** 正在启动的那一条。用来压暗格子，避免用户以为「点了没反应」而连点。 */
   const [busyId, setBusyId] = useState<string | null>(null);
-  const [renamingId, setRenamingId] = useState<string | null>(null);
-  const [renameText, setRenameText] = useState("");
+  /**
+   * 正在就地编辑的那条链接，以及它的草稿。
+   *
+   * 三个字段一起编辑（名字 / 目标 / 启动参数）：原来分成"重命名"和"启动参数"
+   * 两个独立的小编辑器，而**目标路径根本没有入口** —— 路径写错只能删了重加。
+   * 别的页签的铅笔都是"打开完整编辑面"，这里也统一成一样。
+   */
+  const [editId, setEditId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState({ name: "", target: "", args: "" });
   /** 网址是「名称 + 网址」两个字段，用内联表单而不是 window.prompt：
    *  prompt 在 WebView2 里是浏览器样式的弹框，和面板风格完全不搭，也无法校验。 */
   const [urlOpen, setUrlOpen] = useState(false);
@@ -324,9 +330,6 @@ export function LinksPanel() {
   }>({ open: false, target: null });
   /** 正在「移动到…」的那条链接。 */
   const [movingId, setMovingId] = useState<string | null>(null);
-  /** 正在编辑启动参数的那条链接。 */
-  const [argsId, setArgsId] = useState<string | null>(null);
-  const [argsText, setArgsText] = useState("");
   /**
    * 右上角「⋯」菜单：是哪一条、以及那个按钮的矩形（用来把菜单贴着它展开）。
    *
@@ -336,23 +339,14 @@ export function LinksPanel() {
   const [menu, setMenu] = useState<{ id: string; rect: DOMRect } | null>(null);
 
   /**
-   * 重命名是否已被取消（按了 Esc）。
+   * 这次编辑是否已被取消（按了 Esc）。
    *
    * 取消会让输入框卸载、紧接着触发一次 blur，而 blur 的语义是「保存」。
    * 没有这个闸门的话，「Esc 取消」会被随后的 blur 又存回去。
    */
-  const renameAborted = useRef(false);
-  /** 正在重命名的 id（ref 版）。Enter 提交后紧跟的 blur 要靠它来判断「已经结束了，别再存一次」。 */
-  const renamingRef = useRef<string | null>(null);
-
-  /**
-   * 启动参数编辑的两个闸门，和重命名同款。
-   *
-   * Esc 取消会让输入框卸载、紧接着触发一次 blur，而 blur 的语义是「保存」；
-   * 没有这个闸门的话「Esc 取消」会被随后的 blur 又存回去。
-   */
-  const argsAborted = useRef(false);
-  const argsEditingRef = useRef<string | null>(null);
+  const editAborted = useRef(false);
+  /** 正在编辑的 id（ref 版）。Enter 提交后紧跟的 blur 要靠它判断「已经结束了，别再存一次」。 */
+  const editRef = useRef<string | null>(null);
 
   // ---- 数据 ----
 
@@ -750,67 +744,76 @@ export function LinksPanel() {
     await persist({ ...link, folderId }, `已移动「${link.name}」`);
   };
 
-  const startRename = (link: LinkItem) => {
+  // ---- 就地编辑（名字 / 目标 / 启动参数）----
+
+  const startEdit = (link: LinkItem) => {
     setMenu(null);
-    renameAborted.current = false;
-    renamingRef.current = link.id;
-    setRenamingId(link.id);
-    setRenameText(link.name);
+    editAborted.current = false;
+    editRef.current = link.id;
+    setEditId(link.id);
+    setEditDraft({ name: link.name, target: link.target, args: link.args ?? "" });
   };
 
-  const cancelRename = () => {
-    renameAborted.current = true;
-    renamingRef.current = null;
-    setRenamingId(null);
+  const cancelEdit = () => {
+    editAborted.current = true;
+    editRef.current = null;
+    setEditId(null);
   };
 
-  const commitRename = async (link: LinkItem) => {
+  /** 编辑框里的键盘约定：回车保存、Esc 取消。三个输入框共用。 */
+  const onEditKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Escape") {
+      // 主面板把 Esc 当「收起面板」的全局快捷键（见 PanelWindow.tsx）。
+      // 这里按 Esc 的意图只是取消这次编辑，所以别让它冒泡到 window。
+      e.stopPropagation();
+      cancelEdit();
+    }
+    // 回车交给 `onBlur` 走同一条路：在这里直接提交的话，
+    // 输入框卸载又会触发一次 blur，两次提交要靠 `editRef` 那个闸门挡，
+    // 与其两处都写一遍，不如只留 blur 一条路（它在回车时也会被触发）。
+  };
+
+  const commitLinkEdit = async (link: LinkItem) => {
     // Enter 提交之后输入框会卸载并触发 blur，这里挡掉第二次提交
-    if (renamingRef.current !== link.id) return;
-    renamingRef.current = null;
-    setRenamingId(null);
+    if (editRef.current !== link.id) return;
+    editRef.current = null;
+    setEditId(null);
 
-    if (renameAborted.current) {
-      renameAborted.current = false;
+    if (editAborted.current) {
+      editAborted.current = false;
       return;
     }
 
-    const name = renameText.trim();
-    if (!name || name === link.name) return;
-    await persist({ ...link, name }, "已重命名");
-  };
-
-  const startArgs = (link: LinkItem) => {
-    setMenu(null);
-    argsAborted.current = false;
-    argsEditingRef.current = link.id;
-    setArgsId(link.id);
-    setArgsText(link.args ?? "");
-  };
-
-  const cancelArgs = () => {
-    argsAborted.current = true;
-    argsEditingRef.current = null;
-    setArgsId(null);
-  };
-
-  const commitArgs = async (link: LinkItem) => {
-    // Enter 提交之后输入框会卸载并触发 blur，这里挡掉第二次提交
-    if (argsEditingRef.current !== link.id) return;
-    argsEditingRef.current = null;
-    setArgsId(null);
-
-    if (argsAborted.current) {
-      argsAborted.current = false;
-      return;
-    }
-
-    const text = argsText.trim();
+    const name = editDraft.name.trim() || link.name;
+    const rawTarget = editDraft.target.trim() || link.target;
+    const argsText = editDraft.args.trim();
     // 空串存成 null：模型里 null 表示「没有参数」。
     // 存空串会让「到底有没有参数」变得没法判断，界面上也说不清。
-    const args = text === "" ? null : text;
-    if (args === (link.args ?? null)) return;
-    await persist({ ...link, args }, "已保存启动参数");
+    const args = argsText === "" ? null : argsText;
+
+    /**
+     * 目标变了要**重新判一次类型**，否则图标和"怎么启动"会跟实际对不上：
+     * 把一条 .txt 改成 .exe 之后，它仍然按「文件」显示内置图标。
+     *
+     * 网址不走文件系统判定：`classify_paths` 对 `https://…` 只会拿到
+     * 浏览器的默认图标，而且网址还得补全协议。
+     */
+    let target = rawTarget;
+    let kind = link.kind;
+    if (rawTarget !== link.target) {
+      if (link.kind === "url") {
+        target = normalizeUrl(rawTarget);
+      } else {
+        try {
+          kind = (await api.classifyPaths([rawTarget]))[0] ?? link.kind;
+        } catch {
+          // 判不出来就保留原来的类型：图标不准总比"改不了"好
+        }
+      }
+    }
+
+    if (name === link.name && target === link.target && args === (link.args ?? null)) return;
+    await persist({ ...link, name, target, args, kind }, "已保存");
   };
 
   // ---- 渲染 ----
@@ -1050,43 +1053,71 @@ export function LinksPanel() {
           }
 
           /**
-           * 就地编辑（重命名 / 启动参数）：**整行宽**。
+           * 就地编辑：**整行宽**，而且能改**全部**可改字段（名字 / 目标 / 启动参数）。
            *
-           * 原来是挤在格子里的一个小输入框 —— 默认档位一格只有 86~95px 宽，
-           * 稍微长一点的名字根本看不全（用户反馈「重命名也一样看不完全文字」）。
-           * 改成占满一整行（`grid-column: 1 / -1`）之后，输入框有 400px 可用，
-           * 而且位置就在原来那一格上，不会找不到自己在改哪一条。
+           * 两个理由：
+           * 1. 原来是挤在格子里的小输入框 —— 默认档位一格只有 86~95px 宽，
+           *    稍微长一点的名字根本看不全（用户反馈「重命名也一样看不完全文字」）。
+           *    整行宽之后有 400px 可用，位置还在原来那一格上。
+           * 2. 原来「重命名」只能改名字、**目标路径根本没有编辑入口** ——
+           *    路径写错（这功能最常见的输入错误）只能删了重加，
+           *    而重加要走一次文件选择框。别的页签的铅笔都是"打开完整编辑面"，
+           *    这里也该是。
            */
-          const editing = renamingId === link.id || argsId === link.id;
-          if (editing) {
-            const isArgs = argsId === link.id;
+          if (editId === link.id) {
             return (
               <div className="links__editor" key={link.id}>
                 <LinkGlyph link={link} />
-                <input
-                  className="links__editinput"
-                  autoFocus
-                  value={isArgs ? argsText : renameText}
-                  placeholder={isArgs ? "启动参数，例如 --profile work" : "名字"}
-                  title={isArgs ? "留空表示不带参数" : undefined}
-                  onChange={(e) =>
-                    isArgs ? setArgsText(e.target.value) : setRenameText(e.target.value)
-                  }
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      void (isArgs ? commitArgs(link) : commitRename(link));
-                    }
-                    if (e.key === "Escape") {
-                      // 主面板把 Esc 当「收起面板」的全局快捷键（见 PanelWindow.tsx）。
-                      // 这里按 Esc 的意图只是取消这次输入，所以别让它冒泡到 window。
-                      e.stopPropagation();
-                      if (isArgs) cancelArgs();
-                      else cancelRename();
-                    }
-                  }}
-                  onBlur={() => void (isArgs ? commitArgs(link) : commitRename(link))}
-                />
-                <em className="links__edithint">回车保存 · Esc 取消</em>
+
+                <div className="links__editfields">
+                  <label className="links__editrow">
+                    <span className="links__editlabel">名字</span>
+                    <input
+                      className="links__editinput"
+                      autoFocus
+                      value={editDraft.name}
+                      placeholder={link.name}
+                      onChange={(e) =>
+                        setEditDraft((d) => ({ ...d, name: e.target.value }))
+                      }
+                      onKeyDown={onEditKeyDown}
+                      onBlur={() => void commitLinkEdit(link)}
+                    />
+                  </label>
+
+                  <label className="links__editrow">
+                    <span className="links__editlabel">目标</span>
+                    <input
+                      className="links__editinput"
+                      value={editDraft.target}
+                      title={link.target}
+                      onChange={(e) =>
+                        setEditDraft((d) => ({ ...d, target: e.target.value }))
+                      }
+                      onKeyDown={onEditKeyDown}
+                      onBlur={() => void commitLinkEdit(link)}
+                    />
+                  </label>
+
+                  {/* 启动参数只对程序和文件有意义；网址加了也没人消费 */}
+                  {link.kind !== "url" && (
+                    <label className="links__editrow">
+                      <span className="links__editlabel">参数</span>
+                      <input
+                        className="links__editinput"
+                        value={editDraft.args}
+                        placeholder="留空表示不带参数，例如 --profile work"
+                        onChange={(e) =>
+                          setEditDraft((d) => ({ ...d, args: e.target.value }))
+                        }
+                        onKeyDown={onEditKeyDown}
+                        onBlur={() => void commitLinkEdit(link)}
+                      />
+                    </label>
+                  )}
+
+                  <em className="links__edithint">回车保存 · Esc 取消</em>
+                </div>
               </div>
             );
           }
@@ -1196,8 +1227,7 @@ export function LinksPanel() {
             setMenu(null);
             setMovingId(menuLink.id);
           }}
-          onArgs={() => startArgs(menuLink)}
-          onRename={() => startRename(menuLink)}
+          onEdit={() => startEdit(menuLink)}
           onRemove={() => {
             setMenu(null);
             void remove(menuLink);
@@ -1240,16 +1270,14 @@ function LinkMenu({
   anchor,
   onClose,
   onMove,
-  onArgs,
-  onRename,
+  onEdit,
   onRemove,
 }: {
   link: LinkItem;
   anchor: DOMRect;
   onClose: () => void;
   onMove: () => void;
-  onArgs: () => void;
-  onRename: () => void;
+  onEdit: () => void;
   onRemove: () => void;
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
@@ -1315,20 +1343,15 @@ function LinkMenu({
         移动到文件夹
       </button>
 
-      {/* 启动参数只对程序和文件有意义；网址加了也没人消费 */}
-      {link.kind !== "url" && (
-        <button type="button" className="linkmenu__row" onClick={onArgs}>
-          <Terminal size={13} />
-          启动参数
-          <em className="linkmenu__aside">
-            {link.args ? link.args : "给程序加命令行参数"}
-          </em>
-        </button>
-      )}
-
-      <button type="button" className="linkmenu__row" onClick={onRename}>
+      {/* 一个「编辑」打开**全部可改字段**（名字 / 目标 / 启动参数）。
+          原来拆成「重命名」和「启动参数」两项，而**目标路径根本没有入口** ——
+          路径写错只能删了重加。别的页签的铅笔都是"打开完整编辑面"，这里统一。 */}
+      <button type="button" className="linkmenu__row" onClick={onEdit}>
         <Pencil size={13} />
-        重命名
+        编辑
+        <em className="linkmenu__aside">
+          {link.kind === "url" ? "名字 / 网址" : "名字 / 路径 / 参数"}
+        </em>
       </button>
 
       <button

@@ -257,7 +257,8 @@
 .links__editor {
   grid-column: 1 / -1;
   display: flex;
-  align-items: center;
+  /* 图标对齐第一行输入框的**顶边**：字段有三行，居中的话图标会飘在中间 */
+  align-items: flex-start;
   gap: 8px;
   padding: 8px 10px;
   background: var(--bg-solid);
@@ -270,6 +271,34 @@
   width: 22px;
   height: 22px;
   padding: 0;
+  /* 和第一行输入框的垂直中心对齐（输入框 5px 内边距 + 1px 边框 + 一行文字） */
+  margin-top: 3px;
+}
+
+/* 三个字段竖排。整行宽（400px）是这一版的重点：
+   原来挤在 86~95px 的格子里，稍长的名字根本看不全。 */
+.links__editfields {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.links__editrow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 「名字 / 目标 / 参数」三个标签等宽，输入框左边才对得齐 */
+.links__editlabel {
+  width: 30px;
+  flex-shrink: 0;
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+  text-align: right;
 }
 
 .links__editinput {
@@ -289,13 +318,15 @@
   border-color: var(--accent);
 }
 
-/* 「回车保存 · Esc 取消」这句提示：不说的话，光标停在框里不动会让人以为卡住了 */
+/* 「回车保存 · Esc 取消」这句提示：不说的话，光标停在框里不动会让人以为卡住了。
+   用 `margin-left` 而不是 `padding-left` 对齐输入框：`em` 是行内元素，
+   行内元素的 padding 不影响它的 border-box 左边缘，量出来会差一截
+   （视觉上其实是对齐的，但"看起来对"和"量出来对"应该是一回事）。 */
 .links__edithint {
   font-style: normal;
   font-size: var(--fs-2xs);
   color: var(--text-faint);
-  white-space: nowrap;
-  flex-shrink: 0;
+  margin-left: 36px; /* 和输入框左边缘对齐（标签 30 + 间距 6） */
 }
 
 /* ---- 「⋯」更多操作 ---- */

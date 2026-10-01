@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// 计时器的三种模式。
+/// 计时器的四种模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TimerKind {
@@ -29,6 +29,11 @@ pub enum TimerKind {
     Pomodoro,
     /// 秒表：正向计时，可计次。
     Stopwatch,
+    /// 闹钟：在指定的**钟点**响，可选每天重复。
+    ///
+    /// 和倒计时的区别只有一处：倒计时设的是「多久之后」，
+    /// 闹钟设的是「几点」。两者到点后的收尾完全一样。
+    Alarm,
 }
 
 /// 番茄钟当前处于哪个阶段。
@@ -91,6 +96,29 @@ pub struct Timer {
     /// 计次记录（每次计次时的累计毫秒）。
     #[serde(default)]
     pub laps: Vec<i64>,
+
+    // ---- 闹钟专用 ----
+    /// 响铃的钟点，**从本地零点起的分钟数**（0~1439）。
+    ///
+    /// 必须单独存，理由和倒计时的 `duration_ms` 一样：`ends_at` 是
+    /// 「下一次响的绝对时刻」，响过之后就清空了，代表不了用户设的那个钟点。
+    /// 没有它，「停止」之后再「开始」就只能去猜一个时间。
+    ///
+    /// 存分钟数而不是 `"07:30"` 字符串：字符串要解析、会有格式歧义
+    /// （`7:30` / `07:30` / `0730`），而分钟数是唯一的整数表示，
+    /// 排序和比较都是现成的。
+    ///
+    /// 取值范围刻意不在 Rust 侧夹取：调度线程根本不用它，
+    /// 消费方（前端 `lib/alarm.ts`）会先取模再格式化，一个手改出来的
+    /// `99999` 只会显示成某个合法钟点，不会让任何东西坏掉。
+    #[serde(default)]
+    pub alarm_minutes: u32,
+
+    /// 闹钟是否每天重复。
+    ///
+    /// `false` 表示只响一次，响完就停在「已完成」，等用户再点一次。
+    #[serde(default)]
+    pub alarm_daily: bool,
 
     /// 是否已经提醒过（防止同一轮重复弹窗）。
     #[serde(default)]
@@ -462,6 +490,51 @@ mod tests {
         assert_eq!(t.focus_minutes, 25);
         assert_eq!(t.break_minutes, 5);
         assert_eq!(t.folder_id, None, "老数据没有分类，应落在顶层");
+        // 闹钟字段是后加的，老数据里没有：缺省必须是"零点、不重复"这种
+        // 明确无害的值，而不是让整个文件解析失败
+        assert_eq!(t.alarm_minutes, 0);
+        assert!(!t.alarm_daily);
+    }
+
+    #[test]
+    fn 闹钟的钟点与重复设置能往返序列化() {
+        let t = Timer {
+            id: "a1".into(),
+            name: "起床".into(),
+            kind: TimerKind::Alarm,
+            ends_at: None,
+            remaining_ms: None,
+            duration_ms: None,
+            phase: None,
+            focus_minutes: 25,
+            break_minutes: 5,
+            rounds: 0,
+            elapsed_ms: 0,
+            running_since: None,
+            laps: Vec::new(),
+            // 7:30 = 从本地零点起 450 分钟
+            alarm_minutes: 450,
+            alarm_daily: true,
+            fired: false,
+            folder_id: None,
+            created_at: 1,
+        };
+
+        let json = serde_json::to_string(&t).expect("序列化");
+        assert!(json.contains("\"alarmMinutes\":450"), "实际：{json}");
+        assert!(json.contains("\"alarmDaily\":true"));
+        assert!(!json.contains("alarm_minutes"), "不该出现下划线命名");
+
+        let back: Timer = serde_json::from_str(&json).expect("反序列化");
+        assert_eq!(back.kind, TimerKind::Alarm);
+        assert_eq!(back.alarm_minutes, 450);
+        assert!(back.alarm_daily);
+
+        // 枚举值必须是小写字面量，前端按它判断是不是闹钟
+        assert_eq!(
+            serde_json::to_string(&TimerKind::Alarm).expect("序列化"),
+            "\"alarm\""
+        );
     }
 
     #[test]
@@ -714,6 +787,8 @@ mod tests {
             elapsed_ms: 0,
             running_since: None,
             laps: Vec::new(),
+            alarm_minutes: 0,
+            alarm_daily: false,
             fired: false,
             folder_id: Some("f1".into()),
             created_at: 4,
@@ -725,6 +800,8 @@ mod tests {
         assert!(json.contains("\"remainingMs\""));
         assert!(json.contains("\"durationMs\""));
         assert!(json.contains("\"createdAt\""));
+        assert!(json.contains("\"alarmMinutes\""), "闹钟字段也要驼峰：{json}");
+        assert!(json.contains("\"alarmDaily\""));
         assert!(json.contains("\"folderId\":\"f1\""), "分类字段也要驼峰：{json}");
         assert!(!json.contains("ends_at"), "不该出现下划线命名");
         assert!(!json.contains("folder_id"), "不该出现下划线命名");
@@ -800,6 +877,8 @@ mod tests {
             elapsed_ms: 0,
             running_since: None,
             laps: vec![100, 200],
+            alarm_minutes: 0,
+            alarm_daily: false,
             fired: false,
             folder_id: None,
             created_at: 1_700_000_000_000,

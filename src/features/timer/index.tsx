@@ -1,5 +1,5 @@
 /**
- * 计时器功能：倒计时 / 番茄钟 / 秒表。
+ * 计时器功能：倒计时 / 番茄钟 / 秒表 / 闹钟。
  *
  * # 为什么前端只管显示，不管计时
  *
@@ -13,13 +13,21 @@
  *
  * 两边共用同一个系统时钟，不做任何"剩余秒数"的传递，也就不会各算一套。
  *
- * # 三种模式共用一个 Timer 结构
+ * # 四种模式共用一个 Timer 结构
  *
  * 靠 `kind` 区分，各自只用自己那部分字段（字段语义见 `src/lib/api.ts`）。
  * 它们混在同一个列表里，每条都有用户自己起的名字，运行中的排在最前面。
+ *
+ * # 闹钟与倒计时只差一个字段
+ *
+ * 倒计时设的是「多久之后」，闹钟设的是「几点」。到点之后的收尾两者完全一样，
+ * 区别只在"下一次该在什么时候响"——那是日历运算，由 `lib/alarm.ts` 负责。
+ * 闹钟刻意**不做暂停**：它的目标是墙上时钟的一个点，暂停一个绝对时刻没有意义，
+ * 想今天不响就点「停止」。
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
+  AlarmClock,
   Clock,
   Flag,
   FolderInput,
@@ -33,6 +41,7 @@ import {
 
 import { api, newId, onStateChanged } from "../../lib/api";
 import type { Folder as FolderItem, PomodoroPhase, Timer, TimerKind } from "../../lib/api";
+import { formatClock, nextAlarmAt, parseClock } from "../../lib/alarm";
 import { formatDuration, formatMoment, formatStopwatch } from "../../lib/datetime";
 import { useDragSort } from "../../lib/drag-drop";
 import {
@@ -66,6 +75,7 @@ const KIND_LABEL: Record<TimerKind, string> = {
   countdown: "倒计时",
   pomodoro: "番茄钟",
   stopwatch: "秒表",
+  alarm: "闹钟",
 };
 
 const STATE_LABEL: Record<CardState, string> = {
@@ -145,11 +155,19 @@ function elapsedOf(t: Timer, now: number): number {
  *
  * 注意「未开始」和「暂停中」在字段上很像（都是 `endsAt` 为空），
  * 区别只在 `remainingMs` 有没有值：有值说明跑过一段、被暂停了。
+ *
+ * 闹钟只有三种状态：它没有「暂停」——目标是墙上时钟的一个绝对时刻，
+ * 暂停它没有意义（要今天不响就点「停止」）。所以 `remainingMs` 对它无意义，
+ * 响完之后必须停在「已完成」而不是被误判成「暂停」。
  */
 function stateOf(t: Timer): CardState {
   if (t.kind === "stopwatch") {
     if (t.runningSince !== null) return "running";
     return t.elapsedMs > 0 ? "paused" : "idle";
+  }
+  if (t.kind === "alarm") {
+    if (t.fired) return "done";
+    return t.endsAt !== null ? "running" : "idle";
   }
   // fired 只对倒计时有意义：番茄钟到点时 Rust 会在同一个 tick 里
   // 把 phase / endsAt / fired 一起改好，不会停在"已完成"上
@@ -162,6 +180,11 @@ function stateOf(t: Timer): CardState {
 /** 卡片中间那行大号时间。 */
 function mainTime(t: Timer, state: CardState, now: number): string {
   if (t.kind === "stopwatch") return formatStopwatch(elapsedOf(t, now));
+  if (t.kind === "alarm") {
+    // 没在走的时候显示**用户设的那个钟点**——那才是这个闹钟的设定值，
+    // 显示 00:00 什么也说明不了。走起来之后显示还要等多久，和倒计时一致。
+    return state === "running" ? formatDuration(remainingOf(t, now)) : formatClock(t.alarmMinutes);
+  }
   // 未开始的两种计时器显示"将会有多长"，比显示 00:00 有用：
   // 重置之后用户就是靠这个数字确认设定时长还在
   if (state === "idle") {
@@ -188,6 +211,17 @@ function metaOf(t: Timer, state: CardState): string {
     const phase = t.phase === "break" ? "休息" : "专注";
     return `${phase}阶段 · ${t.focusMinutes} 分专注 / ${t.breakMinutes} 分休息 · 已完成 ${t.rounds} 轮`;
   }
+  if (t.kind === "alarm") {
+    // 重复规则 + 钟点都要写出来：卡片上的大号数字在运行中会变成倒计时，
+    // 不写这一行，用户就看不出自己当初设的是几点
+    const rule = t.alarmDaily ? "每天" : "只响一次";
+    const preset = `${rule} ${formatClock(t.alarmMinutes)}`;
+    if (state === "running" && t.endsAt !== null) {
+      return `${preset} · 响铃于 ${formatMoment(t.endsAt)}`;
+    }
+    if (state === "done") return `${preset} · 已响过`;
+    return preset;
+  }
   return t.laps.length > 0 ? `共 ${t.laps.length} 次计次` : "";
 }
 
@@ -197,9 +231,11 @@ function defaultName(
   countdownMs: number,
   focusMinutes: number,
   breakMinutes: number,
+  alarmMinutes: number,
 ): string {
   if (kind === "countdown") return `倒计时 ${formatDuration(countdownMs)}`;
   if (kind === "pomodoro") return `番茄钟 ${focusMinutes}/${breakMinutes}`;
+  if (kind === "alarm") return `闹钟 ${formatClock(alarmMinutes)}`;
   return "秒表";
 }
 
@@ -509,6 +545,34 @@ export function TimerPanel() {
     saveTimer({ ...t, phase: "focus", endsAt: null, remainingMs: null, fired: false });
   };
 
+  // ---- 闹钟 ----
+
+  /**
+   * 开始 / 重新响。
+   *
+   * 时刻由 `nextAlarmAt` 算：今天这个钟点还没到就是今天，过了就是明天。
+   * 它保证结果**严格落在未来**——返回一个过去时刻会让调度线程每 500ms
+   * 判定一次"到点"，变成弹窗风暴。
+   */
+  const startAlarm = (t: Timer) => {
+    saveTimer({
+      ...t,
+      endsAt: nextAlarmAt(t.alarmMinutes),
+      remainingMs: null,
+      fired: false,
+    });
+  };
+
+  /**
+   * 停止：这一次不响了。
+   *
+   * 刻意**保留 `alarmMinutes`**：用户停的是"这一轮"，不是"把这个闹钟删了"，
+   * 下次点「开始」还要用同一个钟点。
+   */
+  const stopAlarm = (t: Timer) => {
+    saveTimer({ ...t, endsAt: null, remainingMs: null, fired: false });
+  };
+
   // ---- 秒表 ----
 
   const startStopwatch = (t: Timer) => {
@@ -607,7 +671,8 @@ export function TimerPanel() {
               <>
                 还没有任何计时器。
                 <br />
-                点右上角「新建」加一个：煮蛋的倒计时、一个番茄钟，或者一块秒表。
+                点右上角「新建」加一个：煮蛋的倒计时、一个番茄钟、一块秒表，
+                或者一个到点叫你起床的闹钟。
               </>
             ) : (
               <>这个文件夹里还没有计时器。</>
@@ -740,6 +805,41 @@ export function TimerPanel() {
                   </>
                 )}
 
+                {t.kind === "alarm" && (
+                  <>
+                    {state === "idle" && (
+                      <button
+                        className="btn btn--primary"
+                        onClick={() => startAlarm(t)}
+                        title="开始等这个钟点（今天已经过了就是明天）"
+                      >
+                        <Play size={12} />
+                        开始
+                      </button>
+                    )}
+                    {state === "running" && (
+                      <button
+                        className="btn"
+                        onClick={() => stopAlarm(t)}
+                        title="这一次不响了。钟点会留着，下次「开始」还用同一个时间"
+                      >
+                        <Square size={12} />
+                        停止
+                      </button>
+                    )}
+                    {state === "done" && (
+                      <button
+                        className="btn btn--primary"
+                        onClick={() => startAlarm(t)}
+                        title="按同一个钟点再排一次（今天已经过了就是明天）"
+                      >
+                        <AlarmClock size={12} />
+                        再响一次
+                      </button>
+                    )}
+                  </>
+                )}
+
                 {t.kind === "stopwatch" && (
                   <>
                     {state === "idle" && (
@@ -819,11 +919,13 @@ export function TimerPanel() {
 /**
  * 新建计时器的表单。
  *
- * 三种模式共用一套输入框，靠 `kind` 决定显示哪几个：
- * 时长只在倒计时和番茄钟上有意义，秒表只需要名字。
+ * 四种模式共用一套输入框，靠 `kind` 决定显示哪几个：
+ * 时长只在倒计时上有意义，节奏只在番茄钟上有意义，钟点只在闹钟上有意义，
+ * 秒表只需要名字。
  *
- * 倒计时的时长会被写进 `durationMs` 持久化下来，所以「重置」之后
- * 再「开始」用的还是用户当初填的这个时长，不靠任何内存记忆。
+ * 倒计时的时长会被写进 `durationMs`、闹钟的钟点会被写进 `alarmMinutes`，
+ * 两者都持久化下来，所以「重置」「停止」之后再开始用的还是用户当初设的值，
+ * 不靠任何内存记忆。
  */
 function TimerCreator({
   onCreate,
@@ -840,6 +942,10 @@ function TimerCreator({
   const [seconds, setSeconds] = useState("0");
   const [focus, setFocus] = useState("25");
   const [rest, setRest] = useState("5");
+  /** 闹钟的钟点，`HH:MM`（`<input type="time">` 给的就是这个形状）。 */
+  const [alarmTime, setAlarmTime] = useState("07:30");
+  /** 闹钟是否每天重复。默认只响一次：默认每天响会让人被自己没设过的闹钟吵醒。 */
+  const [alarmDaily, setAlarmDaily] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
 
   // 打开表单就聚焦名字：填名字是唯一的必填项
@@ -856,13 +962,27 @@ function TimerCreator({
   const countdownMs = (toInt(hours) * 3600 + toInt(minutes) * 60 + toInt(seconds)) * 1000;
   const focusMinutes = toInt(focus);
   const restMinutes = toInt(rest);
+  // 输入框被清空时 `parseClock` 返回 null，这里退回 0 点只是为了有个数字可传；
+  // 「创建」按钮由下面的 `valid` 拦住，不会真的建出一个 00:00 的闹钟
+  const alarmMinutes = parseClock(alarmTime) ?? 0;
 
   const valid =
     kind === "countdown"
       ? countdownMs > 0
       : kind === "pomodoro"
         ? focusMinutes > 0 && restMinutes > 0
-        : true;
+        : kind === "alarm"
+          ? parseClock(alarmTime) !== null
+          : true;
+
+  /** 「创建」被禁用时告诉用户为什么。按钮可用时是空串（不给可用按钮挂误导性提示）。 */
+  const invalidHint = valid
+    ? ""
+    : kind === "countdown"
+      ? "时长需要大于 0"
+      : kind === "alarm"
+        ? "请填一个 00:00 ~ 23:59 的时间"
+        : "";
 
   /** 快捷时长：直接改写时/分/秒三个输入框，用户还能接着微调。 */
   const useQuick = (totalMinutes: number) => {
@@ -873,14 +993,22 @@ function TimerCreator({
 
   const submit = () => {
     const createdAt = Date.now();
+    const isAlarm = kind === "alarm";
     const timer: Timer = {
       id: newId(),
-      name: name.trim() || defaultName(kind, countdownMs, focusMinutes, restMinutes),
+      name:
+        name.trim() ||
+        defaultName(kind, countdownMs, focusMinutes, restMinutes, alarmMinutes),
       kind,
-      // 倒计时一建好就直接开跑：用户填了时长就是想让它开始倒，
-      // 再要求点一次「开始」是多余的一步（想停下点「重置」即可回到未开始）。
-      // 另外两种模式新建出来是「未开始」，等用户点「开始」。
-      endsAt: kind === "countdown" ? createdAt + countdownMs : null,
+      // 倒计时和闹钟都是"建好即开始"：用户填了时长 / 挑好了钟点就是想让它开始等，
+      // 再要求点一次「开始」是多余的一步（想停下点「重置」/「停止」即可）。
+      // 番茄钟和秒表新建出来是「未开始」，等用户点「开始」。
+      endsAt:
+        kind === "countdown"
+          ? createdAt + countdownMs
+          : isAlarm
+            ? nextAlarmAt(alarmMinutes, createdAt)
+            : null,
       remainingMs: null,
       // 倒计时的设定时长要单独存：重置、重新开始都要靠它拿回用户填的时长，
       // 而 remainingMs 到点后会被 Rust 清成 0，不能当设定值用
@@ -893,6 +1021,9 @@ function TimerCreator({
       elapsedMs: 0,
       runningSince: null,
       laps: [],
+      // 闹钟的钟点同样要单独存：停止、重新响都要靠它拿回用户设的时间
+      alarmMinutes: isAlarm ? alarmMinutes : 0,
+      alarmDaily: isAlarm ? alarmDaily : false,
       fired: false,
       // 归属由面板决定（只有它知道用户当前在哪个文件夹里）
       folderId: null,
@@ -906,7 +1037,7 @@ function TimerCreator({
       <div className="tmr__creator-head">新建计时器</div>
 
       <div className="tmr__kinds">
-        {(["countdown", "pomodoro", "stopwatch"] as TimerKind[]).map((k) => (
+        {(["countdown", "pomodoro", "stopwatch", "alarm"] as TimerKind[]).map((k) => (
           <button
             key={k}
             className={`btn tmr__kindbtn${k === kind ? " tmr__kindbtn--on" : ""}`}
@@ -1008,6 +1139,32 @@ function TimerCreator({
         <div className="tmr__hint">秒表只需要一个名字，开始后可以随时计次。</div>
       )}
 
+      {kind === "alarm" && (
+        <>
+          <label className="field">
+            <span className="field__label">
+              响铃时间
+              <em className="field__hint">今天这个点已经过了就明天响</em>
+            </span>
+            <input
+              className="field__input tmr__clock"
+              type="time"
+              value={alarmTime}
+              onChange={(e) => setAlarmTime(e.target.value)}
+            />
+          </label>
+
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={alarmDaily}
+              onChange={(e) => setAlarmDaily(e.target.checked)}
+            />
+            <span>每天这个时间都响</span>
+          </label>
+        </>
+      )}
+
       <div className="tmr__creator-actions">
         <button className="btn" onClick={onCancel}>
           取消
@@ -1016,10 +1173,11 @@ function TimerCreator({
           className="btn btn--primary"
           onClick={submit}
           disabled={!valid}
-          title={valid ? "" : "时长需要大于 0"}
+          title={invalidHint}
         >
-          {/* 倒计时是"建好即开始"，按钮上写清楚，免得用户以为还要再点一次开始 */}
-          {kind === "countdown" ? "创建并开始" : "创建"}
+          {/* 倒计时和闹钟都是"建好即开始"，按钮上写清楚，
+              免得用户以为还要再点一次开始 */}
+          {kind === "countdown" || kind === "alarm" ? "创建并开始" : "创建"}
         </button>
       </div>
     </div>
@@ -1030,7 +1188,7 @@ function TimerCreator({
 export const TimerFeature: FeatureModule = {
   id: "timer",
   title: "计时",
-  description: "倒计时、番茄钟、秒表",
+  description: "倒计时、番茄钟、秒表、闹钟",
   icon: Clock,
   order: 20,
   component: TimerPanel,

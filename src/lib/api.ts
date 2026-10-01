@@ -26,7 +26,7 @@ export interface PasteOutcome {
 // 计时器
 // ===============================================================
 
-export type TimerKind = "countdown" | "pomodoro" | "stopwatch";
+export type TimerKind = "countdown" | "pomodoro" | "stopwatch" | "alarm";
 export type PomodoroPhase = "focus" | "break";
 
 export interface Timer {
@@ -57,6 +57,19 @@ export interface Timer {
   /** 秒表：当前这一段的开始时刻。 */
   runningSince: number | null;
   laps: number[];
+  /**
+   * 闹钟：响铃的钟点，**从本地零点起的分钟数**（0~1439）。
+   *
+   * 和倒计时的 `durationMs` 是同一个角色：`endsAt` 是"下一次响的绝对时刻"，
+   * 响过就清空了，代表不了用户设的那个钟点。没有它，「停止」之后再
+   * 「开始」就只能去猜一个时间。
+   *
+   * 存分钟数而不是 `"07:30"`：字符串要解析、有格式歧义，分钟数是唯一表示。
+   * 换算与取模见 `lib/alarm.ts` 的 `formatClock` / `parseClock`。
+   */
+  alarmMinutes: number;
+  /** 闹钟：是否每天重复。`false` 表示只响一次。 */
+  alarmDaily: boolean;
   fired: boolean;
   /**
    * 所属文件夹 id，`null` 表示在顶层。
@@ -389,6 +402,29 @@ export async function emitSettingsChanged(settings: Settings): Promise<void> {
 /** 订阅设置变更。返回取消订阅函数，组件卸载时必须调用。 */
 export function onSettingsChanged(cb: (settings: Settings) => void): Promise<UnlistenFn> {
   return listen<Settings>("settings-changed", (e) => cb(e.payload));
+}
+
+/**
+ * 广播「计时器变了」。
+ *
+ * # 为什么计时器平时不需要广播，这里却要
+ *
+ * 计时器的数据只有主面板会改，所以 `timer_save` 一直不广播（和链接一样）。
+ * 但**闹钟的「每天重复」是例外**：下一次响铃时刻由后台逻辑算好写回来
+ * （见 `lib/alarm.ts`），主面板那份内存状态不会自己知道，于是会一直显示
+ * 「已完成」；更糟的是用户此时点「移动到文件夹」，写回去的是那份**过期快照**
+ * （`fired: true, endsAt: null`），把推进结果整份冲掉 —— 这个闹钟从此
+ * 永久不响，重启也不恢复。
+ *
+ * 这与备忘录那边是同一个坑（见 Rust 侧 `commands::notify_memos_changed`），
+ * 所以解法也一样：推进成功后广播一次，各窗口重新拉数据。
+ * 闭环是收敛的 —— 重新拉回来时 `fired` 已经是 false，没有可推进的，
+ * 也就不会再保存、不会再广播。
+ *
+ * 用 `emit`（发给所有窗口）而不是 `emitTo`：主面板和小球窗口都可能开着。
+ */
+export async function emitTimersChanged(): Promise<void> {
+  await emit("state-changed", { what: ["timers"] });
 }
 
 /** 生成一个足够唯一的 id。本地单机场景时间戳 + 随机数已足够。 */

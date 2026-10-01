@@ -149,6 +149,30 @@ fn evaluate_timers(timers: &mut [Timer], now: i64, out: &mut Evaluation) {
 
             // 秒表是正向计时，没有"到点"这回事
             TimerKind::Stopwatch => {}
+
+            TimerKind::Alarm => {
+                // 和倒计时完全同一套收尾：标记已响、清掉结束时刻。
+                //
+                // 刻意**不**在这里推进「每天重复」的下一次。算下一次要按
+                // 本地时区做日期运算（"明天 07:30"不等于"加 86400000 毫秒"，
+                // 夏令时那天只有 23 小时），而 Rust 侧没有日历能力也不打算有
+                // （见 crate::models 顶部的分工）。所以下一次由前端在收到
+                // `fired` 之后算好写回来，和备忘录的重复提醒是同一条路。
+                //
+                // `remaining_ms` 不动：闹钟没有"剩余时长"这个概念，
+                // 留着 null 比塞一个 0 更诚实。
+                t.fired = true;
+                t.ends_at = None;
+                out.timers_changed = true;
+
+                out.alerts.push(PendingAlert {
+                    source: "timer".into(),
+                    id: t.id.clone(),
+                    title: t.name.clone(),
+                    body: "闹钟响了".into(),
+                    due_at: ends,
+                });
+            }
         }
     }
 }
@@ -364,6 +388,8 @@ mod tests {
             elapsed_ms: 0,
             running_since: None,
             laps: Vec::new(),
+            alarm_minutes: 0,
+            alarm_daily: false,
             fired: false,
             folder_id: None,
             created_at: 0,
@@ -537,6 +563,99 @@ mod tests {
         assert_eq!(result.alerts.len(), 1);
         assert_eq!(timers[0].phase, Some(PomodoroPhase::Break));
         assert_eq!(timers[0].rounds, 1);
+    }
+
+    // ---------- 闹钟 ----------
+
+    #[test]
+    fn 闹钟未到点不触发() {
+        let mut t = timer("a", TimerKind::Alarm, Some(NOW + 1));
+        t.alarm_minutes = 450;
+        t.alarm_daily = true;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert!(result.alerts.is_empty(), "还差 1 毫秒，不该响");
+        assert!(!result.timers_changed);
+    }
+
+    #[test]
+    fn 闹钟到点响一次并停在已完成() {
+        let mut t = timer("a", TimerKind::Alarm, Some(NOW));
+        t.alarm_minutes = 450;
+        t.alarm_daily = true;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(result.alerts[0].source, "timer");
+        assert_eq!(result.alerts[0].body, "闹钟响了");
+        assert_eq!(result.alerts[0].due_at, NOW);
+        assert!(result.timers_changed);
+
+        // 必须清掉 ends_at，否则下一个 tick 又判定"到点"，变成每 500ms 弹一次
+        assert_eq!(timers[0].ends_at, None);
+        assert!(timers[0].fired);
+        // 闹钟没有"剩余时长"这个概念，不该被塞一个 0 进去
+        assert_eq!(timers[0].remaining_ms, None);
+        // 用户设的钟点不能被调度线程改掉：前端要靠它算下一次
+        assert_eq!(timers[0].alarm_minutes, 450);
+        assert!(timers[0].alarm_daily);
+    }
+
+    #[test]
+    fn 闹钟已响过不会重复弹() {
+        // 前端还没把「每天重复」的下一次写回来时，调度线程每 500ms 都会看到
+        // 这条记录。没有 fired 这道闸门，用户会被闹钟刷屏。
+        let mut t = timer("a", TimerKind::Alarm, Some(NOW));
+        t.fired = true;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW + 10_000);
+
+        assert!(result.alerts.is_empty(), "fired 为真时不该再响");
+        assert!(!result.timers_changed);
+    }
+
+    #[test]
+    fn 只响一次的闹钟响完后不会自己再响() {
+        let mut t = timer("a", TimerKind::Alarm, Some(NOW));
+        t.alarm_daily = false;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        evaluate(&mut timers, &mut memos, NOW);
+        assert!(timers[0].fired);
+
+        // 之后无论过多久都不该再响（要再响只能用户自己点）
+        for offset in [500, 60_000, 86_400_000, 7 * 86_400_000] {
+            let again = evaluate(&mut timers, &mut memos, NOW + offset);
+            assert!(again.alerts.is_empty(), "offset={offset} 时不该再响");
+        }
+    }
+
+    #[test]
+    fn 闹钟停在已完成时不会被当成暂停() {
+        // 暂停的语义是 ends_at 为空 + remaining_ms 有值。
+        // 闹钟响完也是 ends_at 为空，如果顺手把 remaining_ms 写成 Some(0)，
+        // 前端就会把它显示成「已暂停」并给出「继续」按钮 —— 点下去会从 0 开始跑。
+        let mut t = timer("a", TimerKind::Alarm, Some(NOW));
+        t.alarm_daily = true;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(timers[0].ends_at, None);
+        assert_eq!(
+            timers[0].remaining_ms, None,
+            "闹钟没有剩余时长，留 null 才会被判成「已完成」"
+        );
     }
 
     // ---------- 备忘录 ----------

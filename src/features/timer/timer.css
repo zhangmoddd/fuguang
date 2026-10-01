@@ -234,6 +234,15 @@
   flex-shrink: 0;
 }
 
+/* 闹钟的钟点输入框。
+   宽度只占一半：一个 HH:MM 撑满 380px 既难看又容易让人以为要填别的东西。
+   和 `.tmr__segment .field__input` 一样居中，视觉上是一类东西。 */
+.tmr__clock {
+  width: 120px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 .tmr__quickrow {
   display: flex;
   flex-wrap: wrap;

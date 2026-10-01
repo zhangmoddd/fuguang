@@ -98,11 +98,12 @@ interface Field {
   weight: number;
 }
 
-/** 计时器三种模式的中文名。搜索结果里要显示人话，不能显示 `countdown`。 */
+/** 计时器四种模式的中文名。搜索结果里要显示人话，不能显示 `countdown`。 */
 const TIMER_KIND_LABEL: Record<string, string> = {
   countdown: "倒计时",
   pomodoro: "番茄钟",
   stopwatch: "秒表",
+  alarm: "闹钟",
 };
 
 /**

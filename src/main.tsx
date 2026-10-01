@@ -8,6 +8,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 
 import { api, onStateChanged } from "./lib/api";
+import { advanceAlarmsOnce } from "./lib/alarm";
 import { applyBallTheme } from "./lib/ball-theme";
 import { advanceRepeatsOnce } from "./lib/repeat-advance";
 import { applyFontSize } from "./lib/ui-scale";
@@ -45,23 +46,30 @@ void api
   });
 
 /**
- * 后台维护：把「已经弹过、且需要重复」的备忘推进到下一次提醒时刻。
+ * 后台维护：把「已经弹过、且需要重复」的备忘与闹钟推进到下一次。
  *
  * 必须放在这里 —— 每个窗口都会执行这段入口代码，而悬浮球窗口是常驻的。
  *
- * 原来这件事只在 `features/memo/index.tsx` 的挂载逻辑里做，但主面板**只挂载当前页签**，
- * 默认页签是「文本片段」。于是用户不打开备忘页时：Rust 到点弹窗并记下
- * `firedFor = remindAt`，却没有任何代码把 `remindAt` 推到下一次 ——
- * 幂等判断从此永远成立，**重复提醒永久静默**，重启也不恢复。
+ * 原来备忘这件事只在 `features/memo/index.tsx` 的挂载逻辑里做，但主面板
+ * **只挂载当前页签**，默认页签是「文本片段」。于是用户不打开备忘页时：
+ * Rust 到点弹窗并记下 `firedFor = remindAt`，却没有任何代码把 `remindAt`
+ * 推到下一次 —— 幂等判断从此永远成立，**重复提醒永久静默**，重启也不恢复。
+ * 闹钟的「每天重复」是同一个形状（Rust 记 `fired`，下一次由前端算），
+ * 所以走同一条路。
  *
  * 数据推进是数据层的职责，不该由某个页面有没有被挂载来决定。
- * 详见 `lib/repeat-advance.ts`。
+ * 详见 `lib/repeat-advance.ts` 与 `lib/alarm.ts`。
  */
 void advanceRepeatsOnce();
+void advanceAlarmsOnce();
 void onStateChanged((what) => {
   if (what.includes("memos")) void advanceRepeatsOnce();
+  // 闹钟的「每天重复」同理：Rust 只负责响，下一次响铃时刻由这里算好写回去。
+  // 不推进的话 `fired` 会一直是 true，这个闹钟从此再也不响。
+  // 详见 `lib/alarm.ts`。
+  if (what.includes("timers")) void advanceAlarmsOnce();
 }).catch(() => {
-  /* 订阅不上只影响这条后台推进，不该影响界面 */
+  /* 订阅不上只影响这两条后台推进，不该影响界面 */
 });
 
 /**

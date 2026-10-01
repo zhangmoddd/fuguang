@@ -37,6 +37,11 @@
   --accent-soft: rgba(29, 78, 216, 0.1);
   --danger: #d92d20;
   --success: #0b7a58;
+  /* 琥珀 #b45309 = 4.9:1（正文，门槛 4.5）。
+     用在「操作成功了，但有东西没了」这类提示上（见 .snip__feedback--warn /
+     .palette__error--warn）。刻意不用 --danger 的红色：那会让用户以为操作失败了，
+     于是再按一次回车 —— 第二次会真的再粘一遍。 */
+  --warning: #b45309;
 
   --radius: 12px;
   --radius-sm: 8px;
@@ -422,7 +427,7 @@ textarea {
 .snip__feedback--warn {
   background: rgba(217, 119, 6, 0.12);
   border-color: rgba(217, 119, 6, 0.35);
-  color: var(--warning, #b45309);
+  color: var(--warning);
   align-items: flex-start;
   line-height: 1.45;
 }

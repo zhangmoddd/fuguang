@@ -105,6 +105,15 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
   const [busy, setBusy] = useState(false);
 
   /**
+   * 刚刚粘过的那条片段的 id。
+   *
+   * 用来挡住"再按一次回车导致重复粘贴"，**而不是靠清空查询** ——
+   * `setQuery("")` 在 `await` 之后执行，会把用户等待期间新敲的字一起清掉。
+   * 用户一开始改搜索词（`onChange`）就解除封锁，所以不影响接着搜别的。
+   */
+  const justPastedId = useRef<string | null>(null);
+
+  /**
    * 浮层从多高开始 —— 也就是标题栏 + 页签栏的实际高度。
    *
    * 不能硬编码：字号是用户可调的（12–18px），那两条的高度会跟着变，
@@ -209,6 +218,9 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
         if (hit.kind === "snippet") {
           const snippet = raw.snippets.find((s) => s.id === hit.id);
           if (!snippet) return;
+          // 上一条**同一条**片段刚粘完、警告还在屏幕上时，回车别再粘一次 ——
+          // 那会让目标程序里出现两份内容。只挡这一条，不挡用户改去粘别的。
+          if (justPastedId.current === hit.id) return;
           const outcome = await api.pasteText(snippet.content);
           if (outcome.ok) {
             if (outcome.message) {
@@ -216,11 +228,14 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
               // （剪贴板里原来是图片/文件、已被替换且无法还原）。
               //
               // 两个都不能做：直接 onClose() 会把警告丢掉；用红色"失败"样式
-              // 又会让用户以为没粘上、**再按一次回车** —— 第二次会真的再粘一遍，
-              // 目标程序里出现两份内容。所以用中性的警示样式，并清空查询：
-              // 清空后 `current` 变 undefined，回车不会再触发一次粘贴。
+              // 又会让用户以为没粘上、**再按一次回车** —— 第二次会真的再粘一遍。
+              //
+              // 所以用中性的警示样式，并用 `justPastedId` 挡住重复回车。
+              // ⚠️ **不要用 `setQuery("")` 来挡**：它在这行 `await` **之后**才执行，
+              // 会把用户在等待期间新敲进搜索框的字一起清掉（输入框一直有焦点，
+              // 粘贴要花上百毫秒到几秒），用户会看到自己刚打的字凭空消失。
               setError({ text: outcome.message, kind: "warn" });
-              setQuery("");
+              justPastedId.current = hit.id;
               return;
             }
             onClose();
@@ -303,7 +318,11 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
             aria-activedescendant={
               current ? `palette-opt-${current.kind}-${current.id}` : undefined
             }
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              // 用户开始改搜索词 → 解除"刚粘过"的封锁，不影响接着搜别的
+              justPastedId.current = null;
+              setQuery(e.target.value);
+            }}
             onKeyDown={(e) => {
               if (e.key === "ArrowDown") {
                 e.preventDefault();

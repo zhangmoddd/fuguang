@@ -108,13 +108,47 @@ pub fn run() {
             // 前端一挂载就会调 timers_list / memos_list，那时状态必须已经就绪。
             app.manage(state::Store::load(&handle));
 
+            // ---- 热键要**尽早**注册，排在创建窗口之前 ----
+            //
+            // 它依赖的只有设置（上面刚加载完），不需要等窗口或 WebView2 起来。
+            // 原来排在 `create_ball` 之后，而 WebView2 冷启动很慢 ——
+            // 实测从进程启动到 `RegisterHotKey` 成功隔了 **21.6 秒**，
+            // 那段时间里用户按热键毫无反应，而界面没有任何提示。
+            // 热键是"快捷方式"，让它等最慢的那一步是反过来的。
+            //
+            // 顺序不能反：`apply` 需要先拿到热键线程的 id 才能唤醒它。
+            hotkey::start(handle.clone());
+            {
+                let store = handle.state::<state::Store>();
+                let (enabled, combo) = {
+                    let st = store.lock();
+                    (st.settings.hotkey_enabled, st.settings.hotkey.clone())
+                };
+                if enabled {
+                    // 只试一次。**不要重试** —— 实测过：热键被占时重试 3 次全都会失败
+                    // （占用者不会因为等 1.4 秒就让开），而占用者一消失，**第 1 次
+                    // 立刻就能成功**（探针实测 0ms）。所以重试救不回它声称要救的场景，
+                    // 却固定给每次"热键被占用"的启动多加 1.4 秒（若热键线程卡住，
+                    // 每次 apply 要等满 3 秒超时，最坏 9 秒）—— 而这段代码在
+                    // `create_ball` 之前，白等就是悬浮球白等。
+                    //
+                    // 失败就如实记日志：用户能在 `%APPDATA%\浮光\app.log` 里看到，
+                    // 也能在设置页换一个没冲突的组合。
+                    if let Err(err) = hotkey::apply(Some(&combo)) {
+                        crate::diag!("[浮光] 全局热键「{combo}」注册失败：{err}");
+                    }
+                }
+            }
+
             // 清理「指向一个已经不存在的 exe」的自启项。
             // 不清理的话：设置页显示"未开启"（路径对不上），但注册表里那条记录
             // 还在，开机照样去启动一个不存在的文件 —— 用户看到开关是关的，
             // 根本不会去点它，这条坏记录就永久留存了。
             autostart::clean_stale_entry();
 
-            // 创建悬浮球：这是软件的常驻入口，必须在 setup 阶段就出现
+            // 创建悬浮球：这是软件的常驻入口，必须在 setup 阶段就出现。
+            // 它会拉起 WebView2，是整个启动里最慢的一步（实测十几秒），
+            // 所以排在热键之后 —— 别让"快捷方式"去等它。
             windows::create_ball(&handle)?;
 
             // 创建托盘兜底入口
@@ -125,46 +159,6 @@ pub fn run() {
 
             // 启动调度线程：倒计时、番茄钟、备忘录提醒都靠它
             scheduler::start(handle.clone());
-
-            // 启动全局热键线程，并按保存的设置注册组合键。
-            // 顺序不能反：apply 需要先拿到热键线程的 id 才能唤醒它。
-            hotkey::start(handle.clone());
-            {
-                let store = handle.state::<state::Store>();
-                let (enabled, combo) = {
-                    let st = store.lock();
-                    (st.settings.hotkey_enabled, st.settings.hotkey.clone())
-                };
-                if enabled {
-                    // 失败要**重试**。最常见的失败原因是"上一个实例还没完全退出、
-                    // 还占着这个组合键" —— 实测：杀掉进程后立刻启动新实例，
-                    // `RegisterHotKey` 就会失败（1409 已被占用），而旧进程彻底消失后
-                    // 同一个组合键立刻又能注册。用户看到的现象是"热键按了没反应"。
-                    //
-                    // 失败本身很快返回（热键线程会立刻回一个 Err），不会拖慢启动。
-                    let mut last_err = String::new();
-                    let mut registered = false;
-                    for attempt in 0..3 {
-                        match hotkey::apply(Some(&combo)) {
-                            Ok(()) => {
-                                registered = true;
-                                break;
-                            }
-                            Err(err) => {
-                                last_err = err;
-                                if attempt < 2 {
-                                    std::thread::sleep(std::time::Duration::from_millis(700));
-                                }
-                            }
-                        }
-                    }
-                    if !registered {
-                        // 不阻断启动：热键只是"快捷方式"，
-                        // 小球和托盘仍然可用，用户能在设置页里改一个没冲突的组合。
-                        crate::diag!("[浮光] 全局热键「{combo}」注册失败（重试 3 次仍失败）：{last_err}");
-                    }
-                }
-            }
 
             // 启动前台窗口跟踪线程。
             // 目的：记住「用户上一次真正在用的窗口」，这样点击文本片段时

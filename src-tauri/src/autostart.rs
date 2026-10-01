@@ -211,12 +211,19 @@ fn same_exe(a: &str, b: &str) -> bool {
     fn norm(s: &str) -> String {
         // `\\?\C:\...`（`canonicalize` 会加上这个前缀）和 `C:\...` 是同一个文件
         let s = s.strip_prefix(r"\\?\").unwrap_or(s);
-        // Windows **忽略路径尾部的空格和点**：`C:\x\f.exe ` 与 `C:\x\f.exe` 等价。
-        // 实测这两种写法 CreateProcess 都能启动，不裁就会让 is_enabled 谎报"未开启"。
-        let s = s.trim_end_matches([' ', '.']);
-        s.replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
+        // Windows **忽略整个路径末尾的空格和点**，而它们可以和反斜杠**交替出现**：
+        // `C:\x\f.exe \` 与 `C:\x\f.exe` 是同一个文件。所以必须**循环裁到稳定** ——
+        // 只裁一次会漏掉 `…f.exe \`（实测：`"D:\a\b.exe \"` 与 `"D:\a\b.exe"`
+        // 被判成了两个不同的文件，于是 is_enabled 谎报"未开启"）。
+        let mut s = s;
+        loop {
+            let t = s.trim_end_matches([' ', '.', '\\']);
+            if t.len() == s.len() {
+                break;
+            }
+            s = t;
+        }
+        s.replace('/', "\\").to_ascii_lowercase()
     }
     !a.is_empty() && !b.is_empty() && norm(a) == norm(b)
 }
@@ -299,17 +306,24 @@ fn should_clean(registered: &str, current_exe: Option<&str>) -> bool {
         return false;
     }
 
-    // 目标文件还在 → 可能是另一个目录下的正式版，别碰别人的自启
-    if std::path::Path::new(exe).exists() {
+    // ⚠️ **顺序很重要：先确认它在不在本机固定磁盘上，再问文件存不存在。**
+    //
+    // `Path::exists()` 对**不可达的 UNC 路径**会去连 SMB，实测阻塞 **21 秒**
+    // （`\\198.51.100.7\share\…`，本机复现 21044 ms）。而 `clean_stale_entry`
+    // 是在 `setup()` 里**同步**调用的，一次阻塞就让悬浮球和托盘晚出现 20 多秒
+    // （端到端实测 127.8 秒）。
+    //
+    // `is_on_local_fixed_drive` 对 UNC 和未映射盘符直接返回 false、**不碰文件系统**，
+    // 所以把它放前面既能短路掉网络路径，又完整保住"别删别人的自启"这个目的。
+    //
+    // 这正是原来那道"网络共享离线…删了就没了"的守卫 —— 它写对了，但排在
+    // `exists()` **后面**，于是**在真正需要它的那条路径上永远执行不到**。
+    if !is_on_local_fixed_drive(exe) {
         return false;
     }
 
-    // 最后一道：**只有本机固定磁盘上的"文件不存在"才说明记录失效**。
-    //
-    // 网络共享离线、U 盘没插、盘符没映射时目标同样"不存在"，但那条记录其实能用 ——
-    // 删了就没了，而且 release 版是 `windows_subsystem = "windows"`，
-    // `crate::diag!` 没有 stderr 可写，用户看不到任何提示。
-    is_on_local_fixed_drive(exe)
+    // 目标文件还在 → 可能是另一个目录下的正式版，别碰别人的自启
+    !std::path::Path::new(exe).exists()
 }
 
 /// `DRIVE_FIXED`：本机固定磁盘，`GetDriveTypeW` 的返回值之一。
@@ -471,8 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn 非绝对路径的自启值一律不碰() {
-        // 环境变量写法我们没展开，`Path::exists()` 会判假 ——
+    fn 非绝对路径的自启值一律不碰() {        // 环境变量写法我们没展开，`Path::exists()` 会判假 ——
         // 但它其实能正常工作，不能因此删掉
         assert!(!should_clean(r"%LOCALAPPDATA%\浮光\fuguang.exe", None));
         // 相对路径、光秃秃的文件名、垃圾串，一律不碰
@@ -561,5 +574,45 @@ mod tests {
             None
         ));
         assert!(!should_clean(r"%LOCALAPPDATA%\浮光\fuguang.exe", None));
+    }
+
+    /// 「目标不存在就该清掉」那条断言要求目标**在本机固定磁盘**上
+    /// （`should_clean` 最后一道是 `is_on_local_fixed_drive`）。
+    /// `std::env::temp_dir()` 在有些机器上落在 U 盘/网络盘/RAM 盘，那样断言会
+    /// 无端失败 —— 所以这里显式用系统盘上的一个确定不存在的路径。
+    #[test]
+    fn 系统盘上不存在的目标会被判失效() {
+        let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let gone = format!(r"{system_drive}\浮光-绝对不存在的目录-9f3a\fuguang.exe");
+        assert!(
+            !std::path::Path::new(&gone).exists(),
+            "这个路径不该存在，测试前提被破坏了：{gone}"
+        );
+        assert!(should_clean(&gone, None), "系统盘上不存在的目标应判失效：{gone}");
+    }
+
+    /// **碰文件系统之前**就必须短路掉不可达的网络路径。
+    ///
+    /// 这条测试是给一个真实事故上的锁：`should_clean` 原来先调
+    /// `Path::new(exe).exists()`，再判"在不在本机固定磁盘上"。
+    /// 而 `exists()` 对不可达的 UNC 会去连 SMB —— 本机实测**阻塞 21044 ms**。
+    /// `clean_stale_entry()` 又是在 `setup()` 里同步调用的，于是自启项指向
+    /// 一个离线共享时，悬浮球和托盘要等 20 多秒才出现（端到端实测 127.8 秒）。
+    ///
+    /// 把 `is_on_local_fixed_drive` 提到前面之后，UNC 会在**不碰文件系统**的情况下
+    /// 直接返回 false。这条断言用时间兜住"顺序被改回去"这种回归。
+    #[test]
+    fn 不可达的网络路径必须立刻短路_不能去连_smb() {
+        let started = std::time::Instant::now();
+        assert!(
+            !should_clean(r"\\198.51.100.7\share\浮光\fuguang.exe", None),
+            "网络路径不能判成失效"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "对不可达 UNC 应该立刻返回（不碰文件系统），实际耗时 {elapsed:?} —— \
+             说明 `Path::exists()` 又排到 `is_on_local_fixed_drive` 前面去了"
+        );
     }
 }

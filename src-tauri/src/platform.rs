@@ -362,8 +362,22 @@ pub fn clipboard_get_text() -> Option<String> {
     }
 }
 
-/// 把文本写入剪贴板。成功返回 true。
-pub fn clipboard_set_text(text: &str) -> bool {
+/// 写剪贴板的结果。
+///
+/// 必须把"失败了但没碰剪贴板"和"失败了且已清空"分开：调用方要据此决定
+/// 该不该告诉用户"你原来的内容没了"。合成一个 bool 会让提示在没丢东西时说丢东西。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardWrite {
+    /// 写成功了
+    Ok,
+    /// 失败了，但**没碰过**剪贴板（分配/加锁/打开失败都发生在 `EmptyClipboard` 之前）
+    FailedUntouched,
+    /// 失败了，而且剪贴板**已经被清空**（`EmptyClipboard` 执行过，原文没了）
+    FailedCleared,
+}
+
+/// 把文本写入剪贴板，并区分两种失败。
+pub fn clipboard_write_text(text: &str) -> ClipboardWrite {
     // 转成 UTF-16 并补 NUL 结尾
     let mut utf16: Vec<u16> = text.encode_utf16().collect();
     utf16.push(0);
@@ -373,29 +387,39 @@ pub fn clipboard_set_text(text: &str) -> bool {
         // GMEM_MOVEABLE 是 SetClipboardData 要求的分配方式
         let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes);
         if hmem.is_null() {
-            return false;
+            return ClipboardWrite::FailedUntouched;
         }
         let dst = GlobalLock(hmem) as *mut u16;
         if dst.is_null() {
             GlobalFree(hmem);
-            return false;
+            return ClipboardWrite::FailedUntouched;
         }
         std::ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
         GlobalUnlock(hmem);
 
         if !open_clipboard_retry() {
             GlobalFree(hmem);
-            return false;
+            return ClipboardWrite::FailedUntouched;
         }
+        // ⚠️ 这一行之后，用户原来的内容就没了
         EmptyClipboard();
         // 成功后剪贴板接管这块内存的所有权，不能再手动释放
         let ok = !SetClipboardData(CF_UNICODETEXT, hmem as HANDLE).is_null();
         CloseClipboard();
         if !ok {
             GlobalFree(hmem);
+            return ClipboardWrite::FailedCleared;
         }
-        ok
+        ClipboardWrite::Ok
     }
+}
+
+/// 把文本写入剪贴板。成功返回 true。
+///
+/// 只关心成败时用它；需要区分"失败但原文还在"和"失败且原文没了"时用
+/// [`clipboard_write_text`]。
+pub fn clipboard_set_text(text: &str) -> bool {
+    clipboard_write_text(text) == ClipboardWrite::Ok
 }
 
 /// 粘贴结果，回传给前端用于提示用户。
@@ -451,21 +475,33 @@ pub fn paste_to_target(text: &str, restore_delay_ms: u64) -> PasteOutcome {
     let had_richer = clipboard_had_richer_content();
 
     // 2. 写入要粘贴的文本
-    if !clipboard_set_text(text) {
-        // ⚠️ `clipboard_set_text` 是"先 EmptyClipboard 再 SetClipboardData"，
-        // 所以它返回 false 时剪贴板**已经被清空了**，用户原来那份已经没了。
-        // 这里不能只说"请重试" —— 那会让用户以为自己的剪贴板还完好。
-        let lost = had_unbacked || had_richer || backup.is_some();
-        const BASE: &str = "写入剪贴板失败，可能有其他程序正占用剪贴板，请重试";
-        return PasteOutcome {
-            ok: false,
-            target: None,
-            message: Some(if lost {
-                format!("{BASE}；剪贴板里原来的内容已被清空，无法还原")
-            } else {
-                BASE.into()
-            }),
-        };
+    match clipboard_write_text(text) {
+        ClipboardWrite::Ok => {}
+        ClipboardWrite::FailedUntouched => {
+            // ⚠️ 这条路径**没碰过剪贴板**：`GlobalAlloc` / `GlobalLock` /
+            // `OpenClipboard` 三处失败都发生在 `EmptyClipboard` **之前**。
+            // 所以绝不能声称"原文已被清空" —— 那是纯粹的错误信息，
+            // 而且会让用户以为东西丢了（原来这里就是这么错的）。
+            return PasteOutcome {
+                ok: false,
+                target: None,
+                message: Some("写入剪贴板失败，可能有其他程序正占用剪贴板，请重试".into()),
+            };
+        }
+        ClipboardWrite::FailedCleared => {
+            // 这条才真的清空了剪贴板（`EmptyClipboard` 执行过，只是 SetClipboardData 失败）
+            let lost = had_unbacked || had_richer || backup.is_some();
+            const BASE: &str = "写入剪贴板失败，可能有其他程序正占用剪贴板，请重试";
+            return PasteOutcome {
+                ok: false,
+                target: None,
+                message: Some(if lost {
+                    format!("{BASE}；剪贴板里原来的内容已被清空，无法还原")
+                } else {
+                    BASE.into()
+                }),
+            };
+        }
     }
 
     // 3. 把焦点还给目标窗口
@@ -554,30 +590,19 @@ mod tests {
     /// 内容冲掉，表现为随机失败。全 crate 只有下面两条会碰剪贴板。
     static CLIPBOARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// 这次要不要跑"碰真实剪贴板"的测试。
+    /// 这次要不要跑"碰真实剪贴板"的测试 —— 由 `#[ignore]` 决定，不再看环境变量。
     ///
-    /// # 为什么不看剪贴板里现在是什么
+    /// 原来这里有个 `FUGUANG_SKIP_CLIPBOARD_TESTS` 开关，配合"剪贴板里是图片就跳过"。
+    /// 那个设计有个致命问题：**跳过的测试仍然显示为 `ok`**，而 libtest 对**通过**的
+    /// 测试会捕获 stderr，那句 `eprintln!("已跳过")` 根本看不到 —— 实测
+    /// `105 passed` 里有两条一行断言都没执行（全绿但没测）。
     ///
-    /// 原来写的是"剪贴板里是图片就跳过" —— 结果**最需要它的场景恰恰被跳过了**：
-    /// 开发者刚截完图（正是复现这个 bug 的常见姿势）跑 `cargo test`，
-    /// 两条测试一行断言都没执行却报 `ok`，而 libtest 对**通过**的测试会捕获
-    /// stderr，那句 `eprintln!("已跳过")` 根本看不到 —— **全绿但没测**。
-    /// 实测：剪贴板里放一张截图 → `cargo test --lib` → `105 passed`，
-    /// 输出里 grep "跳过" 命中 0 次。这正是本项目已经踩过一次的坑
-    /// （"判据恒为假却全绿"）换了个形式。
+    /// 改成 `#[ignore]` 之后，libtest 会把它们报成 `ignored`（**看得见**），
+    /// 想跑就 `cargo test -- --ignored`。
     ///
-    /// 所以默认**一定跑**：它会把剪贴板覆盖成自己的内容（跑完尽量把文本还回去，
-    /// 图片这类还原不了）。不想被覆盖就显式设 `FUGUANG_SKIP_CLIPBOARD_TESTS=1`。
-    ///
-    /// 另外，真正决定"该不该还原"的逻辑已经拆成 `decide_restore` /
+    /// 真正决定"该不该还原"的逻辑已经拆成 `decide_restore` /
     /// `decide_original_lost` 两个纯函数，由 `收尾决策穷举` 在**任何机器上**
     /// 都真跑 —— 这两条碰真实剪贴板的测试只负责验证 Win32 那一层能对上。
-    fn clipboard_tests_enabled() -> bool {
-        std::env::var_os("FUGUANG_SKIP_CLIPBOARD_TESTS").is_none()
-    }
-
-    /// 备份剪贴板里的**文本**，供测试结束时还原。
-    /// 非文本内容（图片/文件）我们还原不了，这是已知代价。
     fn backup_for_clipboard_test() -> Option<String> {
         clipboard_get_text()
     }
@@ -598,18 +623,17 @@ mod tests {
     /// 从没问过"真写一次剪贴板，序号实际涨多少"。答案是 **5**，不是 1 ——
     /// 于是判据恒为假、剪贴板永远不还原，而 `cargo test` 全绿。
     #[test]
+    #[ignore = "要碰真实剪贴板（会覆盖它）：cargo test -- --ignored 才会跑"]
     fn 写完剪贴板之后判据必须认得自己写的内容() {
         let _guard = CLIPBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        if !clipboard_tests_enabled() {
-            eprintln!("[浮光] 设了 FUGUANG_SKIP_CLIPBOARD_TESTS，跳过这条剪贴板测试");
-            return;
-        }
         const MARK: &str = "浮光剪贴板自检-7f3a";
 
         let saved = backup_for_clipboard_test();
         if !clipboard_set_text(MARK) {
-            eprintln!("[浮光] 没有可用的剪贴板会话，跳过这条剪贴板测试");
-            return;
+            // 拿不到剪贴板会话就**明确失败**，不要静默 return：
+            // 静默 return 会让这条测试以 `ok` 出现却零断言（libtest 还会吞掉 stderr）。
+            // 现在它默认显示为 ignored（可见），真跑起来时拿不到剪贴板就是环境问题，该红。
+            panic!("没有可用的剪贴板会话，无法执行这条测试");
         }
 
         assert!(
@@ -631,19 +655,15 @@ mod tests {
     /// 粘出来的是他**原来**的剪贴板内容（可能是别处的密码/地址），
     /// 而 snippet 的内容一个字都没出去。那条兜底提示 100% 是假的。
     #[test]
+    #[ignore = "要碰真实剪贴板（会覆盖它）：cargo test -- --ignored 才会跑"]
     fn 没有目标窗口时不还原剪贴板_文本要留给用户手动粘贴() {
         let _guard = CLIPBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        if !clipboard_tests_enabled() {
-            eprintln!("[浮光] 设了 FUGUANG_SKIP_CLIPBOARD_TESTS，跳过这条剪贴板测试");
-            return;
-        }
         const ORIGINAL: &str = "浮光测试-原来的剪贴板内容-4b1e";
         const PAYLOAD: &str = "浮光测试-要粘贴的内容-9c2d";
 
         let saved = backup_for_clipboard_test();
         if !clipboard_set_text(ORIGINAL) {
-            eprintln!("[浮光] 没有可用的剪贴板会话，跳过这条剪贴板测试");
-            return;
+            panic!("没有可用的剪贴板会话，无法执行这条测试");
         }
 
         // 测试进程里没人调过 `remember_foreground`，所以走"未找到目标窗口"分支

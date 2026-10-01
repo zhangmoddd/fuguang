@@ -211,6 +211,15 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
   const run = useCallback(
     async (hit: SearchHit) => {
       if (!raw || busy) return;
+
+      // 同一条片段刚粘过、警告还在屏幕上时，回车别再粘一次（会在目标程序里
+      // 留下两份内容）。
+      //
+      // ⚠️ 必须挡在 `setError(null)` **之前**：挡在后面的话，第二次回车会先把
+      // 那条"剪贴板原文已被替换、无法还原"的警告**清掉**，然后什么都不做 ——
+      // 用户看到警告消失却没有任何反馈，只会更糊涂。
+      if (justPastedId.current === hit.id) return;
+
       setBusy(true);
       setError(null);
 
@@ -218,9 +227,6 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
         if (hit.kind === "snippet") {
           const snippet = raw.snippets.find((s) => s.id === hit.id);
           if (!snippet) return;
-          // 上一条**同一条**片段刚粘完、警告还在屏幕上时，回车别再粘一次 ——
-          // 那会让目标程序里出现两份内容。只挡这一条，不挡用户改去粘别的。
-          if (justPastedId.current === hit.id) return;
           const outcome = await api.pasteText(snippet.content);
           if (outcome.ok) {
             if (outcome.message) {

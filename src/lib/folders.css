@@ -102,12 +102,14 @@
   border-color: var(--border-strong);
 }
 
-/* 链接页的网格里：竖排，高度和图标格子一致 */
+/* 链接页的网格里：竖排，高度与图标格子对齐。
+   同样只给下限（见 links.css 里 .links__tile 的说明）：写死高度会让
+   同排的文件夹卡片比链接格子矮一截，或者反过来把卡片里的文字裁掉。 */
 .foldertile--grid .foldertile__open {
   flex-direction: column;
   gap: 5px;
   padding: 10px 6px;
-  height: calc(92px * var(--tile-scale, 1));
+  min-height: calc(92px * var(--tile-scale, 1));
   text-align: center;
 }
 

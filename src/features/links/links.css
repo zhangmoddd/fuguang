@@ -134,8 +134,18 @@
 .links__tile {
   position: relative;
   display: flex;
-  /* 高度跟着 --tile-scale 一起变，否则放大图标后格子会被文字撑成细长条 */
-  height: calc(92px * var(--tile-scale, 1));
+  /* 高度只给**下限**，由内容自己撑开。
+     这里刻意不写死高度：格子里有两个互相独立的缩放因子 ——
+     图标 / 间距 / 内边距按 --tile-scale（Ctrl+滚轮）缩放，
+     名字的字号却由设置页的「界面字号」决定（见 styles.css 的 --fs-base）。
+     写死 92px 时，默认档位下留给名字的只有
+     92 − 上下内边距 20 − 图标 40 − 间距 7 = 25px，
+     而两行 11.5px × 1.35 的文字要 31px，第二行直接被 overflow 裁掉。
+     真事故：「清内存-双击这个」在默认档位下只显示「清内存-双击这」，
+     把缩放拉到最大才完整（那时格子高 147px，装得下）。
+     min-height 之后行高由内容决定：同一行的格子被 grid 拉成一样高，
+     行与行之间允许差几像素，而文字在任何「字号 × 档位」组合下都不会被裁。 */
+  min-height: calc(92px * var(--tile-scale, 1));
   background: var(--bg-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);

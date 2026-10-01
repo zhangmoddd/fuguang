@@ -208,6 +208,20 @@ export function SnippetsPanel() {
     [inFolder, query],
   );
 
+  /**
+   * 当前文件夹**之外**还有多少条命中搜索词。
+   *
+   * 搜索只在当前这一层做（`inFolder` 参与过滤），所以用户在一个文件夹里搜
+   * 别处的东西时，看到的是"没有匹配" —— 而界面上唯一的线索只有面包屑那一行，
+   * 很容易被理解成"这条根本不存在"。用它把"别处还有 N 条"说破。
+   */
+  const outsideHits = useMemo(() => {
+    const q = query.trim();
+    if (!q || !folders.currentId) return 0;
+    const shown = new Set(inFolder.map((s) => s.id));
+    return snippets.filter((s) => !shown.has(s.id) && matches(s, q)).length;
+  }, [snippets, inFolder, query, folders.currentId]);
+
   /** 每个文件夹里有几条片段，显示在文件夹卡片上（只算直接子级）。 */
   const folderCounts = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -485,7 +499,25 @@ export function SnippetsPanel() {
                 点右上角「新建」加一条，比如你的邮箱、常用地址、一段格式模板。
               </>
             ) : query ? (
-              <>没有匹配「{query}」的片段。</>
+              <>
+                没有匹配「{query}」的片段。
+                {/* 搜索是**在当前文件夹里**做的（`inFolder` 参与过滤）。
+                    不点破的话，用户会以为"这条根本不存在"，而其实它在别的层里 ——
+                    界面上唯一的线索只有面包屑那一行。 */}
+                {folders.currentId && outsideHits > 0 && (
+                  <>
+                    <br />
+                    别的文件夹里还有 {outsideHits} 条命中。
+                    <button
+                      type="button"
+                      className="snip__empty-link"
+                      onClick={() => folders.enter(null)}
+                    >
+                      回顶层搜
+                    </button>
+                  </>
+                )}
+              </>
             ) : (
               <>这个文件夹里还没有片段。</>
             )}

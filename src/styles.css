@@ -472,6 +472,20 @@ textarea {
   line-height: 1.7;
 }
 
+/* 空状态里那句"别处还有 N 条命中，回顶层搜"上的链接按钮。
+   它要看起来**能点**（不然用户不知道那是出路），但又不能抢走空状态本身的注意力，
+   所以只上强调色 + 下划线，不加按钮底。 */
+.snip__empty-link {
+  padding: 0 2px;
+  background: transparent;
+  border: 0;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 /* 片段卡片 */
 .card {
   background: var(--bg-raised);

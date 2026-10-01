@@ -284,6 +284,30 @@ export function SettingsPanel() {
     await patch({ ballTheme: id });
   };
 
+  /**
+   * 「还原剪贴板的等待时间」的本地草稿。
+   *
+   * `null` 表示没在编辑（输入框显示存下来的值）。有一份草稿才能让用户在
+   * 中途输入任意内容 —— 否则受控输入框会在每一次按键上校验，
+   * 越界的中间状态被当场拒绝、值弹回去，用户看到的是"打了字自己变回去"。
+   */
+  const [delayDraft, setDelayDraft] = useState<string | null>(null);
+
+  /** 提交等待时间：夹到 0~2000，空串或乱输入退回原值。 */
+  const commitDelay = () => {
+    const raw = delayDraft;
+    setDelayDraft(null);
+    if (raw === null) return;
+    // 空串要单独挡：`Number("")` 是 0，不挡的话"清空重打"会悄悄把延时改成 0
+    if (raw.trim() === "") return;
+    const v = Number(raw);
+    if (!Number.isFinite(v)) return;
+    const clamped = Math.min(2000, Math.max(0, Math.round(v)));
+    if (clamped !== settings?.pasteRestoreDelayMs) {
+      void patch({ pasteRestoreDelayMs: clamped });
+    }
+  };
+
   /** 录制热键时的键盘处理。 */
   const onRecorderKeyDown = (e: React.KeyboardEvent) => {
     if (!recording) return;
@@ -533,12 +557,16 @@ export function SettingsPanel() {
               min={0}
               max={2000}
               step={20}
-              value={settings.pasteRestoreDelayMs}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                if (Number.isFinite(v) && v >= 0 && v <= 2000) {
-                  void patch({ pasteRestoreDelayMs: v });
-                }
+              // 编辑期间用本地草稿，离开输入框时再夹取落盘。
+              // 直接用 `settings.pasteRestoreDelayMs` 做受控值的话，
+              // 越界的中间状态会被当场拒绝、输入框弹回旧值 ——
+              // 用户想从 120 改成 3000、或者只是想清空重打，都会看到
+              // "打了字自己变回去"。见 `commitDelay`。
+              value={delayDraft ?? String(settings.pasteRestoreDelayMs)}
+              onChange={(e) => setDelayDraft(e.target.value)}
+              onBlur={commitDelay}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitDelay();
               }}
             />
             <span className="settings__unit">毫秒</span>

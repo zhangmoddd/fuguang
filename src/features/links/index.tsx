@@ -444,11 +444,25 @@ export function LinksPanel() {
 
     try {
       for (const { link, order } of changed) await api.linkSave({ ...link, order });
+      /**
+       * ⚠️ 必须**重新排序数组**，不能只改每条 link 的 `order` 字段。
+       *
+       * 这里原来只写了 `prev.map(...)`（原地替换那几条的 order），而 `visible`
+       * 是直接 `filter(links)` —— 数组顺序没变，界面上的顺序也就没变。
+       * 表现是：拖动时空位会动（那是渲染时的预览顺序），一松手格子**弹回原位**，
+       * 看起来就是"拖了没反应"。要等切页签/重启重新 `reload()` 才会看到新顺序。
+       *
+       * 用 `sortLinks` 而不是手动拼：它和 Rust 侧 `links_list` 的排序规则
+       * （order 小的在前，同 order 按 createdAt）是同一套，不会出现
+       * "界面一个顺序、重启后另一个顺序"。
+       */
       setLinks((prev) =>
-        prev.map((l) => {
-          const hit = changed.find((c) => c.link.id === l.id);
-          return hit ? { ...l, order: hit.order } : l;
-        }),
+        sortLinks(
+          prev.map((l) => {
+            const hit = changed.find((c) => c.link.id === l.id);
+            return hit ? { ...l, order: hit.order } : l;
+          }),
+        ),
       );
       setNotice({ kind: "ok", text: "已重新排序" });
     } catch (err) {
@@ -815,8 +829,10 @@ export function LinksPanel() {
    *
    * 被拖的那个**也在数组里** —— 渲染时把它画成一个空位（虚框），
    * 其余格子让开，这就是手机桌面拖图标的样子。
-   * 用 `drag.itemOver` 而不是 `drag.over`：指针落到格子缝隙或最后一行下面的
-   * 空白上时 `over` 会变 null，那会让空位"啪"地闪回开头（见 itemOver 的说明）。
+   *
+   * 用 `drag.over` 而不是"最近一次命中的落点"：落点判定（`resolveSortSpot`）
+   * 现在是**离指针最近的那一条**、而且每次都按当前布局重新量，
+   * 所以指针在哪，空位就在哪，不会出现"指到这儿、空位在别处"。
    */
   const orderedFolders = useMemo(
     () =>
@@ -825,10 +841,10 @@ export function LinksPanel() {
         previewOrder(
           folders.children.map((f) => f.id),
           drag.draggingId ?? "",
-          drag.itemOver,
+          drag.over,
         ),
       ),
-    [folders.children, drag.draggingId, drag.itemOver],
+    [folders.children, drag.draggingId, drag.over],
   );
 
   const orderedLinks = useMemo(
@@ -838,10 +854,10 @@ export function LinksPanel() {
         previewOrder(
           visible.map((l) => l.id),
           drag.draggingId ?? "",
-          drag.itemOver,
+          drag.over,
         ),
       ),
-    [visible, drag.draggingId, drag.itemOver],
+    [visible, drag.draggingId, drag.over],
   );
 
   /** 跟手浮层里的那一条：链接或文件夹，取决于正在拖的是什么。 */

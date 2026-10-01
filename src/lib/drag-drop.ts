@@ -88,7 +88,7 @@ export interface DropCandidate {
 export type DropAxis = "vertical" | "horizontal";
 
 /**
- * 根据指针位置算出应该投放到哪里。
+ * 根据指针位置算出应该投放到哪里（**用于"放进去"的命中判定**）。
  *
  * @param candidates - 候选落点。**顺序即优先级**，调用方要把文件夹排在前面：
  *   两个矩形重叠时取第一个命中的，顺序不确定的话同一次拖动会一会儿放这儿
@@ -117,6 +117,110 @@ export function resolveDrop(
   return null;
 }
 
+/**
+ * 把指针位置换算成"插到哪一条的前面/后面"（**用于排序**）。
+ *
+ * # 为什么排序不能沿用 `resolveDrop` 的矩形命中
+ *
+ * 排序是要**让位**的：被拖的那一格提起来之后，其他格子会重排。
+ * 重排之后"指针底下是哪一格"就和"按下那一刻缓存下来的矩形"对不上了 ——
+ * 用户的感觉是"我明明指到这儿了，空位却出现在别处"（原话：有点呆）。
+ * 所以排序每次都用**当前布局**重新算。
+ *
+ * # 为什么不是"离指针最近的那一格"
+ *
+ * 第一版就是那么写的，**错的**：网格里"最近"不按阅读顺序。
+ * 指针在左上角外面时，第二行第一格（0,100）比第一行第二格（100,0）
+ * 离得更近，于是空位会跳到第二行去。实测扫一遍就发现插入位次会**倒退**。
+ *
+ * 正确做法是**先定行、再定行内位置**：
+ * 1. 指针在所有行上方 → 排到最前；在所有行下方 → 排到最后；
+ * 2. 否则取纵向范围包含指针的那一行（都不包含就取中心最近的一行）；
+ * 3. 行内：第一条中点位于指针右边的那条 → 插到它前面；都没有 → 插到这一行最后。
+ *
+ * 这个规则**只看当前布局**，而且对同一份布局是确定的，所以
+ * "重排 → 落点变 → 又重排"不会来回翻（有单测钉着）。
+ *
+ * @param items 候选条目，**按 DOM 顺序**（也就是阅读顺序）传进来。
+ *              必须是当前布局量出来的矩形，且不含被拖的那个
+ *              （它已经变成空位了，本来也不会被 `collect` 收进来）。
+ */
+export function resolveSortSpot(
+  x: number,
+  y: number,
+  items: DropCandidate[],
+  axis: DropAxis,
+): DropSpot | null {
+  if (items.length === 0) return null;
+
+  // 纵向列表是一维的，"最近 + 中点"就够，而且天然稳定
+  if (axis === "vertical") {
+    let best: DropCandidate | null = null;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (const c of items) {
+      const cy = (c.rect.top + c.rect.bottom) / 2;
+      const dist = Math.abs(y - cy);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = c;
+      }
+    }
+    if (!best) return null;
+    return { kind: "item", id: best.id, before: y < (best.rect.top + best.rect.bottom) / 2 };
+  }
+
+  const rows = groupRows(items);
+
+  // 拖到所有行上方 / 下方：直接排到最前 / 最后。
+  // 不特判的话，"取中心最近的一行"会把指针在很下方的情况也算成"插到最后一行的中间"。
+  if (y < rows[0][0].rect.top) {
+    return { kind: "item", id: rows[0][0].id, before: true };
+  }
+  const lastRow = rows[rows.length - 1];
+  const last = lastRow[lastRow.length - 1];
+  if (y > last.rect.bottom) {
+    return { kind: "item", id: last.id, before: false };
+  }
+
+  // 指针落在行与行之间的缝里时（例如两行之间的 6px 间距），取中心最近的一行
+  let row = rows.find((r) => y >= r[0].rect.top && y <= r[0].rect.bottom);
+  if (!row) {
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (const r of rows) {
+      const cy = (r[0].rect.top + r[0].rect.bottom) / 2;
+      const dist = Math.abs(y - cy);
+      if (dist < bestDist) {
+        bestDist = dist;
+        row = r;
+      }
+    }
+  }
+  if (!row) return null;
+
+  const target = row.find((c) => x < (c.rect.left + c.rect.right) / 2);
+  return target
+    ? { kind: "item", id: target.id, before: true }
+    : { kind: "item", id: row[row.length - 1].id, before: false };
+}
+
+/**
+ * 把条目按"行"分组。
+ *
+ * 依赖两件事，两件都成立：
+ * 1. `items` 是 **DOM 顺序**（`collect` 用 `querySelectorAll`，网格是行优先排布）；
+ * 2. 同一行的 `top` 相同（浮点误差在 4px 以内算同一行 —— 缩放档位下
+ *    格子高度是小数，直接 `===` 比不出来）。
+ */
+function groupRows(items: DropCandidate[]): DropCandidate[][] {
+  const rows: DropCandidate[][] = [];
+  for (const c of items) {
+    const last = rows[rows.length - 1];
+    if (last && Math.abs(last[0].rect.top - c.rect.top) < 4) last.push(c);
+    else rows.push([c]);
+  }
+  return rows;
+}
+
 /** 拖动前必须移动这么多像素才算"在拖"，否则算点击。 */
 const DRAG_THRESHOLD = 6;
 
@@ -132,9 +236,9 @@ const DRAG_THRESHOLD = 6;
  * # 这个算法不会来回抖
  *
  * `rest`（原顺序去掉被拖的那个）是**固定的**，指针沿着拖动轴扫过去时
- * 插入位次只会依次 +1，所以空位是单调移动的 —— 这一点很重要：
- * 拖拽期间缓存的是**按下那一刻**的格子矩形（每帧重测会强制同步布局），
- * 如果顺序本身还会震荡，画面就会闪。
+ * 插入位次只会依次 +1，所以空位是单调移动的。这一点很重要：落点判定
+ * （[`resolveSortSpot`]）用的是**当前布局**的矩形，如果顺序本身还会震荡，
+ * 就会出现"重排 → 落点变 → 又重排"的闪烁。
  *
  * @param ids       这一段当前的顺序。文件夹和条目是两段，各传各的
  * @param draggedId 正在拖的那个
@@ -198,17 +302,8 @@ export interface DragItemProps {
 export interface DragSortApi {
   /** 正在拖的东西 id；`null` 表示没在拖。 */
   draggingId: string | null;
-  /** 指针下方的落点，用来高亮"放进去"的文件夹。 */
+  /** 指针下方的落点，用来高亮"放进去"的文件夹、以及算"让位"之后的顺序。 */
   over: DropSpot | null;
-  /**
-   * 拖拽期间**最近一次命中的条目落点**（粘住，不随指针移出格子而清空）。
-   *
-   * 为什么要"粘住"：让位之后格子会重排，指针很容易落到格子之间的缝、
-   * 或者最后一行的下面那片空白上。那时 `over` 变成 `null`，
-   * 按它算出来的顺序会**突然跳回原位** —— 用户看到的是空位"啪"地闪回开头。
-   * 用最近一次有效落点算顺序，空位就稳稳停在最后扫过的位置上。
-   */
-  itemOver: DropSpot | null;
   /** 指针位置（视口坐标）。画跟手的浮层用。 */
   pointer: { x: number; y: number } | null;
   /**
@@ -257,7 +352,6 @@ export function useDragSort({
 }: DragSortOptions): DragSortApi {
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [over, setOver] = useState<DropSpot | null>(null);
-  const [itemOver, setItemOver] = useState<DropSpot | null>(null);
   const [pointer, setPointer] = useState<{ x: number; y: number } | null>(null);
   const [sourceSize, setSourceSize] = useState<{ width: number; height: number } | null>(null);
 
@@ -306,7 +400,6 @@ export function useDragSort({
     overRef.current = null;
     setDraggingId(null);
     setOver(null);
-    setItemOver(null);
     setPointer(null);
     setSourceSize(null);
   }, []);
@@ -334,11 +427,29 @@ export function useDragSort({
       return out;
     };
 
-    /** 按当前缓存的矩形判一次落点；只有真的变了才 setState。 */
+    /** 按**当前**布局重新量一次候选矩形并判落点；只有真的变了才 setState。 */
     const settle = (x: number, y: number) => {
       const s = session.current;
       if (!s) return;
-      const hit = resolveDrop(x, y, s.candidates, axis);
+
+      /**
+       * ⚠️ 每次判定都重新量一遍，不能只用按下那一刻缓存的矩形。
+       *
+       * 原来是"拖拽开始时缓存一次"（每帧量怕强制同步布局）。但排序是**让位**的：
+       * 空位一挪，格子就重排，缓存的矩形立刻过期 —— 指针底下是哪一格和量出来的
+       * 对不上，用户的感觉是"我明明指到这儿了，空位却出现在别处"。
+       *
+       * 重新量其实不贵：两次指针事件之间没有 DOM 写入时，浏览器直接返回已经算好的
+       * 布局，并不会真的重排；只有顺序真的变了那一次（React 刚重排完）才需要重新
+       * 算一遍布局，而那一次本来就必须算。
+       */
+      s.candidates = collect(s.kind);
+
+      // 文件夹优先：拖到文件夹上是"放进去"，和"插到前后"是两件事，不能混
+      const folders = s.candidates.filter((c) => c.kind === "folder");
+      const items = s.candidates.filter((c) => c.kind === "item");
+      const hit = resolveDrop(x, y, folders, axis) ?? resolveSortSpot(x, y, items, axis);
+
       // 只在落点真的变了时才 setState：pointermove 一秒能来上百次
       const same =
         (hit === null && overRef.current === null) ||
@@ -352,28 +463,19 @@ export function useDragSort({
       if (!same) {
         overRef.current = hit;
         setOver(hit);
-        // 粘住最近一次命中的**条目**落点，供"让位"顺序使用（见 itemOver 的说明）。
-        // 只在命中的是条目时更新：拖到文件夹上是"放进去"，不该动排序。
-        if (hit?.kind === "item") setItemOver(hit);
       }
     };
 
     /**
-     * 拖拽期间列表被滚动时**必须重新采集矩形**。
+     * 拖拽期间列表被滚动时也要重判一次。
      *
-     * 矩形只在拖拽开始时缓存一次（每帧对所有卡片调 `getBoundingClientRect`
-     * 会强制同步布局）。但"拖拽期间布局不会变"这个前提**不成立** ——
-     * 按住鼠标拖的同时滚轮照样能用，用户完全可以一边拖一边滚列表。
-     * 那时卡片已经移走了、缓存的矩形还停在原位，表现为"松手插到了别处"。
-     *
+     * `settle` 自己会重新量矩形，所以这里只要按最后的位置再判一遍就够了 ——
+     * 否则用户"滚到目标位置再松手"时用的还是滚动前的落点。
      * 滚动事件**不冒泡**，所以要挂在捕获阶段。
      */
     const onScroll = () => {
       const s = session.current;
       if (!s || !s.active) return;
-      s.candidates = collect(s.kind);
-      // 滚动之后指针没动，但落点可能已经变了 —— 得按最后的位置重判一次，
-      // 否则用户"滚到目标位置再松手"时用的还是旧落点
       settle(s.lastX, s.lastY);
     };
 
@@ -393,19 +495,7 @@ export function useDragSort({
         // 浮层的尺寸用按下那一刻量好的：调用方一进入拖拽状态就会把原来那一格
         // 换成空位，元素不在了，这时再量只能量到空位
         setSourceSize(s.size);
-        /**
-         * 矩形只在这里缓存一次，**之后不跟着"让位"重测**。
-         *
-         * 每帧对所有卡片调 `getBoundingClientRect` 会强制同步布局，很浪费；
-         * 更要紧的是：让位之后格子会重排，重测 → 落点变了 → 又重排，
-         * 很容易变成来回闪的循环。
-         *
-         * 不重测是可以接受的，因为 `previewOrder` 是**单调**的：
-         * 指针沿拖动轴扫过去，空位只会依次往前挪，不会跳来跳去。
-         * 代价是"换位的中点"落在格子**按下时**的位置上，而不是重排之后的位置 ——
-         * 实测格子等宽时两者几乎重合，感觉不出来。
-         */
-        s.candidates = collect(s.kind);
+        // 候选矩形不在这里缓存 —— `settle` 每次判定都会重新量（理由见那里）
         document.addEventListener("scroll", onScroll, true);
       }
 
@@ -515,7 +605,6 @@ export function useDragSort({
   return {
     draggingId,
     over,
-    itemOver,
     pointer,
     sourceSize,
     itemProps,

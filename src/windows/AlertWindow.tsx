@@ -16,6 +16,12 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Bell, Check } from "lucide-react";
 
 import { api, onAlertContent } from "../lib/api";
+import { ringSchedule } from "../lib/ringtone";
+
+/** 铃声最长响多少秒。到点自动停，避免用户不在时一直响（见播放那段的说明）。 */
+const RING_SECONDS = 30;
+/** 前多少秒用满音量，之后降到三分之一当"持续提醒"。 */
+const LOUD_UNTIL_SECONDS = 8;
 
 /** 从 hash 里解析 query 参数。 */
 function readParams(): { title: string; body: string } {
@@ -107,10 +113,21 @@ export function AlertWindow() {
     };
   }, []);
 
-  /** 播放提示音。
+  /** 播放铃声。
    *
-   *  用 WebAudio 合成而不是打包音频文件：省掉几百 KB 体积，
-   *  而且不需要处理资源路径，用户也不会看到额外的 mp3 文件。
+   *  用 WebAudio 合成而不是打包音频文件：不存在版权问题（不是任何人的作品），
+   *  省掉几百 KB 体积，也不用处理资源路径、用户不会看到额外的 mp3 文件。
+   *  排布本身在 `lib/ringtone.ts` 里，是可单测的纯逻辑。
+   *
+   *  # 为什么响 30 秒而不是两声「叮」
+   *
+   *  原来是两声 0.2 秒的「叮」，一共 0.4 秒 —— 当闹钟用根本叫不醒人。
+   *  现在是一段真正的铃声：六声急促的交替音、停 0.8 秒、再来一遍，
+   *  一直响到用户点「知道了」为止（上限 30 秒）。
+   *
+   *  上限不能省：提醒窗是**置顶**的，用户可能正在开会、或者干脆不在电脑前，
+   *  没有上限的话它能一直响下去。而前 8 秒满音量、之后降到三分之一，
+   *  是为了"先抓住注意力、再变成持续但不烦人的提醒"。
    *
    *  # 为什么「读设置」必须写在同一个 effect 里面
    *
@@ -149,20 +166,26 @@ export function AlertWindow() {
         // 因为 TS 不会把外层可变量在闭包里的赋值当成收窄
         ctx = audio;
 
-        // 两声「叮」，比单声更容易被注意到
-        const now = audio.currentTime;
-        [0, 0.22].forEach((offset, i) => {
+        // 没有用户手势时上下文可能是挂起的，显式唤一次。
+        // 唤不醒也没关系：那就和以前一样没声音，不该因此影响提醒本身。
+        if (audio.state === "suspended") void audio.resume();
+
+        // 整段铃声一次排完。用户点「知道了」→ 窗口销毁 → `ctx.close()`
+        // 会把还没响的那些一起掐掉，不需要额外记定时器。
+        const start = audio.currentTime + 0.03;
+        for (const bell of ringSchedule(RING_SECONDS, LOUD_UNTIL_SECONDS)) {
           const osc = audio.createOscillator();
           const gain = audio.createGain();
           osc.type = "sine";
-          osc.frequency.value = i === 0 ? 880 : 1174;
-          gain.gain.setValueAtTime(0.0001, now + offset);
-          gain.gain.exponentialRampToValueAtTime(0.25, now + offset + 0.02);
-          gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.18);
+          osc.frequency.value = bell.freq;
+          const at = start + bell.at;
+          gain.gain.setValueAtTime(0.0001, at);
+          gain.gain.exponentialRampToValueAtTime(bell.peak, at + bell.attack);
+          gain.gain.exponentialRampToValueAtTime(0.0001, at + bell.attack + bell.decay);
           osc.connect(gain).connect(audio.destination);
-          osc.start(now + offset);
-          osc.stop(now + offset + 0.2);
-        });
+          osc.start(at);
+          osc.stop(at + bell.attack + bell.decay + 0.02);
+        }
       } catch {
         // 音频不可用不影响提醒本身，静默忽略
       }
@@ -170,6 +193,7 @@ export function AlertWindow() {
 
     return () => {
       cancelled = true;
+      // `close()` 会停掉所有已排期但还没响的振荡器 —— 这就是"点知道了就闭嘴"
       void ctx?.close();
     };
     // `arrival` 必须在依赖里：内容完全相同的两条提醒只靠 title/body 是区分不出来的，

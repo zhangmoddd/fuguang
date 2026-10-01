@@ -28,6 +28,7 @@ import "./styles.css";
 import { api, onStateChanged } from "./lib/api";
 import { advanceAlarmsOnce } from "./lib/alarm";
 import { applyBallTheme } from "./lib/ball-theme";
+import { ErrorBoundary } from "./lib/error-boundary";
 import { advanceRepeatsOnce } from "./lib/repeat-advance";
 import { applyFontSize } from "./lib/ui-scale";
 import { AlertWindow } from "./windows/AlertWindow";
@@ -158,6 +159,8 @@ if (!container) {
 
 ReactDOM.createRoot(container).render(
   <React.StrictMode>
-    <Root />
+    <ErrorBoundary>
+      <Root />
+    </ErrorBoundary>
   </React.StrictMode>,
 );

@@ -20,9 +20,15 @@ const WRITE_DEBOUNCE_MS = 400;
  *
  * @param file 数据文件名，例如 `snippets.json`
  * @param initial 文件不存在时使用的初始值
+ * @param isShapeValid 可选的形状校验。返回 `false` 时**不采纳**磁盘上的值，
+ *   而是保持 `initial` 并给一条明确的错误。见下面加载那段的说明。
  * @returns 当前数据、更新函数、是否仍在首次加载
  */
-export function usePersistentState<T>(file: string, initial: T) {
+export function usePersistentState<T>(
+  file: string,
+  initial: T,
+  isShapeValid?: (value: unknown) => boolean,
+) {
   const [value, setValue] = useState<T>(initial);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -36,6 +42,16 @@ export function usePersistentState<T>(file: string, initial: T) {
   /** 连续写失败次数：给重试做退避，并设个上限（磁盘真写不了时不能一直撞）。 */
   const failures = useRef(0);
   const timer = useRef<number | null>(null);
+  /**
+   * 形状校验函数放 ref 里，**不进加载 effect 的依赖**。
+   *
+   * 调用方多半写成内联箭头函数（`(v) => Array.isArray(v)`），每次渲染都是新的；
+   * 进依赖的话加载 effect 会每渲染一次就重跑一次，等于不停地重读磁盘。
+   */
+  const shapeRef = useRef(isShapeValid);
+  useEffect(() => {
+    shapeRef.current = isShapeValid;
+  });
   /**
    * 正在飞的那次写盘。
    *
@@ -129,6 +145,30 @@ export function usePersistentState<T>(file: string, initial: T) {
         const loaded = await api.readData<T>(file);
         if (cancelled) return;
         if (loaded !== null && loaded !== undefined && !touched.current) {
+          /**
+           * ⚠️ 形状校验不能省。
+           *
+           * `read_data` 返回的是 `serde_json::Value`，**只保证是合法 JSON，
+           * 不保证是我们要的形状**；`api.readData<T>` 是纯类型断言，
+           * 运行期零校验。而这个文件是纯文本、用户能手改 ——
+           * 把它写成 `{"a":1}`（或者 `"[]"` 这种字符串），
+           * 消费方一句 `snippets.filter(...)` 就在**渲染期**抛异常。
+           *
+           * 渲染期异常会把整棵 React 树掀掉（`main.tsx` 的 ErrorBoundary 兜着），
+           * 而面板窗口是 `prevent_close` + `hide`、**组件不会卸载** ——
+           * 于是用户看到的是 420×640 的一片空白，关掉面板再打开还是白的，
+           * 只有杀掉进程才能恢复。
+           *
+           * 所以这里宁可不采纳：保持空数据 + 一条说明，界面还能用，
+           * 用户也能看懂发生了什么（磁盘上的文件一个字节都没动）。
+           */
+          if (shapeRef.current && !shapeRef.current(loaded)) {
+            setError(
+              `${file} 的内容不是软件认识的形状（多半是被手改过）。` +
+                `当前显示为空，磁盘上的文件没有被改动 —— 改回来或把它改名再重启即可。`,
+            );
+            return;
+          }
           setValue(loaded);
           latest.current = loaded;
         }

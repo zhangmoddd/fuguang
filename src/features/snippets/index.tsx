@@ -94,10 +94,27 @@ function mask(text: string): string {
   return "•".repeat(len);
 }
 
+/**
+ * `snippets.json` 读出来的是不是一个片段数组。
+ *
+ * 放在模块级而不是写成内联箭头函数：`usePersistentState` 把它放进 ref，
+ * 但模块级常量天然稳定，读代码的人也不会怀疑它每次渲染都变。
+ *
+ * 只校验"是数组"这一层。数组**里面**的元素形状不在这里管 ——
+ * 一条坏元素最多让那一条显示不对，而整个不是数组会让整页崩掉，
+ * 两者的代价差了一个数量级，不值得为前者把加载路径写复杂。
+ */
+function isSnippetList(value: unknown): boolean {
+  return Array.isArray(value);
+}
+
 export function SnippetsPanel() {
   const { value: snippets, update, loading, error, flush } = usePersistentState<Snippet[]>(
     DATA_FILE,
     [],
+    // 形状校验：`snippets.json` 是纯文本、用户能手改。写成 `{}` 或 `"[]"`
+    // 的话，下面一句 `snippets.filter(...)` 就在**渲染期**抛异常、整块面板变白屏。
+    isSnippetList,
   );
 
   const [query, setQuery] = useState("");

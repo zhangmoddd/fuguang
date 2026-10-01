@@ -164,7 +164,12 @@ fn send_ctrl_v() -> bool {
 ///
 /// 剪贴板同一时刻只允许一个所有者，而 Office、剪贴板管理器、输入法都会
 /// 短暂占用它。Win32 文档明确要求失败时重试；单次失败就放弃会让复制/粘贴
-/// 偶发失灵 —— 而且这条路径上用户原来的剪贴板内容已经被清掉了。
+/// 偶发失灵。
+///
+/// ⚠️ 注意：**这个函数在 `EmptyClipboard` 之前被调用**，所以它失败时
+/// 用户原来的剪贴板内容**完好无损**（曾经这里的注释写成"已经被清掉了"，
+/// 那个错误认知让调用方对用户谎报"原文已被清空、无法还原"，
+/// 见 `ClipboardWrite::FailedUntouched`）。
 fn open_clipboard_retry() -> bool {
     for _ in 0..5 {
         if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {

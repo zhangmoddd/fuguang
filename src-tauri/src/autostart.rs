@@ -211,19 +211,19 @@ fn same_exe(a: &str, b: &str) -> bool {
     fn norm(s: &str) -> String {
         // `\\?\C:\...`（`canonicalize` 会加上这个前缀）和 `C:\...` 是同一个文件
         let s = s.strip_prefix(r"\\?\").unwrap_or(s);
-        // Windows **忽略整个路径末尾的空格和点**，而它们可以和反斜杠**交替出现**：
-        // `C:\x\f.exe \` 与 `C:\x\f.exe` 是同一个文件。所以必须**循环裁到稳定** ——
-        // 只裁一次会漏掉 `…f.exe \`（实测：`"D:\a\b.exe \"` 与 `"D:\a\b.exe"`
-        // 被判成了两个不同的文件，于是 is_enabled 谎报"未开启"）。
-        let mut s = s;
-        loop {
-            let t = s.trim_end_matches([' ', '.', '\\']);
-            if t.len() == s.len() {
-                break;
-            }
-            s = t;
-        }
-        s.replace('/', "\\").to_ascii_lowercase()
+        // Windows **忽略路径尾部的空格和点**：`C:\x\f.exe ` 与 `C:\x\f.exe` 等价。
+        // 实测这两种写法 `CreateProcess` 都能启动，不裁就会让 `is_enabled` 谎报"未开启"。
+        //
+        // ⚠️ **只裁一次，不要循环，也不要把尾部的反斜杠一起裁掉。**
+        // 曾经改成"循环裁掉空格/点/反斜杠"，理由是"`f.exe \` 与 `f.exe` 是同一个文件"。
+        // **那个前提是错的**：实测 `CreateProcess` 对 `"…\cmd.exe\"` 返回
+        // ERROR_FILE_NOT_FOUND(2) —— 这种写法**根本启动不了**。循环裁剪会让
+        // `is_enabled` 把一条启动不了的记录认成"就是我们自己"，从而谎报"已开启"，
+        // 而 `should_clean` 也不再清理它。
+        let s = s.trim_end_matches([' ', '.']);
+        s.replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
     }
     !a.is_empty() && !b.is_empty() && norm(a) == norm(b)
 }
@@ -603,11 +603,26 @@ mod tests {
     /// 直接返回 false。这条断言用时间兜住"顺序被改回去"这种回归。
     #[test]
     fn 不可达的网络路径必须立刻短路_不能去连_smb() {
-        let started = std::time::Instant::now();
-        assert!(
-            !should_clean(r"\\198.51.100.7\share\浮光\fuguang.exe", None),
-            "网络路径不能判成失效"
+        // ⚠️ **每次换一个主机地址**，别用固定地址。
+        //
+        // 内核会缓存失败的 SMB 连接（按**主机**，实测约 6 分钟过期）。用固定地址的话：
+        // 第一次跑确实能抓到"顺序被改回去"（实测 21.03s FAILED），
+        // **第二次跑就秒回、测试变绿** —— 明明代码里那个 bug 还在。
+        // 那正是这个项目反复踩的"假通过"，只是换了个形式。
+        //
+        // 用 TEST-NET-2（198.51.100.0/24，RFC 5737 保留给文档、实际不可路由），
+        // 每次随机取一个，绕开负缓存。
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let unc = format!(
+            r"\\198.51.100.{}\share\浮光\fuguang.exe",
+            1 + (nanos % 254)
         );
+
+        let started = std::time::Instant::now();
+        assert!(!should_clean(&unc, None), "网络路径不能判成失效：{unc}");
         let elapsed = started.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(2),

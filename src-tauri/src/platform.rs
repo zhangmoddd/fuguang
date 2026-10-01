@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HWND};
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, CountClipboardFormats, EmptyClipboard, GetClipboardData, OpenClipboard,
-    SetClipboardData,
+    CloseClipboard, CountClipboardFormats, EmptyClipboard, GetClipboardData,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -28,6 +28,22 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindow, SetForegroundWindow}
 
 /// CF_UNICODETEXT：剪贴板里的纯文本格式。
 const CF_UNICODETEXT: u32 = 13;
+
+/// 「文本家族之外」的几种剪贴板格式。
+///
+/// 用来判断用户原来复制的东西是不是**不只是纯文本** —— 这次粘贴会
+/// `EmptyClipboard()` 把整个剪贴板清空，事后我们只能把**文本**写回去，
+/// 这些格式一旦原来存在就永久没了，必须告诉用户。
+///
+/// 为什么不按"格式数 > 1"判断：Windows 复制**纯文本**时也会同时放
+/// `CF_TEXT` / `CF_OEMTEXT` / `CF_UNICODETEXT` / `CF_LOCALE` 好几种，
+/// 那样会对普通文本误报"你的东西被销毁了"。
+const CF_BITMAP: u32 = 2;
+const CF_METAFILEPICT: u32 = 3;
+const CF_DIB: u32 = 8;
+const CF_ENHMETAFILE: u32 = 14;
+const CF_HDROP: u32 = 15;
+const CF_DIBV5: u32 = 17;
 
 /// 浮光自己的窗口标题，用于把「前台窗口」判定为「不是外部目标」。
 pub const OUR_WINDOW_TITLES: [&str; 3] = ["浮光·球", "浮光·主面板", "浮光·提醒"];
@@ -205,6 +221,115 @@ fn clipboard_state(text: &str) -> Option<bool> {
     clipboard_get_text().map(|current| current == text)
 }
 
+/// 把字符串转成 NUL 结尾的 UTF-16，供 Win32 的 `*W` 系列函数用。
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 剪贴板里除了纯文本，还装着别的东西吗（图片 / 元文件 / 文件列表 / HTML / RTF）？
+///
+/// # 为什么这个判断非有不可
+///
+/// 这次粘贴会把用户原来的剪贴板**整个清空**（`EmptyClipboard`），事后我们只能把
+/// **文本**写回去。所以"文本读到了"**不等于**"用户的东西没丢" ——
+/// 从 Word / 浏览器复制一段内容时，剪贴板里同时有 `CF_UNICODETEXT` **和**
+/// HTML / RTF / Bitmap；粘贴完那些格式全没了，用户回 Word 再粘一次只会得到纯文本。
+///
+/// 原来只看 `backup.is_none()`，于是这种情况被判成"没丢、不用提示" ——
+/// 与警告文案里明写的"图片/文件/富文本"自相矛盾。
+fn clipboard_had_richer_content() -> bool {
+    const EXTRA: [u32; 6] = [
+        CF_BITMAP,
+        CF_METAFILEPICT,
+        CF_DIB,
+        CF_ENHMETAFILE,
+        CF_HDROP,
+        CF_DIBV5,
+    ];
+    unsafe {
+        if EXTRA.iter().any(|f| IsClipboardFormatAvailable(*f) != 0) {
+            return true;
+        }
+        // Word / 浏览器复制富文本时会注册这两个格式名（不是预定义常量）
+        for name in ["HTML Format", "Rich Text Format"] {
+            let id = RegisterClipboardFormatW(wide(name).as_ptr());
+            if id != 0 && IsClipboardFormatAvailable(id) != 0 {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// 粘贴结束后要不要把用户原来的文本还回去。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreAction {
+    /// 把用户原来的文本写回去
+    Restore,
+    /// 我们写的文本要**留在**剪贴板里（失败路径上用户得能手动 Ctrl+V）
+    KeepOurs,
+    /// 什么都不做（有人写过剪贴板，或者我们读不出来）
+    LeaveAlone,
+}
+
+/// 决定收尾动作。**纯函数，不碰系统剪贴板。**
+///
+/// # 为什么要把这段判断从 Win32 调用里拆出来
+///
+/// 这段逻辑**连续错了两次**（一次判据恒为假、一次"手动 Ctrl+V"的提示是假的），
+/// 而它原来和 `OpenClipboard` / `SetClipboardData` 缠在一起，只能靠
+/// "改真实剪贴板 + 跑 cargo test" 来验证 —— 而那个测试在"剪贴板里正好是图片"
+/// 时会静默跳过（libtest 还会把跳过信息吞掉），于是**全绿但一条断言都没跑**。
+///
+/// 拆成纯函数之后可以穷举所有组合，不依赖任何本机状态。
+fn decide_restore(ok: bool, still_ours: Option<bool>) -> RestoreAction {
+    // 失败路径上我们刚告诉用户"已把文本放入剪贴板，可手动 Ctrl+V"，
+    // 那时必须把文本**留在**剪贴板里。原来不看 `ok`、照还原不误，
+    // 于是用户照着提示按 Ctrl+V，粘出来的是他**原来**的内容 —— 那句话是假的。
+    if !ok {
+        return RestoreAction::KeepOurs;
+    }
+    match still_ours {
+        // 还是我们写的那段 → 没人动过，还回去
+        Some(true) => RestoreAction::Restore,
+        // 有人写过（用户复制了新东西，或目标程序改写了它）→ 不覆盖它
+        Some(false) => RestoreAction::LeaveAlone,
+        // 读不出来 → 没法判断，保守不动
+        None => RestoreAction::LeaveAlone,
+    }
+}
+
+/// 用户原来复制的东西是不是**已经找不回来了**。**纯函数，不碰系统剪贴板。**
+///
+/// 只要返回 true 就必须给用户一条提示 —— 东西没了而他一无所知是最坏的结果。
+fn decide_original_lost(
+    ok: bool,
+    had_backup: bool,
+    had_unbacked: bool,
+    had_richer: bool,
+    still_ours: Option<bool>,
+    restored: bool,
+) -> bool {
+    if !ok {
+        // 降级路径：为了保住"手动 Ctrl+V 能粘出 snippet"，我们**故意**不还原。
+        // 原来有东西（能备份的文本，或备份不了的东西）就都算丢了；剪贴板原本是空的则无所谓。
+        return had_backup || had_unbacked;
+    }
+    match still_ours {
+        Some(true) => {
+            // 还回去了（或本来就没什么可还的）。三种情况仍然算丢：
+            //   1. 想还但写入失败
+            //   2. 原来除了文本还有 HTML/RTF/图片/文件列表 —— 那些已被销毁
+            //   3. 原来有我们根本读不出来的东西
+            (had_backup && !restored) || had_richer || had_unbacked
+        }
+        // 有人写过 / 我们读不出来 → 都没还原，原文回不来。
+        // "有人写过"几乎一定是目标程序改写的：用户刚点完粘贴，
+        // 这 120ms 里不可能自己去复制别的东西。
+        _ => true,
+    }
+}
+
 /// 读取剪贴板中的文本。剪贴板非文本或为空时返回 None。
 pub fn clipboard_get_text() -> Option<String> {
     unsafe {
@@ -315,19 +440,31 @@ pub fn paste_to_target(text: &str, restore_delay_ms: u64) -> PasteOutcome {
         };
     }
 
-    // 1. 备份用户原本的**文本**
+    // 1. 备份用户原本的**文本**，并记下原来还有没有别的东西
     //
     // 备份拿不到文本有两种情况，含义完全不同：剪贴板是空的（无所谓），
     // 或者里面有我们备份不了的东西（图片/文件/富文本，或延迟渲染读不出来的文本）。
     let backup = clipboard_get_text();
     let had_unbacked = backup.is_none() && clipboard_has_unbacked_content();
+    // "文本读到了"不等于"用户的东西没丢"：从 Word/浏览器复制时剪贴板里
+    // 同时有文本和 HTML/RTF/图片，粘贴完那些格式全被 EmptyClipboard 销毁了
+    let had_richer = clipboard_had_richer_content();
 
     // 2. 写入要粘贴的文本
     if !clipboard_set_text(text) {
+        // ⚠️ `clipboard_set_text` 是"先 EmptyClipboard 再 SetClipboardData"，
+        // 所以它返回 false 时剪贴板**已经被清空了**，用户原来那份已经没了。
+        // 这里不能只说"请重试" —— 那会让用户以为自己的剪贴板还完好。
+        let lost = had_unbacked || had_richer || backup.is_some();
+        const BASE: &str = "写入剪贴板失败，可能有其他程序正占用剪贴板，请重试";
         return PasteOutcome {
             ok: false,
             target: None,
-            message: Some("写入剪贴板失败，可能有其他程序正占用剪贴板，请重试".into()),
+            message: Some(if lost {
+                format!("{BASE}；剪贴板里原来的内容已被清空，无法还原")
+            } else {
+                BASE.into()
+            }),
         };
     }
 
@@ -365,45 +502,33 @@ pub fn paste_to_target(text: &str, restore_delay_ms: u64) -> PasteOutcome {
 
     // 5. 还原用户原来的剪贴板
     //
-    // ⚠️ **只在这次粘贴真的成功（`ok`）时才还原。**
-    //
-    // 失败路径上我们刚刚告诉用户"已把文本放入剪贴板，可手动 Ctrl+V"——
-    // 那时必须把文本**留在**剪贴板里。原来的写法不看 `ok`、照还原不误，
-    // 于是用户照着提示按 Ctrl+V，粘出来的是他**原来**的剪贴板内容
-    // （可能是别处的密码、地址），而 snippet 的内容一个字都没出去 ——
-    // 那条兜底提示 100% 是假的。
-    //
-    // 但"不还原"意味着用户原来的内容**没了**，所以这件事要显式跟踪：
-    // 只要原文没被成功还回去，就必须告诉他，否则东西没了而他一无所知。
-    let mut original_lost = had_unbacked;
-
-    if ok {
-        if let Some(previous) = backup {
-            if restore_delay_ms > 0 {
-                thread::sleep(Duration::from_millis(restore_delay_ms));
-            }
-            match clipboard_state(text) {
-                // 还是我们写的那段 → 没人动过，还回去
-                Some(true) => {
-                    if !clipboard_set_text(&previous) {
-                        original_lost = true;
-                    }
-                }
-                // 有人写过（用户复制了新东西，或目标程序改写了它）→ 不覆盖它。
-                // 用户原来那份确实回不来了，但此刻剪贴板里是他自己在意的内容，
-                // 报一句"原文已被替换"只会让人困惑，所以这里不提示。
-                Some(false) => {}
-                // 读不出来：没法判断该不该还原，保守不动 —— 但原文确实丢了，要说
-                None => original_lost = true,
-            }
-        }
-    } else if backup.is_some() {
-        // 降级路径：为了保住"手动 Ctrl+V 能粘出 snippet"，我们**故意**不还原。
-        // 代价就是用户原来的内容被替换掉了 —— 必须说清楚。
-        original_lost = true;
+    // 决策本身在 `decide_restore` / `decide_original_lost` 两个**纯函数**里，
+    // 这里只负责按决策去调 Win32。把它们拆开是因为这段判断连续错了两次，
+    // 而和 Win32 缠在一起就只能靠"改真实剪贴板"来验证 ——
+    // 那个测试在"剪贴板里正好是图片"时会静默跳过，等于没有安全网。
+    if ok && restore_delay_ms > 0 {
+        // 先等一会儿：目标程序可能还没处理完那次 Ctrl+V
+        thread::sleep(Duration::from_millis(restore_delay_ms));
     }
 
-    if original_lost {
+    let still_ours = if ok { clipboard_state(text) } else { None };
+    let action = decide_restore(ok, still_ours);
+
+    let mut restored = false;
+    if action == RestoreAction::Restore {
+        if let Some(previous) = backup.as_ref() {
+            restored = clipboard_set_text(previous);
+        }
+    }
+
+    if decide_original_lost(
+        ok,
+        backup.is_some(),
+        had_unbacked,
+        had_richer,
+        still_ours,
+        restored,
+    ) {
         const WARN: &str =
             "剪贴板里原来的内容已被这次粘贴替换，无法还原（图片/文件/富文本，或这次没能还原成功的文本）";
         message = Some(match message {
@@ -429,21 +554,32 @@ mod tests {
     /// 内容冲掉，表现为随机失败。全 crate 只有下面两条会碰剪贴板。
     static CLIPBOARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// 备份当前剪贴板，并判断"这次测试能不能安全地跑"。
+    /// 这次要不要跑"碰真实剪贴板"的测试。
     ///
-    /// 返回 `None` 表示**必须跳过**：要么没有剪贴板会话（CI / 无桌面），
-    /// 要么剪贴板里是图片/文件这种我们还原不了的东西 ——
-    /// `clipboard_set_text` 会 `EmptyClipboard()` 把它彻底销毁，
-    /// 跑一次测试不该毁掉开发者剪贴板里的截图。
-    fn backup_for_clipboard_test() -> Option<Option<String>> {
-        let saved = clipboard_get_text();
-        if saved.is_none() && clipboard_has_unbacked_content() {
-            // 跳过必须**可见**。静默跳过会让"全绿"变成假象 ——
-            // 上一批那个"判据恒为假却全绿"的坑就是这么来的。
-            eprintln!("[浮光] 剪贴板里是图片/文件，还原不了，跳过这条剪贴板测试");
-            return None;
-        }
-        Some(saved)
+    /// # 为什么不看剪贴板里现在是什么
+    ///
+    /// 原来写的是"剪贴板里是图片就跳过" —— 结果**最需要它的场景恰恰被跳过了**：
+    /// 开发者刚截完图（正是复现这个 bug 的常见姿势）跑 `cargo test`，
+    /// 两条测试一行断言都没执行却报 `ok`，而 libtest 对**通过**的测试会捕获
+    /// stderr，那句 `eprintln!("已跳过")` 根本看不到 —— **全绿但没测**。
+    /// 实测：剪贴板里放一张截图 → `cargo test --lib` → `105 passed`，
+    /// 输出里 grep "跳过" 命中 0 次。这正是本项目已经踩过一次的坑
+    /// （"判据恒为假却全绿"）换了个形式。
+    ///
+    /// 所以默认**一定跑**：它会把剪贴板覆盖成自己的内容（跑完尽量把文本还回去，
+    /// 图片这类还原不了）。不想被覆盖就显式设 `FUGUANG_SKIP_CLIPBOARD_TESTS=1`。
+    ///
+    /// 另外，真正决定"该不该还原"的逻辑已经拆成 `decide_restore` /
+    /// `decide_original_lost` 两个纯函数，由 `收尾决策穷举` 在**任何机器上**
+    /// 都真跑 —— 这两条碰真实剪贴板的测试只负责验证 Win32 那一层能对上。
+    fn clipboard_tests_enabled() -> bool {
+        std::env::var_os("FUGUANG_SKIP_CLIPBOARD_TESTS").is_none()
+    }
+
+    /// 备份剪贴板里的**文本**，供测试结束时还原。
+    /// 非文本内容（图片/文件）我们还原不了，这是已知代价。
+    fn backup_for_clipboard_test() -> Option<String> {
+        clipboard_get_text()
     }
 
     /// 把测试前的剪贴板内容还回去。
@@ -464,11 +600,13 @@ mod tests {
     #[test]
     fn 写完剪贴板之后判据必须认得自己写的内容() {
         let _guard = CLIPBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !clipboard_tests_enabled() {
+            eprintln!("[浮光] 设了 FUGUANG_SKIP_CLIPBOARD_TESTS，跳过这条剪贴板测试");
+            return;
+        }
         const MARK: &str = "浮光剪贴板自检-7f3a";
 
-        let Some(saved) = backup_for_clipboard_test() else {
-            return; // 剪贴板里是还原不了的东西，别动它（原因已 eprintln）
-        };
+        let saved = backup_for_clipboard_test();
         if !clipboard_set_text(MARK) {
             eprintln!("[浮光] 没有可用的剪贴板会话，跳过这条剪贴板测试");
             return;
@@ -495,12 +633,14 @@ mod tests {
     #[test]
     fn 没有目标窗口时不还原剪贴板_文本要留给用户手动粘贴() {
         let _guard = CLIPBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !clipboard_tests_enabled() {
+            eprintln!("[浮光] 设了 FUGUANG_SKIP_CLIPBOARD_TESTS，跳过这条剪贴板测试");
+            return;
+        }
         const ORIGINAL: &str = "浮光测试-原来的剪贴板内容-4b1e";
         const PAYLOAD: &str = "浮光测试-要粘贴的内容-9c2d";
 
-        let Some(saved) = backup_for_clipboard_test() else {
-            return;
-        };
+        let saved = backup_for_clipboard_test();
         if !clipboard_set_text(ORIGINAL) {
             eprintln!("[浮光] 没有可用的剪贴板会话，跳过这条剪贴板测试");
             return;
@@ -537,5 +677,73 @@ mod tests {
         assert!(holds(Some("abc"), "abc"));
         assert!(!holds(Some("abc"), "abd"));
         assert!(!holds(None, "abc"), "剪贴板里没有文本时不该说成立");
+    }
+
+    /// 收尾决策的**穷举表**。
+    ///
+    /// 这一段连续错了两次（判据恒为假 → 剪贴板永不还原；不看 `ok` →
+    /// "手动 Ctrl+V"的提示是假的），而它原来只能靠"改真实剪贴板 + 跑 cargo test"
+    /// 验证 —— 那个测试还会在剪贴板里是图片时静默跳过。
+    /// 拆成纯函数之后，这里把每种组合都钉死，**任何机器上都真跑**（CI 也一样）。
+    #[test]
+    fn 收尾决策穷举() {
+        struct Case {
+            ok: bool,
+            had_backup: bool,
+            had_unbacked: bool,
+            had_richer: bool,
+            still_ours: Option<bool>,
+            restored: bool,
+            action: RestoreAction,
+            lost: bool,
+            why: &'static str,
+        }
+
+        let cases = [
+            // —— 粘贴成功 ——
+            Case { ok: true, had_backup: true, had_unbacked: false, had_richer: false, still_ours: Some(true), restored: true, action: RestoreAction::Restore, lost: false,
+                why: "普通文本：还回去，什么都没丢" },
+            Case { ok: true, had_backup: true, had_unbacked: false, had_richer: false, still_ours: Some(true), restored: false, action: RestoreAction::Restore, lost: true,
+                why: "想还但写入失败 → 原文没了" },
+            Case { ok: true, had_backup: true, had_unbacked: false, had_richer: true, still_ours: Some(true), restored: true, action: RestoreAction::Restore, lost: true,
+                why: "文本+HTML/RTF：文本还回去了，但富文本格式已被 EmptyClipboard 销毁" },
+            Case { ok: true, had_backup: false, had_unbacked: true, had_richer: true, still_ours: Some(true), restored: false, action: RestoreAction::Restore, lost: true,
+                why: "原来只有图片：还不了" },
+            Case { ok: true, had_backup: false, had_unbacked: false, had_richer: false, still_ours: Some(true), restored: false, action: RestoreAction::Restore, lost: false,
+                why: "剪贴板原本是空的：没什么可丢" },
+            Case { ok: true, had_backup: true, had_unbacked: false, had_richer: false, still_ours: Some(false), restored: false, action: RestoreAction::LeaveAlone, lost: true,
+                why: "还原前被目标程序改写了 → 不覆盖它，但原文没了" },
+            Case { ok: true, had_backup: true, had_unbacked: false, had_richer: false, still_ours: None, restored: false, action: RestoreAction::LeaveAlone, lost: true,
+                why: "读不出来 → 保守不动，但原文没了" },
+            // —— 粘贴失败：文本必须留在剪贴板里，用户才能手动 Ctrl+V ——
+            Case { ok: false, had_backup: true, had_unbacked: false, had_richer: false, still_ours: None, restored: false, action: RestoreAction::KeepOurs, lost: true,
+                why: "失败+原来有文本：故意不还原（否则提示是假的），原文丢了" },
+            Case { ok: false, had_backup: false, had_unbacked: true, had_richer: true, still_ours: None, restored: false, action: RestoreAction::KeepOurs, lost: true,
+                why: "失败+原来是图片：原文丢了" },
+            Case { ok: false, had_backup: false, had_unbacked: false, had_richer: false, still_ours: None, restored: false, action: RestoreAction::KeepOurs, lost: false,
+                why: "失败+剪贴板原本是空的：没什么可丢" },
+        ];
+
+        for (i, c) in cases.iter().enumerate() {
+            assert_eq!(
+                decide_restore(c.ok, c.still_ours),
+                c.action,
+                "第 {i} 条（{}）的收尾动作不对",
+                c.why
+            );
+            assert_eq!(
+                decide_original_lost(
+                    c.ok,
+                    c.had_backup,
+                    c.had_unbacked,
+                    c.had_richer,
+                    c.still_ours,
+                    c.restored,
+                ),
+                c.lost,
+                "第 {i} 条（{}）的「原文是否丢失」不对",
+                c.why
+            );
+        }
     }
 }

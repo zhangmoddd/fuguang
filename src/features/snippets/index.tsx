@@ -24,6 +24,7 @@ import {
   Send,
   Star,
   Trash2,
+  TriangleAlert,
   X,
 } from "lucide-react";
 
@@ -101,7 +102,30 @@ export function SnippetsPanel() {
 
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState<Snippet | null>(null);
-  const [feedback, setFeedback] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<{
+    text: string;
+    kind: "ok" | "warn";
+    seq: number;
+  } | null>(null);
+  /**
+   * 反馈序号。同样的文案再出现一次时 `setFeedback` 收到的仍是**新对象**
+   * （`seq` 变了），React 不会 bail out，计时器 effect 才会重启 ——
+   * 否则 2.4 秒内连点两次同一条，第二次的提示会跟着第一次一起消失。
+   */
+  const feedbackSeq = useRef(0);
+
+  /**
+   * 显示一条反馈。
+   *
+   * `kind === "warn"` 用于「操作成功了，但有东西没了」这类**必须读完**的提示。
+   * 它不能复用 `已保存` 那条绿色对勾 + 2.4 秒的通道：一句六十来字的
+   * "剪贴板里原来的内容已被替换，无法还原"读都读不完就消失了，
+   * 用户只会以为自己看错了 —— 而那正是最需要他看见的一句话。
+   */
+  const showFeedback = (text: string, kind: "ok" | "warn" = "ok") => {
+    feedbackSeq.current += 1;
+    setFeedback({ text, kind, seq: feedbackSeq.current });
+  };
   /** 哪些条目的遮罩被临时揭开。 */
   const [revealed, setRevealed] = useState<Set<string>>(new Set());
   const searchRef = useRef<HTMLInputElement>(null);
@@ -118,10 +142,11 @@ export function SnippetsPanel() {
     searchRef.current?.focus();
   }, []);
 
-  // 反馈提示 2.4 秒后自动消失
+  // 反馈提示自动消失。警告留久一点 —— 它讲的是"东西没了"，需要读完。
   useEffect(() => {
     if (!feedback) return;
-    const t = window.setTimeout(() => setFeedback(null), 2400);
+    const ttl = feedback.kind === "warn" ? 8000 : 2400;
+    const t = window.setTimeout(() => setFeedback(null), ttl);
     return () => window.clearTimeout(t);
   }, [feedback]);
 
@@ -195,10 +220,16 @@ export function SnippetsPanel() {
       // ⚠️ 成功时也可能带回一条**必须让用户看到**的警告：剪贴板里原来是图片/文件，
       // 或者这次没能还原成功 —— 那意味着他原来复制的东西已经没了。
       // 只在失败分支读 `message` 的话，这条提示在成功路径上就是死代码。
-      setFeedback(outcome.message ? `${base}；${outcome.message}` : base);
+      showFeedback(
+        outcome.message ? `${base}；${outcome.message}` : base,
+        outcome.message ? "warn" : "ok",
+      );
     } else {
       // 降级路径：内容已经躺在剪贴板里了，明确告诉用户手动 Ctrl+V
-      setFeedback(outcome.message ?? "已复制到剪贴板，请手动 Ctrl+V");
+      showFeedback(
+        outcome.message ?? "已复制到剪贴板，请手动 Ctrl+V",
+        "warn",
+      );
     }
   };
 
@@ -206,7 +237,10 @@ export function SnippetsPanel() {
   const copyOnly = async (s: Snippet) => {
     const ok = await api.copyText(s.content);
     bumpUse(s.id);
-    setFeedback(ok ? "已复制到剪贴板" : "复制失败，剪贴板可能被占用");
+    showFeedback(
+      ok ? "已复制到剪贴板" : "复制失败，剪贴板可能被占用",
+      ok ? "ok" : "warn",
+    );
   };
 
   const save = (draft: Snippet) => {
@@ -220,12 +254,12 @@ export function SnippetsPanel() {
       return exists ? prev.map((s) => (s.id === cleaned.id ? cleaned : s)) : [cleaned, ...prev];
     });
     setEditing(null);
-    setFeedback("已保存");
+    showFeedback("已保存");
   };
 
   const remove = (id: string) => {
     update((prev) => prev.filter((s) => s.id !== id));
-    setFeedback("已删除");
+    showFeedback("已删除");
   };
 
   const toggleFlag = (id: string, key: "starred" | "sensitive") => {
@@ -244,7 +278,7 @@ export function SnippetsPanel() {
     setMovingId(null);
     if ((s.folderId ?? null) === folderId) return;
     update((prev) => prev.map((x) => (x.id === s.id ? { ...x, folderId } : x)));
-    setFeedback(`已移动「${s.title}」`);
+    showFeedback(`已移动「${s.title}」`);
   };
 
   /**
@@ -324,9 +358,17 @@ export function SnippetsPanel() {
       </div>
 
       {feedback && (
-        <div className="snip__feedback">
-          <Check size={13} />
-          {feedback}
+        <div
+          className={`snip__feedback${
+            feedback.kind === "warn" ? " snip__feedback--warn" : ""
+          }`}
+        >
+          {feedback.kind === "warn" ? (
+            <TriangleAlert size={13} />
+          ) : (
+            <Check size={13} />
+          )}
+          {feedback.text}
         </div>
       )}
 

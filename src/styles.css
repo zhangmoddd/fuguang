@@ -416,6 +416,17 @@ textarea {
   flex-shrink: 0;
 }
 
+/* 「操作成功了，但有东西没了」这类提示。
+   不能沿用上面的绿色对勾：那是在说"一切正常"，而这条在说"你的剪贴板原文被替换了"。
+   改成警示色，并且留 8 秒（见 index.tsx 里的 ttl）—— 六十来字读不完就消失等于没说。 */
+.snip__feedback--warn {
+  background: rgba(217, 119, 6, 0.12);
+  border-color: rgba(217, 119, 6, 0.35);
+  color: var(--warning, #b45309);
+  align-items: flex-start;
+  line-height: 1.45;
+}
+
 .snip__error {
   margin: 0 10px 6px;
   padding: 6px 9px;

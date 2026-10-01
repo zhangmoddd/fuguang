@@ -169,14 +169,15 @@ fn read_registered_path(hkey: HKEY) -> Option<String> {
 /// 所以 `"C:\x\浮光\fuguang.exe" --minimized` 是**完全合法、能正常工作**的一条自启项。
 /// 而把整串丢给 `Path::exists()` 必然为假 —— 那就会把这条好记录当成"失效"删掉。
 ///
-/// # 为什么"取不出来"要单独表达
+/// # 未加引号时整串就是路径
 ///
-/// 未加引号**且含空格**的写法是有歧义的：Windows 会从 `c:\program.exe` 开始
-/// 逐个尝试更长的前缀，所以 `C:\Program Files\浮光\fuguang.exe` 这样写**也能启动**，
-/// 而"第一个空白之前"只会得到 `C:\Program` —— 拿它去判存在必然为假，
-/// 于是把一条**指向浮光自己、且完全能用**的记录删掉。
+/// 曾经因为"未加引号且含空格 → 判不准 → 返回 None"，结果 `is_enabled` 对
+/// `C:\sp ace\fuguang.exe` 这种**实测能启动**的写法谎报"未开启"，
+/// 用户看到开关是关的、开机却照样启动。
 ///
-/// 判不准就不要判：返回 `None`，调用方据此保守处理（不删、不认作已开启）。
+/// 所以这里返回整串。**"含空格所以有歧义"这件事交给 [`is_ambiguous`]** ——
+/// 它的用途不同：`is_enabled` 该尽力认（认出来对用户更好），
+/// `should_clean` 该保守（判不准就别删注册表）。
 fn exe_path_of(command: &str) -> Option<&str> {
     let s = command.trim();
     if s.is_empty() {
@@ -188,12 +189,18 @@ fn exe_path_of(command: &str) -> Option<&str> {
         return rest.split('"').next().filter(|p| !p.is_empty());
     }
 
-    // 未加引号却含空格 → 有歧义，见上面的说明
-    if s.contains(char::is_whitespace) {
-        return None;
-    }
-
     Some(s)
+}
+
+/// 这个 Run 值是不是"未加引号**且**含空格"。
+///
+/// 这种写法**有歧义**：Windows 会从 `c:\program.exe` 开始逐个尝试更长的前缀，
+/// 所以 `C:\Program Files\浮光\fuguang.exe` 这样写既可能启动到浮光，
+/// 也可能启动到 `C:\Program.exe`。能不能启动、启动的是谁都不确定 ——
+/// 那就**不许据此删注册表**。
+fn is_ambiguous(command: &str) -> bool {
+    let s = command.trim();
+    !s.starts_with('"') && s.contains(char::is_whitespace)
 }
 
 /// 判断注册表里记的路径是不是就是当前这个 exe。
@@ -202,6 +209,11 @@ fn exe_path_of(command: &str) -> Option<&str> {
 /// Windows 路径这几种写法都指向同一个文件，逐字节比较会把它们当成两个程序。
 fn same_exe(a: &str, b: &str) -> bool {
     fn norm(s: &str) -> String {
+        // `\\?\C:\...`（`canonicalize` 会加上这个前缀）和 `C:\...` 是同一个文件
+        let s = s.strip_prefix(r"\\?\").unwrap_or(s);
+        // Windows **忽略路径尾部的空格和点**：`C:\x\f.exe ` 与 `C:\x\f.exe` 等价。
+        // 实测这两种写法 CreateProcess 都能启动，不裁就会让 is_enabled 谎报"未开启"。
+        let s = s.trim_end_matches([' ', '.']);
         s.replace('/', "\\")
             .trim_end_matches('\\')
             .to_ascii_lowercase()
@@ -257,7 +269,12 @@ pub fn is_enabled() -> bool {
 /// @param registered 注册表里记的**命令行**
 /// @param current_exe 当前进程的 exe 路径；拿不到时传 `None`（保守：不删）
 fn should_clean(registered: &str, current_exe: Option<&str>) -> bool {
-    // 取不出可执行文件路径（空值、引号没闭合、未加引号却含空格）→ 判不准，不碰
+    // 未加引号且含空格 → 有歧义（见 is_ambiguous），不许据此删注册表
+    if is_ambiguous(registered) {
+        return false;
+    }
+
+    // 取不出可执行文件路径（空值、引号没闭合）→ 判不准，不碰
     let Some(exe) = exe_path_of(registered) else {
         return false;
     };
@@ -268,13 +285,56 @@ fn should_clean(registered: &str, current_exe: Option<&str>) -> bool {
         return false;
     }
 
-    // 不是绝对路径（环境变量、相对路径、或者干脆是段垃圾）→ 不碰
+    // 不是绝对路径（相对路径、光秃文件名、垃圾串）→ 不碰
     if !looks_absolute(exe) {
         return false;
     }
 
+    // 路径里还有**没展开的环境变量** → 判不准，不碰。
+    //
+    // 只挡开头的 `%LOCALAPPDATA%\...` 是不够的：变量出现在中段时
+    // （`C:\Users\%USERNAME%\...`）`Path::exists()` 同样判假，而这条记录
+    // 若是 REG_EXPAND_SZ，Explorer 会展开它、其实能正常启动。
+    if exe.contains('%') {
+        return false;
+    }
+
     // 目标文件还在 → 可能是另一个目录下的正式版，别碰别人的自启
-    !std::path::Path::new(exe).exists()
+    if std::path::Path::new(exe).exists() {
+        return false;
+    }
+
+    // 最后一道：**只有本机固定磁盘上的"文件不存在"才说明记录失效**。
+    //
+    // 网络共享离线、U 盘没插、盘符没映射时目标同样"不存在"，但那条记录其实能用 ——
+    // 删了就没了，而且 release 版是 `windows_subsystem = "windows"`，
+    // `eprintln!` 没有 stderr 可写，用户看不到任何提示。
+    is_on_local_fixed_drive(exe)
+}
+
+/// `DRIVE_FIXED`：本机固定磁盘，`GetDriveTypeW` 的返回值之一。
+///
+/// 自己定义而不是从 `windows_sys` 引：它住在
+/// `Win32::System::WindowsProgramming` 里，为**一个常量**多开一个 feature 不划算。
+/// 值取自 Win32 头文件（`winbase.h`），是稳定的 ABI 常量。
+const DRIVE_FIXED: u32 = 3;
+
+/// 这条路径是不是位于一个**本机固定磁盘**上（`C:\` 这种）。
+///
+/// 只有在这种地方，"文件不存在"才真正说明自启项失效。
+fn is_on_local_fixed_drive(path: &str) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+    // UNC（`\\server\share`）一律不算：共享可能只是暂时离线
+    if path.starts_with("\\\\") {
+        return false;
+    }
+    let b = path.as_bytes();
+    if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
+        return false;
+    }
+    let root = [b[0] as u16, b':' as u16, b'\\' as u16, 0];
+    unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_FIXED }
 }
 
 /// 看起来是不是一条**绝对路径**（`X:\…` 或 `\\server\…`）。
@@ -432,24 +492,74 @@ mod tests {
             exe_path_of(r#"  "C:\a b\f.exe"  /silent  "#),
             Some(r"C:\a b\f.exe")
         );
-        // 不带引号且无空格：整串就是路径
+        // 不带引号：整串就是路径。**含空格也一样** —— 实测这种写法 CreateProcess
+        // 能启动，返回 None 会让 is_enabled 谎报"未开启"（开关是关的、开机却照样启动）。
         assert_eq!(
             exe_path_of(r"C:\soft\fuguang.exe"),
             Some(r"C:\soft\fuguang.exe")
         );
-        // 不带引号却含空格 → **有歧义，判不准**（见 exe_path_of 的说明）
-        assert_eq!(exe_path_of(r"C:\Program Files\浮光\fuguang.exe"), None);
+        assert_eq!(
+            exe_path_of(r"C:\Program Files\浮光\fuguang.exe"),
+            Some(r"C:\Program Files\浮光\fuguang.exe")
+        );
         // 坏值一律判不准
         assert_eq!(exe_path_of(""), None);
         assert_eq!(exe_path_of("\""), None);
     }
 
     #[test]
-    fn 未加引号且含空格的自启值判不准_一律不删() {
-        // Windows 对未加引号的含空格路径会从 `c:\program.exe` 开始逐个尝试更长的
-        // 前缀，所以 `C:\Program Files\浮光\fuguang.exe` 这样写**能正常工作**。
-        // 按"第一个空白之前"取会得到 `C:\Program`（不存在）—— 照它判就会误删一条
-        // 指向浮光自己、且完全能用的自启项。
+    fn 未加引号含空格的写法有歧义_不能据此删注册表() {
+        // Windows 会从 `c:\program.exe` 开始逐个尝试更长的前缀，所以这种写法
+        // 能不能启动、启动的到底是哪一个都不确定 —— 判不准就别删注册表。
+        assert!(is_ambiguous(r"C:\Program Files\浮光\fuguang.exe"));
         assert!(!should_clean(r"C:\Program Files\浮光\fuguang.exe", None));
+        // 带引号的同一路径不歧义；不含空格的也不歧义
+        assert!(!is_ambiguous(r#""C:\Program Files\浮光\fuguang.exe""#));
+        assert!(!is_ambiguous(r"C:\soft\fuguang.exe"));
+    }
+
+    #[test]
+    fn 路径比较要认得出同一个文件的几种写法() {
+        let me = r"D:\software\浮光\fuguang.exe";
+        // 尾部空格 / 尾部点：Windows 忽略（实测这两种 CreateProcess 都能启动，
+        // 不裁就会让 is_enabled 谎报"未开启"）
+        assert!(same_exe(r"D:\software\浮光\fuguang.exe ", me));
+        assert!(same_exe(r"D:\software\浮光\fuguang.exe.", me));
+        // `\\?\` 前缀（canonicalize 会加上它）
+        assert!(same_exe(r"\\?\D:\software\浮光\fuguang.exe", me));
+        // 正斜杠 / 大小写
+        assert!(same_exe(r"d:/SOFTWARE/浮光/FUGUANG.EXE", me));
+        // 不同的文件不能算相同
+        assert!(!same_exe(r"D:\software\浮光\fuguang2.exe", me));
+    }
+
+    #[test]
+    fn 只有本机固定磁盘上的路径才允许被判失效() {
+        // 系统盘一定是固定磁盘
+        assert!(is_on_local_fixed_drive(r"C:\Windows\notepad.exe"));
+
+        // UNC 一律不算：共享可能只是暂时离线，那条记录其实能用
+        assert!(!is_on_local_fixed_drive(
+            r"\\offline-server\share\浮光\fuguang.exe"
+        ));
+        assert!(!should_clean(
+            r"\\offline-server\share\浮光\fuguang.exe",
+            None
+        ));
+
+        // 找一个当前不存在的盘符，确认"没映射的盘"不会被当成固定磁盘
+        let free = ('D'..='Z').find(|c| !std::path::Path::new(&format!("{c}:\\")).exists());
+        if let Some(c) = free {
+            let p = format!("{c}:\\浮光\\fuguang.exe");
+            assert!(!is_on_local_fixed_drive(&p), "未映射的盘符不该算固定磁盘：{p}");
+            assert!(!should_clean(&p, None), "未映射盘符上的记录不能删：{p}");
+        }
+
+        // 含未展开环境变量的路径一律不碰（变量在中段时同样要挡住）
+        assert!(!should_clean(
+            r"C:\Users\%USERNAME%\AppData\Local\浮光\fuguang.exe",
+            None
+        ));
+        assert!(!should_clean(r"%LOCALAPPDATA%\浮光\fuguang.exe", None));
     }
 }

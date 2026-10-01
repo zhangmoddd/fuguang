@@ -83,6 +83,27 @@ describe("advanceRepeats", () => {
     expect(memoSave).not.toHaveBeenCalled();
   });
 
+  it("恰好推进一个周期，不是两个", async () => {
+    // 基准用"刚刚过去"而不是固定的远期过去时刻：后者会让 firstOccurrence
+    // 把结果再往前滚很多天，于是"推一个周期"和"推两个周期"算出来**同一个值** ——
+    // 变异验证时把代码改成连推两次，测试全绿（那对这个规则是等价变换）。
+    // 基准贴近现在，结果就正好落在一个周期之后，多推一次看得出来。
+    const base = Date.now() - 1000;
+    const result = await advanceRepeats([
+      dueMemo({ remindAt: base, firedFor: base }),
+    ]);
+    expect(result.failed).toBe(0);
+
+    const sent = memoSave.mock.calls[0][0] as Memo;
+    expect(sent.remindAt).not.toBeNull();
+    const delta = (sent.remindAt as number) - base;
+    const hour = 3600 * 1000;
+    // 每日规则的一个周期是 23/24/25 小时（夏令时），留足余量；
+    // 推两个周期会是 ~48 小时，落不进来
+    expect(delta).toBeGreaterThan(20 * hour);
+    expect(delta).toBeLessThan(28 * hour);
+  });
+
   it("写盘失败必须计数，不能只是交给 onError", async () => {
     // 后台调用方（应用入口）**不传** onError，它只能靠 `failed` 知道要重试。
     // 只报 onError 的话，重试永远不会触发 —— 上一批就是这么错的。

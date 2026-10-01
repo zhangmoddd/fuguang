@@ -77,6 +77,16 @@
   flex-shrink: 0;
 }
 
+/* 「操作成功了，但有东西没了」——例如剪贴板原文已被替换、无法还原。
+   不能沿用上面的红色"失败"样式：那会让用户以为没粘上，于是再按一次回车，
+   第二次会**真的再粘一遍**。改成中性警示色，并允许换行（文案较长）。 */
+.palette__error--warn {
+  background: rgba(217, 119, 6, 0.12);
+  color: var(--warning, #b45309);
+  align-items: flex-start;
+  line-height: 1.45;
+}
+
 .palette__list {
   flex: 1;
   min-height: 0;

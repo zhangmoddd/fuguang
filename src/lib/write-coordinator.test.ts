@@ -95,17 +95,24 @@ describe("WriteCoordinator", () => {
     expect(c.dirty).toBe(false);
   });
 
-  it("commit 一个更旧的版本号不会把 written 往回退", () => {
-    // 理论上不该发生，但真发生了也不能让"已写"倒退，
-    // 否则会凭空冒出一个永不消失的 dirty
+  it("迟到的旧版本回调不会把 written 往回退", () => {
+    // 理论上不该发生（`begin` 的 inFlight 已经把写盘串行化了），但真发生了也不能让
+    // "已写"倒退 —— 那会凭空冒出一个永远清不掉的 dirty。
+    //
+    // ⚠️ **顺序是关键**：必须先提交新版本、再提交旧版本。
+    // 原来写成"先 commit(1) 再 commit(2)"，那样 written 全程单调递增，
+    // 守卫 `writing > written` 恒为真 —— 把守卫整行删掉测试照样全绿。
+    // （变异验证实测：删掉守卫 → 8 passed。）
     const c = new WriteCoordinator();
     c.markDirty();
     c.markDirty();
-    const second = c.begin() as number;
 
-    c.commit(1); // 迟到的旧版本回调
-    expect(c.dirty).toBe(true); // 第 2 版还没写
-    expect(c.commit(second)).toBe(false);
+    expect(c.begin()).toBe(2);
+    expect(c.commit(2)).toBe(false); // 最新版写完了
+    expect(c.dirty).toBe(false);
+
+    // 迟到的旧版本回调：不许把 written 退回 1
+    expect(c.commit(1)).toBe(false);
     expect(c.dirty).toBe(false);
   });
 });

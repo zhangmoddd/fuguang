@@ -91,8 +91,17 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [raw, setRaw] = useState<RawData | null>(null);
   const [cursor, setCursor] = useState(0);
-  /** 出错时留在面板上显示，而不是静默关掉——用户需要知道"没成功"。 */
-  const [error, setError] = useState<string | null>(null);
+  /**
+   * 出错时留在面板上显示，而不是静默关掉——用户需要知道"没成功"。
+   *
+   * `kind === "warn"` 表示**成功了但有东西没了**（例如剪贴板原文已被替换）。
+   * 它必须和"失败"分开：把这种话渲染成红底三角警告，用户会以为粘贴失败了，
+   * 于是**再按一次回车** —— 第二次会真的再粘一遍，目标程序里出现两份内容。
+   */
+  const [error, setError] = useState<{
+    text: string;
+    kind: "fail" | "warn";
+  } | null>(null);
   const [busy, setBusy] = useState(false);
 
   /**
@@ -139,7 +148,7 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
           timers,
         });
       } catch (err) {
-        if (alive) setError(`读取数据失败：${String(err)}`);
+        if (alive) setError({ text: `读取数据失败：${String(err)}`, kind: "fail" });
       }
     })();
     return () => {
@@ -205,8 +214,13 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
             if (outcome.message) {
               // 粘贴成功了，但带回一条**必须让用户看到**的警告
               // （剪贴板里原来是图片/文件、已被替换且无法还原）。
-              // 直接 onClose() 会把它整条丢掉 —— 那样用户永远不知道东西没了。
-              setError(outcome.message);
+              //
+              // 两个都不能做：直接 onClose() 会把警告丢掉；用红色"失败"样式
+              // 又会让用户以为没粘上、**再按一次回车** —— 第二次会真的再粘一遍，
+              // 目标程序里出现两份内容。所以用中性的警示样式，并清空查询：
+              // 清空后 `current` 变 undefined，回车不会再触发一次粘贴。
+              setError({ text: outcome.message, kind: "warn" });
+              setQuery("");
               return;
             }
             onClose();
@@ -214,7 +228,10 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
           }
           // 粘贴失败**不关面板**：内容这时已经在剪贴板里了，
           // 得把「请手动 Ctrl+V」这句话留在屏幕上让用户看到
-          setError(outcome.message ?? "已复制到剪贴板，请手动 Ctrl+V");
+          setError({
+            text: outcome.message ?? "已复制到剪贴板，请手动 Ctrl+V",
+            kind: "fail",
+          });
           return;
         }
 
@@ -228,7 +245,7 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
         onNavigate(hit.kind === "memo" ? "memo" : "timer");
         onClose();
       } catch (err) {
-        setError(String(err));
+        setError({ text: String(err), kind: "fail" });
       } finally {
         setBusy(false);
       }
@@ -303,9 +320,13 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
         </div>
 
         {error && (
-          <div className="palette__error">
+          <div
+            className={`palette__error${
+              error.kind === "warn" ? " palette__error--warn" : ""
+            }`}
+          >
             <TriangleAlert size={13} />
-            <span>{error}</span>
+            <span>{error.text}</span>
           </div>
         )}
 

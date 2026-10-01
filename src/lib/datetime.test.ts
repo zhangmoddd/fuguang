@@ -21,6 +21,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   combineLocal,
+  combineLocalSkippingGap,
   dateKey,
   firstOccurrence,
   formatDateHuman,
@@ -610,5 +611,22 @@ describe.skipIf(!DST)("夏令时跳变时的钟点稳定性", () => {
     }
 
     expect(new Set(times)).toEqual(new Set(["02:30"]));
+  });
+
+  it("创建时就落在跳变那一小时，会跳过那天而不是改掉钟点", () => {
+    // 美东 2026-03-08 的 02:00–02:59 不存在。`combineLocal` 会把它归一化成
+    // 03:30，而备忘录创建时是**把这个值直接存进 remindAt** 的 ——
+    // 于是"每天 02:30"从第一次起就永久变成"每天 03:30"，
+    // 之后 `atLocalTime` 只是忠实地保持那个错的基准。
+    const skipped = combineLocalSkippingGap("2026-03-08", "02:30");
+    expect(splitLocal(skipped).time).toBe("02:30");
+    // 跳过不存在的那一天，落到 3-09
+    expect(splitLocal(skipped).date).toBe("2026-03-09");
+
+    // 正常日期不受影响：不跳、也不改钟点
+    expect(splitLocal(combineLocalSkippingGap("2026-03-06", "02:30"))).toEqual({
+      date: "2026-03-06",
+      time: "02:30",
+    });
   });
 });

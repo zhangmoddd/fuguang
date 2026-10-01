@@ -318,6 +318,39 @@ pub fn toggle_panel(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// 最近一次提醒的内容。前端挂载时主动拉一次（见 [`last_alert`]）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AlertContent {
+    pub title: String,
+    pub body: String,
+}
+
+/// 最近一次提醒的内容。
+///
+/// # 为什么光有事件推送不够
+///
+/// 提醒窗口是**复用**的：内容靠 `alert:content` 事件推给前端。但事件"发了就没了"——
+/// 如果那一刻前端的监听器还没注册好（两条提醒挨得很近，第二条赶在窗口刚建好、
+/// 前端还没挂载完的时候到达），事件被丢弃。而调度线程**已经把 `fired_for` 落盘了**，
+/// 那条提醒就再也不会补弹 —— 用户少收一条提醒，且没有任何地方能发现。
+///
+/// 首次创建窗口时 URL query 能兜住（见 [`show_alert`] 的说明），但"复用已有窗口"
+/// 这条路原来没有兜底。所以这里留一份，前端挂载时主动拉。
+static LAST_ALERT: std::sync::OnceLock<std::sync::Mutex<Option<AlertContent>>> =
+    std::sync::OnceLock::new();
+
+fn last_alert_slot() -> &'static std::sync::Mutex<Option<AlertContent>> {
+    LAST_ALERT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 取最近一次提醒的内容。前端挂载时拉一次，避免错过事件推送。
+pub fn last_alert() -> Option<AlertContent> {
+    last_alert_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// 弹出提醒窗。
 ///
 /// # 内容怎么传
@@ -328,8 +361,17 @@ pub fn toggle_panel(app: &AppHandle) -> tauri::Result<()> {
 /// 首次创建时同时把内容塞进 URL query，作为兜底：
 /// 万一事件在前端挂载完成之前就发出去了（首次弹窗存在这个竞态），
 /// 前端仍能从 query 里读到正确内容。
+///
+/// **复用窗口时事件同样可能丢**（监听器还没注册），所以内容还会存进
+/// [`last_alert`]，前端挂载时主动拉一次兜底。
 pub fn show_alert(app: &AppHandle, title: &str, body: &str) -> tauri::Result<()> {
     use tauri::Emitter;
+
+    // 先记下来：无论事件能不能送达，前端挂载时都能拉到
+    *last_alert_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(AlertContent {
+        title: title.to_string(),
+        body: body.to_string(),
+    });
 
     let url = format!(
         "index.html#/alert?title={}&body={}",

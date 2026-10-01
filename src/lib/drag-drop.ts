@@ -227,6 +227,9 @@ export function useDragSort({
     active: boolean;
     /** 拖拽开始时缓存的目标矩形，见 `resolveDrop` 的说明。 */
     candidates: DropCandidate[];
+    /** 最近一次指针位置。滚动时要按它重新判落点。 */
+    lastX: number;
+    lastY: number;
   } | null>(null);
 
   /** 指针下方的落点（ref 版，`pointerup` 里要读最新值）。 */
@@ -278,25 +281,11 @@ export function useDragSort({
       return out;
     };
 
-    const onMove = (e: PointerEvent) => {
+    /** 按当前缓存的矩形判一次落点；只有真的变了才 setState。 */
+    const settle = (x: number, y: number) => {
       const s = session.current;
       if (!s) return;
-
-      if (!s.active) {
-        // 没越过阈值就什么都不做：一次普通点击也会走 pointerdown/up，
-        // 不加这道闸门的话，轻轻一点就会被当成拖拽
-        if (Math.hypot(e.clientX - s.startX, e.clientY - s.startY) < DRAG_THRESHOLD) return;
-
-        s.active = true;
-        setDraggingId(s.id);
-        // 拖拽期间布局不会变，矩形缓存一次就够——
-        // 每帧对所有卡片调 getBoundingClientRect 会强制同步布局，很浪费
-        s.candidates = collect(s.kind);
-      }
-
-      setPointer({ x: e.clientX, y: e.clientY });
-
-      const hit = resolveDrop(e.clientX, e.clientY, s.candidates, axis);
+      const hit = resolveDrop(x, y, s.candidates, axis);
       // 只在落点真的变了时才 setState：pointermove 一秒能来上百次
       const same =
         (hit === null && overRef.current === null) ||
@@ -313,6 +302,49 @@ export function useDragSort({
       }
     };
 
+    /**
+     * 拖拽期间列表被滚动时**必须重新采集矩形**。
+     *
+     * 矩形只在拖拽开始时缓存一次（每帧对所有卡片调 `getBoundingClientRect`
+     * 会强制同步布局）。但"拖拽期间布局不会变"这个前提**不成立** ——
+     * 按住鼠标拖的同时滚轮照样能用，用户完全可以一边拖一边滚列表。
+     * 那时卡片已经移走了、缓存的矩形还停在原位，表现为"松手插到了别处"。
+     *
+     * 滚动事件**不冒泡**，所以要挂在捕获阶段。
+     */
+    const onScroll = () => {
+      const s = session.current;
+      if (!s || !s.active) return;
+      s.candidates = collect(s.kind);
+      // 滚动之后指针没动，但落点可能已经变了 —— 得按最后的位置重判一次，
+      // 否则用户"滚到目标位置再松手"时用的还是旧落点
+      settle(s.lastX, s.lastY);
+    };
+
+    const onMove = (e: PointerEvent) => {
+      const s = session.current;
+      if (!s) return;
+      s.lastX = e.clientX;
+      s.lastY = e.clientY;
+
+      if (!s.active) {
+        // 没越过阈值就什么都不做：一次普通点击也会走 pointerdown/up，
+        // 不加这道闸门的话，轻轻一点就会被当成拖拽
+        if (Math.hypot(e.clientX - s.startX, e.clientY - s.startY) < DRAG_THRESHOLD) return;
+
+        s.active = true;
+        setDraggingId(s.id);
+        // 拖拽期间布局本身不会变，矩形缓存一次就够——
+        // 每帧对所有卡片调 getBoundingClientRect 会强制同步布局，很浪费。
+        // 但**滚动会让它失效**，所以同时挂上滚动监听（见 onScroll）。
+        s.candidates = collect(s.kind);
+        document.addEventListener("scroll", onScroll, true);
+      }
+
+      setPointer({ x: e.clientX, y: e.clientY });
+      settle(e.clientX, e.clientY);
+    };
+
     const onUp = () => {
       const s = session.current;
       if (!s) return;
@@ -323,6 +355,7 @@ export function useDragSort({
         const spot = overRef.current;
         if (spot) dropRef.current(s.id, s.kind, spot);
       }
+      document.removeEventListener("scroll", onScroll, true);
       reset();
     };
 
@@ -334,6 +367,7 @@ export function useDragSort({
       document.removeEventListener("pointermove", onMove);
       document.removeEventListener("pointerup", onUp);
       document.removeEventListener("pointercancel", onUp);
+      document.removeEventListener("scroll", onScroll, true);
     };
   }, [axis, reset]);
 
@@ -371,6 +405,8 @@ export function useDragSort({
         startY: e.clientY,
         active: false,
         candidates: [],
+        lastX: e.clientX,
+        lastY: e.clientY,
       };
     },
     [ignoreSelector],

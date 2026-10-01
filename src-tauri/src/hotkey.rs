@@ -23,13 +23,13 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetMessageW, PostThreadMessageW, MSG, WM_APP, WM_HOTKEY,
+    GetMessageW, PeekMessageW, PostThreadMessageW, MSG, PM_NOREMOVE, WM_APP, WM_HOTKEY,
 };
 
 /// 热键标识。同一个线程内唯一即可，取 "FU" 的 ASCII。
@@ -43,6 +43,12 @@ const MSG_APPLY: u32 = WM_APP + 1;
 /// 不能无限等：万一消息循环线程出问题，命令会永远挂住，
 /// 设置页那个开关就卡死在转圈状态。
 const APPLY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 补注册的检查间隔。
+///
+/// 30 秒是权衡：占用者退出后用户最多多等半分钟，而检查本身只是读一次内存里的
+/// 设置 + 一个 `Option` 判断，开销可以忽略。
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// 一个解析好的热键组合。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,10 +96,23 @@ pub fn start(app: AppHandle) {
 
     thread::spawn(move || {
         let tid = unsafe { GetCurrentThreadId() };
+
+        // ⚠️ **先把消息队列建出来，再把 tid 报回去。**
+        //
+        // `PostThreadMessageW` 对"还没有消息队列"的线程会**失败**（返回 0），
+        // 而线程的消息队列是**第一次调用消息函数时才创建**的。
+        // 原来这里是直接 `tx.send(tid)` 就进循环 —— 于是 `start()` 一拿到 tid
+        // 就可能有别的线程来 `PostThreadMessageW`，撞上"队列还没建"：
+        // `apply` 报"无法通知热键服务"，**整个会话都没有热键**。
+        //
+        // 实测抓到过（`app.log` 里就这一条，而热键确实没注册上）。
+        // `PeekMessageW(..., PM_NOREMOVE)` 不取走任何消息，只负责把队列建出来。
+        let mut msg = MSG::default();
+        unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE) };
+
         // 把线程 id 交回去，之后别的线程才能 PostThreadMessageW 唤醒我们
         let _ = tx.send(tid);
 
-        let mut msg = MSG::default();
         loop {
             // 阻塞等待消息。第三个参数为 0 表示不过滤，线程消息也能收到。
             let ret = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
@@ -245,6 +264,63 @@ pub fn apply(spec: Option<&str>) -> Result<(), String> {
         Ok(result) => result,
         Err(_) => Err("热键服务没有响应，请重启浮光后再试".into()),
     }
+}
+
+/// 起一个后台线程：热键**没注册成功**时定期自动补注册。
+///
+/// # 为什么需要它
+///
+/// 启动时只尝试一次 —— 重试几次没有意义（占用者不会因为等一两秒就让开），
+/// 但那一次失败就意味着**整个会话都没有热键**：占用它的程序退出之后也不会
+/// 自动补上，用户只能自己去设置页重新应用一次。实测过：占用者一消失，
+/// 下一次注册**立刻**就能成功（0ms），所以"过一会儿再试"是有效的。
+///
+/// 只在"设置里要开、实际却没注册上"时才重试；成功之后就安静了。
+pub fn start_watchdog(app: AppHandle) {
+    thread::spawn(move || {
+        // 避免每 30 秒刷一行日志；状态变化（成功/关掉）时重置
+        let mut logged = false;
+        loop {
+            thread::sleep(WATCHDOG_INTERVAL);
+
+            let (enabled, combo) = {
+                let store = app.state::<crate::state::Store>();
+                let st = store.lock();
+                (st.settings.hotkey_enabled, st.settings.hotkey.clone())
+            };
+            if !enabled {
+                logged = false;
+                continue;
+            }
+
+            let already = current_slot()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            if already {
+                logged = false;
+                continue;
+            }
+
+            match apply(Some(&combo)) {
+                Ok(()) => {
+                    // 用位置参数而不是 `{combo}`：内联捕获在这里会被当成按值传 `str`
+                    crate::diag!("[浮光] 全局热键「{}」补注册成功", combo);
+                    logged = false;
+                }
+                Err(err) => {
+                    if !logged {
+                        crate::diag!(
+                            "[浮光] 全局热键「{}」仍未注册成功，会继续定期重试：{}",
+                            combo,
+                            err
+                        );
+                        logged = true;
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// 取当前实际生效的热键文本。没注册成功时返回 `None`。

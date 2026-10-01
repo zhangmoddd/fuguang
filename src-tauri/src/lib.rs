@@ -80,8 +80,6 @@ pub fn run() {
             commands::link_save,
             commands::link_remove,
             commands::link_launch,
-            commands::open_target,
-            commands::reveal_path,
             commands::link_icon,
             commands::classify_paths,
             // 文件夹（链接 / 文本片段 / 计时器共用）
@@ -100,6 +98,8 @@ pub fn run() {
             commands::hotkey_current,
             commands::hotkey_apply,
             commands::hotkey_validate,
+            commands::alert_current,
+            commands::snippet_bump_use,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -156,6 +156,9 @@ pub fn run() {
                     }
                 }
             }
+            // 万一这次没注册上（组合键被别的程序占着），后台定期补注册 ——
+            // 否则整个会话都没有热键，只能等用户自己去设置页重新应用一次。
+            hotkey::start_watchdog(handle.clone());
 
             // 启动前台窗口跟踪线程。
             // 目的：记住「用户上一次真正在用的窗口」，这样点击文本片段时

@@ -156,6 +156,39 @@ export function splitLocal(ms: number): { date: string; time: string } {
   };
 }
 
+/**
+ * 把 `YYYY-MM-DD` 与 `HH:MM` 组合成本地时刻；**那天那个钟点不存在时
+ * （夏令时春季跳变那一小时）往后找第一个存在的日期**。
+ *
+ * # 为什么创建路径需要它，而不只是推进路径
+ *
+ * 美东 2026-03-08 的 02:00–02:59 这个本地时刻**不存在**。`combineLocal` 会把它
+ * 归一化成 03:30，而备忘录创建时**把这个 03:30 直接存进了 `remindAt`** ——
+ * 于是"每天 02:30"从第一次起就变成"每天 03:30"。
+ *
+ * `atLocalTime` 在**推进**时确实会保住钟点，但它的职责是"别让钟点漂移"——
+ * 基准在创建那一刻就已经被改掉了，它只是忠实地保持那个错的。
+ *
+ * 跳过那一天、保住钟点，与 `atLocalTime` 的策略一致：
+ * 钟点是用户设的规则，任何情况下都不该被改掉。
+ */
+export function combineLocalSkippingGap(dateStr: string, timeStr: string): number {
+  const first = combineLocal(dateStr, timeStr);
+  // 钟点没被引擎改掉 → 那天它存在，直接用
+  if (splitLocal(first).time === timeStr) return first;
+
+  // 被归一化了 → 从那天正午起往后一天天找第一个"钟点存在"的日期。
+  // 用正午做基准，避免基准自己又落在跳变区间里。
+  const base = new Date(combineLocal(dateStr, "12:00"));
+  for (let i = 1; i <= 370; i += 1) {
+    const d = localDate(base.getFullYear(), base.getMonth(), base.getDate() + i);
+    const candidate = combineLocal(dateKey(d), timeStr);
+    if (splitLocal(candidate).time === timeStr) return candidate;
+  }
+  // 兜底：一年都找不到（理论上不可能），退回归一化的那个
+  return first;
+}
+
 /** 人类可读的日期，例如 `9月20日 周六`；今天/明天用相对说法。 */
 export function formatDateHuman(dateStr: string): string {
   const today = todayKey();

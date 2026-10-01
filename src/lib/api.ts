@@ -283,9 +283,6 @@ export const api = {
   linkSave: (link: LinkItem) => invoke<void>("link_save", { link }),
   linkRemove: (id: string) => invoke<void>("link_remove", { id }),
   linkLaunch: (id: string) => invoke<void>("link_launch", { id }),
-  openTarget: (target: string, args?: string | null) =>
-    invoke<void>("open_target", { target, args: args ?? null }),
-  revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   linkIcon: (path: string) => invoke<IconData | null>("link_icon", { path }),
   /**
    * 判断一批路径各自是什么（拖拽添加链接时用）。
@@ -338,6 +335,24 @@ export const api = {
     invoke<void>("hotkey_apply", { enabled, combo }),
   /** 只校验组合键文本是否合法，不实际注册。用于输入时的即时提示。 */
   hotkeyValidate: (combo: string) => invoke<string>("hotkey_validate", { combo }),
+
+  /**
+   * 取最近一次提醒的内容。
+   *
+   * 提醒窗口挂载时主动拉一次 —— 只靠 `alert:content` 事件推送的话，
+   * 窗口复用 + 监听器还没就绪时会丢内容，而调度线程已经把 `fired_for`
+   * 落盘了，那条提醒就永远不补弹。
+   */
+  alertCurrent: () =>
+    invoke<{ title: string; body: string } | null>("alert_current"),
+
+  /**
+   * 把某条片段的使用次数 +1（「常用优先」排序靠它）。
+   *
+   * 由 Rust 在写锁里做「读 → 改 → 写」：命令面板浮在片段页上面时两个组件
+   * 会同时挂载，前端各开一份 `usePersistentState` 就有两个写者了。
+   */
+  snippetBumpUse: (id: string) => invoke<void>("snippet_bump_use", { id }),
 };
 
 // ===============================================================

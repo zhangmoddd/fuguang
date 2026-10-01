@@ -66,8 +66,7 @@ fn open_run_key(create: bool) -> Result<HKEY, String> {
     Ok(hkey)
 }
 
-/// 开发模式（debug 构建）下拒绝开启自启时给出的说明。
-///
+/// 开发模式（debug 构建）下拒绝开启自启时给出的说明。///
 /// 这段话会原样出现在设置页的错误提示里，所以要同时讲清「为什么」和「怎么办」。
 ///
 /// 为什么必须拒绝：debug 构建**不内嵌前端**，它的窗口地址是 `tauri.conf.json`
@@ -79,6 +78,88 @@ const DEV_BUILD_REFUSAL: &str = "开发模式（调试版）不能设为开机�
 调试版没有把界面打包进 exe，运行时要去连本机的开发服务器 127.0.0.1:4173；\
 开机时那个服务器不在，小球和面板里只会显示浏览器的「无法访问此页面」。\
 请改用正式版 exe（先跑一次 2-重新编译.bat，产物在 src-tauri\\target\\release\\fuguang.exe）再开启自启。";
+
+/// 「任务管理器 → 启动」的批准记录键。
+///
+/// Windows 在那里禁用一条自启项时**不删 Run 值**，而是往这个键下写一个
+/// 12 字节的 blob：首字节最低位为 1 表示禁用（最常见的是 `0x03`），
+/// `0x02` 表示启用。
+const STARTUP_APPROVED_KEY: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+
+/// 那个 blob 是不是表示"已禁用"。
+///
+/// 抽成纯函数以便单测：真正的判定逻辑（最低位）只有一行，但它是"开关会不会
+/// 撒谎"的全部依据，值得钉住。
+fn blob_says_disabled(bytes: &[u8]) -> bool {
+    // 空 blob 当成"没有标记"，保守处理（宁可显示已开启，也不要凭空说被禁了）
+    matches!(bytes.first(), Some(b) if b & 0x01 != 0)
+}
+
+/// 这条自启项是不是被「任务管理器 → 启动」禁用了。
+///
+/// # 为什么必须看它
+///
+/// 只看 Run 值的话，用户在那里禁用之后设置页仍然显示"已开启"，而开机**不会**
+/// 启动 —— 开关在撒谎。更糟的是点"关"再点"开"也修不好：我们只写 Run 值，
+/// 那个 blob 还留着，系统照样跳过。
+///
+/// 读不到（键/值不存在、形状不认识）一律当作"没被禁用"。
+fn disabled_by_task_manager() -> bool {
+    use windows_sys::Win32::System::Registry::{
+        RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_QUERY_VALUE, REG_BINARY,
+    };
+
+    let sub = wide(STARTUP_APPROVED_KEY);
+    let mut hkey: HKEY = std::ptr::null_mut();
+    let opened = unsafe {
+        RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_QUERY_VALUE, &mut hkey)
+    };
+    if opened != ERROR_SUCCESS {
+        return false;
+    }
+
+    let name = wide(VALUE_NAME);
+    let mut kind = 0u32;
+    let mut buf = [0u8; 32];
+    let mut len = buf.len() as u32;
+    let status = unsafe {
+        RegQueryValueExW(
+            hkey,
+            name.as_ptr(),
+            std::ptr::null(),
+            &mut kind,
+            buf.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    unsafe { RegCloseKey(hkey) };
+
+    if status != ERROR_SUCCESS || kind != REG_BINARY {
+        return false;
+    }
+    blob_says_disabled(&buf[..(len as usize).min(buf.len())])
+}
+
+/// 清掉「任务管理器 → 启动」留下的禁用标记。
+///
+/// 用户在设置页里明确要开启时调它 —— 不清的话我们写了 Run 值、系统还是按
+/// 那个 blob 跳过，用户看到的是"开关是开的、开机却不启动"。
+fn clear_task_manager_flag() {
+    use windows_sys::Win32::System::Registry::{RegDeleteValueW, RegOpenKeyExW, KEY_SET_VALUE};
+
+    let sub = wide(STARTUP_APPROVED_KEY);
+    let mut hkey: HKEY = std::ptr::null_mut();
+    let opened = unsafe {
+        RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_SET_VALUE, &mut hkey)
+    };
+    if opened != ERROR_SUCCESS {
+        return; // 键不存在就说明没有禁用标记
+    }
+    let name = wide(VALUE_NAME);
+    unsafe { RegDeleteValueW(hkey, name.as_ptr()) };
+    unsafe { RegCloseKey(hkey) };
+}
 
 /// 设置开机自启。
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
@@ -122,6 +203,14 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
     const ERROR_FILE_NOT_FOUND: u32 = 2;
     if status != ERROR_SUCCESS && !(status == ERROR_FILE_NOT_FOUND && !enabled) {
         return Err(format!("写入注册表失败（错误码 {status}）"));
+    }
+
+    // 开启时还要清掉「任务管理器 → 启动」留下的禁用标记。
+    //
+    // 不清的话：Run 值写回去了，可系统仍然按那个 blob 跳过 ——
+    // 用户看到"开关是开的、开机却不启动"，而且怎么点都修不好。
+    if enabled {
+        clear_task_manager_flag();
     }
     Ok(())
 }
@@ -237,8 +326,10 @@ fn same_exe(a: &str, b: &str) -> bool {
 /// 但开机启动的其实是那个调试版——界面上什么都没错，实际启动的却是另一个程序。
 /// 这正是用户实测踩到的坑：以为自启的是正式版，开机出来的却是一个报错页。
 ///
-/// 另外，用户可能在「任务管理器 → 启动」里手动禁用了这条记录，
-/// 那种情况这里读不到（记录仍在），语义上仍算"已开启"。
+/// 另外，用户可能在「任务管理器 → 启动」里手动禁用了这条记录 ——
+/// 那种情况 Run 值仍在，但系统会**跳过**它。所以还要看那份批准记录
+/// （见 [`disabled_by_task_manager`]）：只看 Run 值的话，开关会显示"已开启"
+/// 而开机不启动，用户怎么点都修不好。
 pub fn is_enabled() -> bool {
     let Ok(hkey) = open_run_key(false) else {
         return false;
@@ -249,6 +340,12 @@ pub fn is_enabled() -> bool {
     let Some(registered) = registered else {
         return false;
     };
+
+    // 被任务管理器禁用 = 开机不会启动 = 语义上"没开启"
+    if disabled_by_task_manager() {
+        return false;
+    }
+
     match current_exe_path() {
         // 比的是**可执行文件路径**，不是整条命令行 ——
         // `"…\fuguang.exe" --minimized` 也是在启动我们这个 exe，不能算"未开启"。
@@ -629,5 +726,21 @@ mod tests {
             "对不可达 UNC 应该立刻返回（不碰文件系统），实际耗时 {elapsed:?} —— \
              说明 `Path::exists()` 又排到 `is_on_local_fixed_drive` 前面去了"
         );
+    }
+
+    /// 「任务管理器 → 启动」的批准记录怎么解读。
+    ///
+    /// 这一行是"开关会不会撒谎"的全部依据：用户在那里禁用之后 Run 值仍在，
+    /// 不看这份记录的话设置页会显示"已开启"而开机不启动。
+    #[test]
+    fn 任务管理器的批准记录怎么读() {
+        // 真实 blob 的第一个字节（本机实测）：0x02 启用、0x03 禁用
+        assert!(!blob_says_disabled(&[0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(blob_says_disabled(&[0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        // 只看最低位：0x07 也是禁用（bit0 = 1）
+        assert!(blob_says_disabled(&[0x07]));
+        assert!(!blob_says_disabled(&[0x06]));
+        // 读不到内容时保守当作"没有标记"，不要凭空说用户的自启被禁了
+        assert!(!blob_says_disabled(&[]));
     }
 }

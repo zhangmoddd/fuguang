@@ -228,6 +228,10 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
           const snippet = raw.snippets.find((s) => s.id === hit.id);
           if (!snippet) return;
           const outcome = await api.pasteText(snippet.content);
+          // 记录一次使用（排序是"收藏 → 使用次数 → 最近更新"）。面板是主推入口，
+          // 不记的话"常用"排序长期反映不了真实使用。交给 Rust 写：
+          // 面板浮在片段页上面时两个组件同时挂载，前端各写一份会出现两个写者。
+          void api.snippetBumpUse(snippet.id).catch(() => {});
           if (outcome.ok) {
             if (outcome.message) {
               // 粘贴成功了，但带回一条**必须让用户看到**的警告

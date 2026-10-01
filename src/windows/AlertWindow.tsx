@@ -11,7 +11,7 @@
  * 2. **窗口复用**时 Rust 通过 `alert:content` 事件推送新内容。
  *    窗口已存在时只调 `show()` 会显示上一条提醒的旧文字，所以必须走事件。
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Bell, Check } from "lucide-react";
 
@@ -32,6 +32,13 @@ function readParams(): { title: string; body: string } {
 
 export function AlertWindow() {
   const [info, setInfo] = useState(readParams);
+  /**
+   * 首次渲染时 URL query 里的内容。
+   *
+   * 用来判断"主动拉回来的内容是不是同一条"：创建窗口时 query 已经带了内容，
+   * 如果再无条件应用一次拉回来的同一个内容，就会**重复响铃**。
+   */
+  const initial = useRef(readParams());
 
   /**
    * 每收到一次推送就 +1，用来给提示音 effect 一个"这次是新的提醒"的信号。
@@ -61,6 +68,42 @@ export function AlertWindow() {
     return () => {
       disposed = true;
       unlisten?.();
+    };
+  }, []);
+
+  /**
+   * 挂载时**主动拉一次**最近一条提醒的内容。
+   *
+   * # 为什么事件推送不够
+   *
+   * 提醒窗口是复用的，新内容靠 `alert:content` 事件推过来。但事件"发了就没了"：
+   * 如果那一刻监听器还没注册好（第二条提醒赶在窗口刚建好、前端还没挂载完时到达），
+   * 事件被丢弃。而调度线程**已经把 `fired_for` 落盘了** ——
+   * 那条提醒再也不会补弹，用户少收一条，且没有任何地方能发现。
+   *
+   * 拉回来的内容如果和 URL query 里那条相同（首次创建的正常情况），
+   * 就什么都不做 —— 否则会重复响铃。
+   */
+  useEffect(() => {
+    let disposed = false;
+    void (async () => {
+      try {
+        const cur = await api.alertCurrent();
+        if (disposed || !cur) return;
+        if (
+          cur.title === initial.current.title &&
+          cur.body === initial.current.body
+        ) {
+          return;
+        }
+        setInfo({ title: cur.title, body: cur.body });
+        setArrival((n) => n + 1);
+      } catch {
+        /* 拉不到就算了：URL query 已经兜住了首次创建那一条 */
+      }
+    })();
+    return () => {
+      disposed = true;
     };
   }, []);
 

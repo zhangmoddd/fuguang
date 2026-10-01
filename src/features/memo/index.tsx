@@ -42,7 +42,7 @@ import {
 import { api, newId, onStateChanged, type Memo, type Repeat } from "../../lib/api";
 import {
   REPEAT_OPTIONS,
-  combineLocal,
+  combineLocalSkippingGap,
   dateKey,
   firstOccurrence,
   formatDateHuman,
@@ -454,9 +454,21 @@ function MemoEditor({
    * 函数里，于是**在正文 / 标题 / 标签里每敲一个字都要重付一次** —— 输入明显卡顿。
    */
   const preview = useMemo(() => {
-    const wanted = combineLocal(remindDate, remindTime || "09:00");
+    const wanted = combineLocalSkippingGap(remindDate, remindTime || "09:00");
     const actual = firstOccurrence(wanted, repeat);
-    return { actual, moved: actual !== wanted };
+    return {
+      actual,
+      moved: actual !== wanted,
+      /**
+       * 算出来的时刻**已经过去了**。
+       *
+       * 不重复的提醒如果设在过去，`firstOccurrence` 会**原样返回**那个过去时刻
+       * （刻意的取舍："设在过去就立刻提醒"好过"永远不提醒"）。
+       * 但界面上不能只写"将在 <过去的时间> 提醒" —— 用户看不出它到底会不会响。
+       * 这种情况直接说清楚：保存后会立刻提醒一次。
+       */
+      past: actual <= Date.now(),
+    };
   }, [remindDate, remindTime, repeat, nowTick]);
 
   const titleRef = useRef<HTMLInputElement>(null);
@@ -505,7 +517,12 @@ function MemoEditor({
     let remindAt: number | null = null;
     let nextRepeat: Repeat = "none";
     if (reminderOn) {
-      const wanted = combineLocal(remindDate, remindTime || "09:00");
+      // 用 combineLocalSkippingGap 而不是 combineLocal：
+      // 用户把日期正好选在夏令时跳变那一小时（美东 3-08 的 02:30）时，
+      // combineLocal 会把它归一化成 03:30 并**存进 remindAt** ——
+      // 于是"每天 02:30"从第一次起就永久变成"每天 03:30"。
+      // 跳过那一天、保住钟点，与推进时的策略一致。
+      const wanted = combineLocalSkippingGap(remindDate, remindTime || "09:00");
       // 关键一步：用户填的时刻可能已经过去了（下午三点设「今天 9:00 每天提醒」）。
       // firstOccurrence 会按重复规则推到下一次，而不是立刻弹一条过期提醒；
       // 不重复的笔记则原样保留，让用户看到「已到期」而不是被悄悄改掉。
@@ -637,9 +654,13 @@ function MemoEditor({
                 算法在 preview 那个 useMemo 里，别挪回渲染里。 */}
             <Bell size={12} />
             <span>
-              {preview.moved ? "这个时刻已经过了，改到 " : "将在 "}
-              {formatMoment(preview.actual)}
-              {repeat !== "none" ? `，${repeatLabel(repeat)}` : ""}提醒
+              {preview.past
+                ? "这个时刻已经过了，保存后会立刻提醒一次"
+                : preview.moved
+                  ? `这个时刻已经过了，改到 ${formatMoment(preview.actual)}`
+                  : `将在 ${formatMoment(preview.actual)}`}
+              {!preview.past && repeat !== "none" ? `，${repeatLabel(repeat)}` : ""}
+              {!preview.past && "提醒"}
             </span>
           </div>
         )}

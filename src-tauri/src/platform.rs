@@ -427,6 +427,21 @@ pub fn clipboard_set_text(text: &str) -> bool {
     clipboard_write_text(text) == ClipboardWrite::Ok
 }
 
+/// 清空剪贴板。成功返回 true。
+///
+/// 用在"用户原来的剪贴板**本来就是空的**"这种情况：把状态还原成空的，
+/// 而不是把我们粘过的片段永久留在里面（带「敏感」标记的片段尤其不该留）。
+fn clipboard_clear() -> bool {
+    unsafe {
+        if !open_clipboard_retry() {
+            return false;
+        }
+        EmptyClipboard();
+        CloseClipboard();
+        true
+    }
+}
+
 /// 粘贴结果，回传给前端用于提示用户。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PasteOutcome {
@@ -560,6 +575,18 @@ pub fn paste_to_target(text: &str, restore_delay_ms: u64) -> PasteOutcome {
         if let Some(previous) = backup.as_ref() {
             restored = clipboard_set_text(previous);
         }
+    }
+
+    // 剪贴板**原本就是空的**（没有东西可还）→ 把状态还原成"空"，
+    // 而不是把我们写进去的那段片段永久留在里面。
+    //
+    // 只有粘贴**成功**时才清：失败路径上那段文本是留给用户手动 Ctrl+V 的
+    // （提示里明说了），清掉就等于把提示又变成假话。
+    //
+    // 带「敏感」标记的片段尤其需要这条 —— 否则它就一直躺在剪贴板里，
+    // 下一个 Ctrl+V 就粘出来了。
+    if ok && backup.is_none() && !had_unbacked && !had_richer {
+        clipboard_clear();
     }
 
     if decide_original_lost(

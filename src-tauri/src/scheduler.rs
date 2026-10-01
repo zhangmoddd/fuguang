@@ -227,14 +227,34 @@ fn summarize_body(body: &str) -> String {
 /// 启动调度线程。需要在 `setup` 阶段调用一次。
 pub fn start(app: AppHandle) {
     thread::spawn(move || {
+        // 每一轮都套一层 **panic 守卫**。
+        //
+        // 不加的话：`run()` 里任何一处 panic 都会让**整个调度线程**结束 ——
+        // 倒计时、番茄钟、备忘录提醒**全部永久静默**，而且没有任何地方能发现
+        // （正式版是 `windows_subsystem = "windows"`，panic 信息进不了任何地方）。
+        // 用户只会觉得"提醒怎么不响了"，只有重启才可能恢复。
+        //
+        // 捕获之后继续跑：一次判定出错不该让所有提醒一起陪葬。
+        // 锁中毒不用担心：全项目的 `lock()` 都写了 `unwrap_or_else(|e| e.into_inner())`。
+        let tick = |app: &AppHandle, first: bool| {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(app, first);
+            }));
+            if outcome.is_err() {
+                crate::diag!(
+                    "[浮光] 调度线程这一轮判定 panic 了，已跳过这一轮并继续运行（提醒不会因此永久停止）"
+                );
+            }
+        };
+
         // 第一次 tick 单独处理：把所有"已经过期"的项目**汇总成一条**提醒，
         // 而不是逐个弹窗。这就是设计里说的「开机后汇总补发错过的提醒」。
         thread::sleep(TICK);
-        run(&app, true);
+        tick(&app, true);
 
         loop {
             thread::sleep(TICK);
-            run(&app, false);
+            tick(&app, false);
         }
     });
 }

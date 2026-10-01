@@ -349,18 +349,6 @@ pub async fn link_launch(app: AppHandle, id: String) -> Result<(), String> {
     launcher::open(&target, args.as_deref())
 }
 
-/// 直接打开一个路径或网址（用于"添加后立即测试"这类场景）。
-#[tauri::command]
-pub async fn open_target(target: String, args: Option<String>) -> Result<(), String> {
-    launcher::open(&target, args.as_deref())
-}
-
-/// 在资源管理器中定位某个文件。
-#[tauri::command]
-pub async fn reveal_path(path: String) -> Result<(), String> {
-    launcher::reveal_in_explorer(&path)
-}
-
 /// 提取某个路径的图标。
 ///
 /// 失败返回 `null`，前端会退回按类型区分的内置图标。
@@ -540,6 +528,65 @@ pub async fn current_exe() -> Result<String, String> {
 #[tauri::command]
 pub async fn hotkey_current() -> Option<String> {
     hotkey::current()
+}
+
+/// 取最近一次提醒的内容。
+///
+/// 提醒窗口挂载时**主动拉一次**：只靠 `alert:content` 事件推送的话，
+/// 窗口复用 + 监听器还没就绪时会丢内容 —— 而调度线程已经把 `fired_for`
+/// 落盘了，那条提醒就永远不补弹（见 `windows::last_alert` 的说明）。
+#[tauri::command]
+pub async fn alert_current() -> Option<windows::AlertContent> {
+    windows::last_alert()
+}
+
+/// 把某条片段的使用次数 +1（「常用优先」的排序靠它）。
+///
+/// # 为什么放在 Rust 而不是前端
+///
+/// 片段数据是 `snippets.json`，前端用 `usePersistentState` 读写。而命令面板
+/// 是**浮在片段页上面**的 —— 两个组件会同时挂载。如果面板也开一个
+/// `usePersistentState`，同一个文件就有**两个写者**（`WriteCoordinator` 是每实例
+/// 一份），谁后写谁赢，另一边刚做的改动会被整份覆盖。
+///
+/// 让 Rust 在**写锁**里做「读 → 改 → 写」，文件层面就只有一条写入路径。
+/// （前端内存里那份会短暂陈旧：用户紧接着手动编辑某条片段时，这一次计数会丢。
+///  计数只影响排序，丢一次可以接受；把用户的编辑覆盖掉不行。）
+#[tauri::command]
+pub async fn snippet_bump_use(app: AppHandle, id: String) -> Result<(), String> {
+    state::with_write_lock(|| -> Result<(), String> {
+        let current = storage::read_json(
+            &app,
+            "snippets.json",
+            serde_json::Value::Array(Vec::new()),
+        );
+        let Some(list) = current.as_array() else {
+            return Ok(()); // 形状不对就别动它
+        };
+
+        let mut next = list.clone();
+        let mut hit = false;
+        for item in next.iter_mut() {
+            if item.get("id").and_then(|v| v.as_str()) != Some(id.as_str()) {
+                continue;
+            }
+            let uses = item.get("uses").and_then(|v| v.as_u64()).unwrap_or(0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("uses".into(), serde_json::json!(uses + 1));
+                obj.insert("updatedAt".into(), serde_json::json!(now));
+            }
+            hit = true;
+            break;
+        }
+        if !hit {
+            return Ok(()); // 找不到就算了，不值得报错
+        }
+        storage::write_json(&app, "snippets.json", &serde_json::Value::Array(next))
+    })
 }
 
 /// 应用热键设置。

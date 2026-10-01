@@ -7,6 +7,24 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 
+/**
+ * ⚠️ `styles.css` 必须**第一个** import，顺序不能挪到后面。
+ *
+ * 打包时 Vite 按模块图的遍历顺序拼 CSS，而 `.btn` / `.iconbtn` / `.field__input`
+ * 这些基础类和模块自己的类**特异性一样**（都是 0,1,0）—— 于是"谁在后面谁赢"。
+ * 一个元素同时挂 `class="iconbtn links__more"` 时，靠的就是这个顺序。
+ *
+ * 这个顺序原来在最后，等于**基础样式盖住模块样式**，结果 5 条规则被静默吃掉：
+ *   `.links__more` 的 20px 宽 → 变成 24px（悬停按钮占掉格子宽的 26%）
+ *   `.tmr__clock` 的 120px 宽 → 变成 376px（闹钟时间框撑满一整行）
+ *   `.datepicker__input` 的 padding、`.memo__today` 与 `.tmr__quick` 的
+ *   padding / 字号，同样被 `.btn` / `.field__input` 盖掉。
+ *
+ * 这类 bug 特别阴：写样式的人会以为"我写了怎么没生效"，而查的时候又看不到报错。
+ * 基础在前、模块在后是 CSS 的通行约定，也是这里唯一说得通的顺序。
+ */
+import "./styles.css";
+
 import { api, onStateChanged } from "./lib/api";
 import { advanceAlarmsOnce } from "./lib/alarm";
 import { applyBallTheme } from "./lib/ball-theme";
@@ -15,7 +33,6 @@ import { applyFontSize } from "./lib/ui-scale";
 import { AlertWindow } from "./windows/AlertWindow";
 import { BallWindow } from "./windows/BallWindow";
 import { PanelWindow } from "./windows/PanelWindow";
-import "./styles.css";
 
 /** 根据当前 hash 选择要渲染的窗口。 */
 function resolveWindow(): React.ComponentType {

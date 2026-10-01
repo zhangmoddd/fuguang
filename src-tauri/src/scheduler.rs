@@ -287,12 +287,12 @@ fn persist(app: &AppHandle, timers: bool, memos: bool) {
     // （已复现：编辑被回滚、删掉的计时器复活）。
     if timers {
         if let Err(e) = state::persist(app, || store.lock().timers.clone(), state::save_timers) {
-            eprintln!("[浮光] 保存计时器失败：{e}");
+            crate::diag!("[浮光] 保存计时器失败：{e}");
         }
     }
     if memos {
         if let Err(e) = state::persist(app, || store.lock().memos.clone(), state::save_memos) {
-            eprintln!("[浮光] 保存备忘录失败：{e}");
+            crate::diag!("[浮光] 保存备忘录失败：{e}");
         }
     }
 }

@@ -116,7 +116,7 @@ pub fn start(app: AppHandle) {
     // 但已经注册的默认热键仍然能用，所以这里只是记录失败。
     match rx.recv_timeout(APPLY_TIMEOUT) {
         Ok(tid) => *thread_id_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(tid),
-        Err(e) => eprintln!("[浮光] 热键线程启动异常：{e}"),
+        Err(e) => crate::diag!("[浮光] 热键线程启动异常：{e}"),
     }
 }
 

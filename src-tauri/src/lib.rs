@@ -26,6 +26,7 @@ mod autostart;
 mod backup;
 mod ballmenu;
 mod commands;
+mod diag;
 mod hotkey;
 mod launcher;
 mod linkicon;
@@ -135,10 +136,32 @@ pub fn run() {
                     (st.settings.hotkey_enabled, st.settings.hotkey.clone())
                 };
                 if enabled {
-                    if let Err(err) = hotkey::apply(Some(&combo)) {
+                    // 失败要**重试**。最常见的失败原因是"上一个实例还没完全退出、
+                    // 还占着这个组合键" —— 实测：杀掉进程后立刻启动新实例，
+                    // `RegisterHotKey` 就会失败（1409 已被占用），而旧进程彻底消失后
+                    // 同一个组合键立刻又能注册。用户看到的现象是"热键按了没反应"。
+                    //
+                    // 失败本身很快返回（热键线程会立刻回一个 Err），不会拖慢启动。
+                    let mut last_err = String::new();
+                    let mut registered = false;
+                    for attempt in 0..3 {
+                        match hotkey::apply(Some(&combo)) {
+                            Ok(()) => {
+                                registered = true;
+                                break;
+                            }
+                            Err(err) => {
+                                last_err = err;
+                                if attempt < 2 {
+                                    std::thread::sleep(std::time::Duration::from_millis(700));
+                                }
+                            }
+                        }
+                    }
+                    if !registered {
                         // 不阻断启动：热键只是"快捷方式"，
                         // 小球和托盘仍然可用，用户能在设置页里改一个没冲突的组合。
-                        eprintln!("[浮光] 全局热键「{combo}」注册失败：{err}");
+                        crate::diag!("[浮光] 全局热键「{combo}」注册失败（重试 3 次仍失败）：{last_err}");
                     }
                 }
             }

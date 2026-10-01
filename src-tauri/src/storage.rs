@@ -125,12 +125,12 @@ pub fn read_json_at<T: serde::de::DeserializeOwned>(path: &Path, fallback: T) ->
 fn quarantine(path: &Path, why: &str) {
     let backup = corrupt_backup_path(path);
     match fs::rename(path, &backup) {
-        Ok(()) => eprintln!(
+        Ok(()) => crate::diag!(
             "[浮光] {} {why}，已备份到 {}",
             path.display(),
             backup.display()
         ),
-        Err(rename_err) => eprintln!(
+        Err(rename_err) => crate::diag!(
             "[浮光] {} {why}，且备份失败（{rename_err}）",
             path.display()
         ),
@@ -219,7 +219,7 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
 /// 读取数据文件（面向 `AppHandle`）。
 pub fn read_json<T: serde::de::DeserializeOwned>(app: &AppHandle, file: &str, fallback: T) -> T {
     let Ok(name) = check_file_name(file) else {
-        eprintln!("[浮光] 拒绝读取非法文件名：{file}");
+        crate::diag!("[浮光] 拒绝读取非法文件名：{file}");
         return fallback;
     };
     let Ok(dir) = data_dir(app) else {

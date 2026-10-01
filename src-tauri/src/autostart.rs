@@ -308,7 +308,7 @@ fn should_clean(registered: &str, current_exe: Option<&str>) -> bool {
     //
     // 网络共享离线、U 盘没插、盘符没映射时目标同样"不存在"，但那条记录其实能用 ——
     // 删了就没了，而且 release 版是 `windows_subsystem = "windows"`，
-    // `eprintln!` 没有 stderr 可写，用户看不到任何提示。
+    // `crate::diag!` 没有 stderr 可写，用户看不到任何提示。
     is_on_local_fixed_drive(exe)
 }
 
@@ -383,7 +383,7 @@ pub fn clean_stale_entry() {
     unsafe { RegCloseKey(hkey) };
 
     if status == ERROR_SUCCESS {
-        eprintln!("[浮光] 已清理失效的开机自启项（目标已不存在）：{registered}");
+        crate::diag!("[浮光] 已清理失效的开机自启项（目标已不存在）：{registered}");
     }
 }
 

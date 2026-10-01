@@ -64,36 +64,76 @@ pub fn check_file_name(file: &str) -> Result<&str, String> {
     Ok(file)
 }
 
+/// 剥掉开头的 UTF-8 BOM（如果有）。
+///
+/// 记事本"另存为"默认可能写 BOM，而 `serde_json` 不认它，会报
+/// `expected value at line 1 column 1`。BOM 是**无损可剥**的，把它当
+/// "文件损坏"处理会让用户白白丢一次数据 —— 曾经真的这样丢过一整份设置。
+///
+/// 抽成函数是因为这个坑在**两条**路径上都有：读数据文件（`read_json_at`）
+/// 和导入备份（`backup::import`）。修了一处漏另一处，等于没修。
+pub fn strip_bom(raw: &str) -> &str {
+    raw.trim_start_matches('\u{feff}')
+}
+
 /// 读取 JSON 文件（路径版本，可单测）。
 ///
-/// 文件不存在或内容损坏时返回 `fallback`，而不是报错。
-/// 理由：数据文件是纯文本、用户可能手动编辑；一次手滑不该让软件打不开。
+/// **只有"文件不存在"才静默返回 `fallback`**（首次运行的正常情况）。
+/// 读失败与解析失败都要先把文件改名备份，再返回默认值。
 ///
-/// 损坏时会**先把坏文件改名备份**再返回默认值，
-/// 否则下次写入会直接覆盖掉用户还能抢救的内容。
+/// # 为什么读失败也要备份
+///
+/// 调用方拿到默认值后往往会紧接着写一次（例如设置页随便改一项就整份覆盖写），
+/// 不备份的话原文件当场就被覆盖了，用户没有任何抢救机会。
+/// 「文件被占用/权限不足/不是 UTF-8」都不等于「文件不存在」，
+/// 把它们当成空的，用户看到的是"我的数据全没了"。
+///
+/// # 为什么先剥 BOM
+///
+/// 记事本保存 JSON 时默认可能带 UTF-8 BOM，而 `serde_json` 不认它，
+/// 会报 `expected value at line 1 column 1`。BOM 是**无损可剥**的，
+/// 把它当"文件损坏"处理会让用户白白丢一次全部设置。
 pub fn read_json_at<T: serde::de::DeserializeOwned>(path: &Path, fallback: T) -> T {
-    let Ok(raw) = fs::read_to_string(path) else {
-        // 文件不存在属于正常情况（首次运行），静默用默认值
-        return fallback;
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // 首次运行：文件还没生成过，正常情况，静默用默认值
+            return fallback;
+        }
+        Err(err) => {
+            quarantine(path, &format!("读取失败（{err}）"));
+            return fallback;
+        }
     };
 
-    match serde_json::from_str::<T>(&raw) {
+    // 只剥开头的 BOM，不动文件内容里的任何字符
+    let raw = strip_bom(&raw);
+
+    match serde_json::from_str::<T>(raw) {
         Ok(value) => value,
         Err(err) => {
-            let backup = corrupt_backup_path(path);
-            match fs::rename(path, &backup) {
-                Ok(()) => eprintln!(
-                    "[浮光] {} 解析失败（{err}），已备份到 {}",
-                    path.display(),
-                    backup.display()
-                ),
-                Err(rename_err) => eprintln!(
-                    "[浮光] {} 解析失败（{err}），且备份失败（{rename_err}）",
-                    path.display()
-                ),
-            }
+            quarantine(path, &format!("解析失败（{err}）"));
             fallback
         }
+    }
+}
+
+/// 把读不了 / 解析不了的文件改名留证，并打一条日志。
+///
+/// 改名而不是删除：用户还能自己去 `%APPDATA%\浮光\` 把内容捞回来。
+/// 改名失败（例如文件被别的进程锁着）只记日志——至少不再是静默。
+fn quarantine(path: &Path, why: &str) {
+    let backup = corrupt_backup_path(path);
+    match fs::rename(path, &backup) {
+        Ok(()) => eprintln!(
+            "[浮光] {} {why}，已备份到 {}",
+            path.display(),
+            backup.display()
+        ),
+        Err(rename_err) => eprintln!(
+            "[浮光] {} {why}，且备份失败（{rename_err}）",
+            path.display()
+        ),
     }
 }
 
@@ -116,19 +156,64 @@ fn corrupt_backup_path(path: &Path) -> PathBuf {
 /// 下次启动就变成"文件损坏"。而临时文件方案下，最坏情况只是丢掉这一次写入，
 /// 旧文件依然完整。
 pub fn write_json_at<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    let tmp = path.with_extension("json.tmp");
-
     let json = serde_json::to_string_pretty(value).map_err(|e| format!("序列化失败：{e}"))?;
-    fs::write(&tmp, json).map_err(|e| format!("写入临时文件失败：{e}"))?;
 
-    // Windows 的 rename 不能覆盖已存在的目标，必须先删。
-    // 这一步会短暂出现"目标不存在"的窗口，但读侧对文件缺失是容错的，
-    // 且写入都在同一进程内串行发生，不会读到中间态。
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| format!("替换旧数据文件失败：{e}"))?;
+    // 临时文件名必须唯一。`settings_save` / `hotkey_apply` / `autostart_set`
+    // 都是 async 命令，跑在多线程 runtime 上，同一个文件可能被并发写；
+    // 固定叫 `x.json.tmp` 的话两个写者会互相踩（后写的覆盖前写的临时内容，
+    // 或者前一个已经 rename 走、后一个 rename 报 ENOENT）。
+    let tmp = unique_tmp_path(path);
+    if let Err(err) = fs::write(&tmp, json) {
+        // 失败也要清掉临时文件。
+        //
+        // `fs::write` 会先创建文件再写内容，所以在"创建成功、写内容失败"时
+        // （磁盘满 ENOSPC 最典型，也可能写到一半进程被杀）会留下一个残缺的 .tmp。
+        // 而它永远不会被读取，只会一直堆在用户的数据目录里 ——
+        // 用户打开数据目录会看到一堆 `timers.json.1234-5.tmp` 这样的垃圾，
+        // 每个还都长得像数据文件。
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("写入临时文件失败：{err}"));
     }
-    fs::rename(&tmp, path).map_err(|e| format!("提交数据文件失败：{e}"))?;
+
+    // 直接 rename 覆盖，**不要**先 remove_file。
+    //
+    // Rust 的 `std::fs::rename` 在 Windows 上走
+    // `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING)`，本来就能覆盖已存在的目标。
+    // 先删再改名反而制造了一个"目标文件不存在"的窗口：一旦 rename 失败
+    // （磁盘满、被占用、断电），旧数据已经删了、新数据还在 .tmp 里，
+    // 而读取侧永远不读 .tmp —— 用户看到的就是"数据全没了"。
+    if let Err(err) = fs::rename(&tmp, path) {
+        // 提交失败就别把半成品留在用户的数据目录里
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("提交数据文件失败：{err}"));
+    }
     Ok(())
+}
+
+/// 临时文件名里的进程内单调计数器。
+///
+/// # 为什么不能只靠时间戳
+///
+/// 原来用的是"进程 id + 纳秒"，并假设纳秒唯一。**实测不成立**：
+/// Windows 的系统时钟粒度是 100ns，同一纳秒里取两次时间是常事 ——
+/// 本机连续取 20 万次时间戳，有约 **16%** 与前一次完全相同；
+/// 8 线程各生成 1 万个临时名，8 万个名字去重后只剩 6.6 万个（撞掉 17%）。
+///
+/// 撞名之后两个写者会互相截断对方的临时文件，或者其中一个 `rename` 拿到
+/// ENOENT、报出莫名其妙的"提交数据文件失败"。计数器才是真正的唯一性来源。
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 给目标文件生成一个**同目录**下、带唯一后缀的临时路径。
+///
+/// 必须同目录：`rename` 跨卷会失败（`MoveFileExW` 不支持跨卷移动）。
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "data.json".into());
+    // 进程 id 区分不同进程，计数器保证同一进程内绝不重复
+    path.with_file_name(format!("{name}.{}-{seq}.tmp", std::process::id()))
 }
 
 /// 读取数据文件（面向 `AppHandle`）。
@@ -381,5 +466,171 @@ mod tests {
 
         assert_eq!(loaded, item);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ===========================================================
+    // 以下四条对应一次真实事故：用户用记事本把 settings.json 存成
+    // 「UTF-8 带 BOM」，重启后整个文件被判为损坏、全部设置回到默认值。
+    // ===========================================================
+
+    #[test]
+    fn 带_bom_的_json_能正常读回而不是被判损坏() {
+        let dir = temp_dir("bom");
+        let path = dir.join("items.json");
+
+        // 记事本存「UTF-8 带 BOM」就是这个字节序列
+        let body = serde_json::to_string(&sample()).expect("序列化");
+        fs::write(&path, format!("\u{feff}{body}")).expect("写文件");
+
+        let loaded: Item = read_json_at(&path, Item {
+            name: String::new(),
+            count: 0,
+        });
+
+        assert_eq!(loaded, sample(), "BOM 应该被剥掉，而不是当成损坏");
+        assert!(path.exists(), "原文件必须还在，不该被改名");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 文件不存在时不该留下任何备份文件() {
+        // "不存在"是首次运行的正常情况，不能每启动一次就产生一个 .corrupt
+        let dir = temp_dir("no-backup");
+        let path = dir.join("nope.json");
+
+        let _: Vec<Item> = read_json_at(&path, Vec::new());
+
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .expect("读目录")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "文件不存在时不该产生任何文件，实际：{leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 读失败也会备份而不是静默当成空() {
+        // 用 GBK 存过的文件读不成 UTF-8。旧行为是静默返回空列表，
+        // 用户随后任何一次写入都会把原文件彻底覆盖掉。
+        let dir = temp_dir("gbk");
+        let path = dir.join("items.json");
+
+        // "测试" 的 GBK 编码，保证不是合法 UTF-8
+        fs::write(&path, [0xB2u8, 0xE2, 0xCA, 0xD4]).expect("写文件");
+
+        let loaded: Vec<Item> = read_json_at(&path, Vec::new());
+        assert!(loaded.is_empty(), "读失败应回退默认值");
+
+        let backups: Vec<_> = fs::read_dir(&dir)
+            .expect("读目录")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("corrupt"))
+            .collect();
+        assert_eq!(backups.len(), 1, "读失败必须留下备份，实际：{backups:?}");
+
+        // 备份必须保留原始字节，否则"留证"没意义
+        let raw = fs::read(dir.join(&backups[0])).expect("读备份");
+        assert_eq!(raw, vec![0xB2u8, 0xE2, 0xCA, 0xD4]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_能覆盖已存在的文件() {
+        // 这条不是测我们的代码，是**测我们的假设**：
+        // `write_json_at` 去掉了"先删后改名"，前提是 std::fs::rename
+        // 在 Windows 上能覆盖已存在的目标（MoveFileExW + MOVEFILE_REPLACE_EXISTING）。
+        // 如果这个假设错了，去掉 remove_file 会让写入直接失败 —— 必须钉死。
+        let dir = temp_dir("rename-overwrite");
+        let dst = dir.join("dst.json");
+        let src = dir.join("src.json");
+
+        fs::write(&dst, "旧内容").expect("写目标");
+        fs::write(&src, "新内容").expect("写源");
+
+        fs::rename(&src, &dst).expect("rename 必须能覆盖已存在的目标");
+
+        assert_eq!(fs::read_to_string(&dst).expect("读目标"), "新内容");
+        assert!(!src.exists(), "源文件应该已经被移走");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 并发写同一文件不会互相踩() {
+        // 固定临时文件名时，两个写者会算出同一个 .tmp。
+        // 这里起 8 个线程同时写同一个文件，最后内容必须是其中完整的一份，
+        // 而且不能留下任何 .tmp 残骸。
+        let dir = temp_dir("concurrent");
+        let path = dir.join("items.json");
+        let mut handles = Vec::new();
+
+        for i in 0..8u32 {
+            let p = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let item = Item {
+                    name: format!("写者{i}"),
+                    count: i,
+                };
+                write_json_at(&p, &item).expect("并发写入不该失败");
+            }));
+        }
+        for h in handles {
+            h.join().expect("线程不该 panic");
+        }
+
+        let loaded: Item = read_json_at(&path, Item {
+            name: String::new(),
+            count: 0,
+        });
+        assert!(
+            (0..8).contains(&loaded.count),
+            "读回来的必须是某一次完整写入，实际：{loaded:?}"
+        );
+
+        let tmps: Vec<_> = fs::read_dir(&dir)
+            .expect("读目录")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(tmps.is_empty(), "不该留下临时文件，实际：{tmps:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 临时文件名在进程内绝不重复() {
+        // 只靠"进程 id + 纳秒"是不够的：Windows 系统时钟粒度实测 100ns，
+        // 约 16% 的连续取值完全相同。撞名之后两个写者会互相截断对方的临时文件，
+        // 或者其中一个 rename 拿到 ENOENT 报出莫名其妙的"保存失败"。
+        // 计数器才是唯一性来源 —— 这条测试就是钉住它。
+        let dir = temp_dir("tmp-unique");
+        let path = dir.join("items.json");
+
+        let names: std::collections::HashSet<String> = (0..10_000)
+            .map(|_| {
+                unique_tmp_path(&path)
+                    .file_name()
+                    .expect("有文件名")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(names.len(), 10_000, "临时文件名撞了");
+        // 必须同目录：跨卷 rename 会失败
+        assert!(unique_tmp_path(&path).starts_with(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 剥_bom_不会动正文里的字符() {
+        assert_eq!(strip_bom("\u{feff}{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(strip_bom("{\"a\":1}"), "{\"a\":1}");
+        // 只在开头剥：正文中间出现的 U+FEFF 是内容，不能动
+        assert_eq!(strip_bom("{\"a\":\"\u{feff}\"}"), "{\"a\":\"\u{feff}\"}");
     }
 }

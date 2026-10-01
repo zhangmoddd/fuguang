@@ -15,6 +15,8 @@
 //!
 //! 这样 Rust 不需要任何日期库，也不会算错时区。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// 计时器的三种模式。
@@ -93,6 +95,12 @@ pub struct Timer {
     /// 是否已经提醒过（防止同一轮重复弹窗）。
     #[serde(default)]
     pub fired: bool,
+
+    /// 所属文件夹 id。`None` 表示在顶层。
+    ///
+    /// 后加字段：老数据里没有这一项，缺省即顶层。
+    #[serde(default)]
+    pub folder_id: Option<String>,
 
     pub created_at: i64,
 }
@@ -180,6 +188,11 @@ pub struct Link {
     /// 排序权重，小的在前。
     #[serde(default)]
     pub order: i32,
+    /// 所属文件夹 id。`None` 表示在顶层。
+    ///
+    /// 后加字段：老数据里没有这一项，缺省即顶层。
+    #[serde(default)]
+    pub folder_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -195,6 +208,45 @@ pub enum LinkKind {
     File,
     /// 网址。
     Url,
+}
+
+/// 一个文件夹，用来给条目分类。
+///
+/// # 为什么单独一个文件（`folders.json`）
+///
+/// 文件夹不属于某一个功能：链接、文本片段、计时器各有一套，所以用一个文件装全部，
+/// 靠 `feature` 字段区分归属。
+///
+/// 为什么不塞进 `links.json` 之类：数据文件的约定是**只增字段不删字段**，
+/// 把 `[条目, ...]` 改成 `{ "items": [...], "folders": [...] }` 会让老版本
+/// 直接读不了这个文件——用户的链接会一夜之间消失。
+///
+/// # 嵌套
+///
+/// 用 `parent_id` 表达父子关系，`None` 就是顶层。任意层数都能表示，
+/// 前端用面包屑下钻来浏览（面板只有 420px，塞不下左侧树）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Folder {
+    pub id: String,
+    /// 属于哪个功能页签（`links` / `snippets` / `timer`）。
+    ///
+    /// 刻意用字符串而不是枚举：这里不需要"认识"所有取值，前端按自己的 id 过滤即可。
+    /// 换成枚举的话，一个前端先加上、后端还不认识的取值会让**整个文件**解析失败，
+    /// 而解析失败会被 [`crate::storage`] 当成文件损坏备份掉——代价太大。
+    pub feature: String,
+    pub name: String,
+    /// 备注。和名字分开：名字要短才排得下，
+    /// 想写清楚"这个文件夹是干什么的"就写在备注里。
+    #[serde(default)]
+    pub note: String,
+    /// 父文件夹 id。`None` 表示在顶层。
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// 排序权重，小的在前。
+    #[serde(default)]
+    pub order: i32,
+    pub created_at: i64,
 }
 
 /// 应用设置。
@@ -241,6 +293,19 @@ pub struct Settings {
     /// 让用户自由填颜色很容易配出"标志和底色糊在一起"的组合。
     #[serde(default = "default_ball_theme")]
     pub ball_theme: String,
+
+    /// 各页签的缩放百分比（100 = 默认大小）。
+    ///
+    /// 用一个 map 而不是"每个页签一个字段"：页签是刻意做成可扩展的
+    /// （见前端 `features/registry.ts`），每加一个页签都要改数据模型不合理。
+    ///
+    /// 用 `BTreeMap` 而不是 `HashMap`：前者按 key 排序序列化，
+    /// 写出来的 `settings.json` 顺序稳定，diff 才不会每次都在抖。
+    ///
+    /// 认不出来的 key 会被原样留着——前端只读自己那个页签的键，
+    /// 多出来的键既不影响显示，也不会因为卸载了某个页签就把用户的选择删掉。
+    #[serde(default)]
+    pub zoom: BTreeMap<String, u32>,
 }
 
 /// 悬浮球可选配色。与前端 `src/lib/ball-theme.ts` 里的 id 一一对应。
@@ -266,6 +331,17 @@ fn default_ball_theme() -> String {
 pub const FONT_SIZE_MIN: u32 = 12;
 /// 界面字号的上限。再大面板里就放不下了。
 pub const FONT_SIZE_MAX: u32 = 18;
+
+/// 页签缩放的上下限（百分比）。
+///
+/// 下限 70：再小图标就点不中了；上限 160：再大链接页一行只放得下两个。
+///
+/// 「没有单独设置过的页签用多少」不在 Rust 侧定义：缺 key 就代表用默认值，
+/// 默认值由前端 `lib/zoom.ts` 的 `ZOOM_DEFAULT` 说了算——
+/// 那样调整默认档位不用动数据模型，也不会让老数据文件凭空多出一堆键。
+pub const ZOOM_MIN: u32 = 70;
+/// 见 [`ZOOM_MIN`]。
+pub const ZOOM_MAX: u32 = 160;
 
 fn default_restore_delay() -> u64 {
     120
@@ -298,6 +374,11 @@ impl Settings {
         if !BALL_THEMES.contains(&self.ball_theme.as_str()) {
             self.ball_theme = default_ball_theme();
         }
+        // 缩放档位也要夹：一个手写的 "zoom": {"links": 9999}
+        // 会让链接页一个图标占满整屏，等于把功能弄坏了。
+        for v in self.zoom.values_mut() {
+            *v = (*v).clamp(ZOOM_MIN, ZOOM_MAX);
+        }
     }
 }
 
@@ -312,6 +393,7 @@ impl Default for Settings {
             hotkey: default_hotkey(),
             font_size_px: default_font_size(),
             ball_theme: default_ball_theme(),
+            zoom: BTreeMap::new(),
         }
     }
 }
@@ -379,6 +461,7 @@ mod tests {
         // 番茄钟时长要有可用的默认值，否则老数据里的番茄钟会变成 0 分钟
         assert_eq!(t.focus_minutes, 25);
         assert_eq!(t.break_minutes, 5);
+        assert_eq!(t.folder_id, None, "老数据没有分类，应落在顶层");
     }
 
     #[test]
@@ -416,6 +499,48 @@ mod tests {
         assert_eq!(l.kind, LinkKind::Program);
         assert_eq!(l.args, None);
         assert_eq!(l.order, 0);
+        assert_eq!(l.folder_id, None, "老数据没有分类，应落在顶层");
+    }
+
+    #[test]
+    fn 只有必填字段的文件夹也能解析() {
+        let json = r#"{
+            "id": "f1",
+            "feature": "links",
+            "name": "工作",
+            "createdAt": 1
+        }"#;
+
+        let f: Folder = serde_json::from_str(json).expect("老数据必须能解析");
+
+        assert_eq!(f.feature, "links");
+        assert_eq!(f.name, "工作");
+        assert_eq!(f.note, "");
+        assert_eq!(f.parent_id, None, "缺省即顶层");
+        assert_eq!(f.order, 0);
+    }
+
+    #[test]
+    fn 文件夹的父子关系能往返序列化() {
+        let f = Folder {
+            id: "f2".into(),
+            feature: "links".into(),
+            name: "项目".into(),
+            note: "正在做的".into(),
+            parent_id: Some("f1".into()),
+            order: 3,
+            created_at: 1,
+        };
+
+        let json = serde_json::to_string(&f).expect("必须能序列化");
+        // 前端按 camelCase 读，字段名写错会让嵌套关系整条失效
+        assert!(json.contains("\"parentId\":\"f1\""), "实际输出：{json}");
+        assert!(json.contains("\"createdAt\":1"));
+
+        let back: Folder = serde_json::from_str(&json).expect("必须能解析回去");
+        assert_eq!(back.parent_id.as_deref(), Some("f1"));
+        assert_eq!(back.note, "正在做的");
+        assert_eq!(back.order, 3);
     }
 
     #[test]
@@ -461,6 +586,40 @@ mod tests {
             s.clamp();
             assert_eq!(s.font_size_px, size, "合法值不该被改动");
         }
+    }
+
+    #[test]
+    fn 缩放档位被夹到合法区间() {
+        // 场景同字号：手写一个 "zoom": {"links": 9999}
+        // 会让链接页一个图标占满整屏，等于把功能弄坏了。
+        let mut s = Settings::default();
+        s.zoom.insert("links".into(), 9999);
+        s.zoom.insert("timer".into(), 1);
+        s.zoom.insert("snippets".into(), 120);
+        s.clamp();
+
+        assert_eq!(s.zoom["links"], ZOOM_MAX);
+        assert_eq!(s.zoom["timer"], ZOOM_MIN);
+        assert_eq!(s.zoom["snippets"], 120, "合法值不该被改动");
+    }
+
+    #[test]
+    fn 缩放档位按页签独立保存() {
+        // 这是这个功能的核心承诺：调大链接的图标不该影响计时器
+        let mut s = Settings::default();
+        s.zoom.insert("links".into(), 140);
+        s.clamp();
+
+        assert_eq!(s.zoom.get("links"), Some(&140));
+        assert_eq!(s.zoom.get("timer"), None, "没设置过的页签不该被写进去");
+    }
+
+    #[test]
+    fn 老设置文件没有缩放字段时是空表() {
+        // 空表代表"所有页签都用默认大小"。clamp 刻意不往里塞默认值：
+        // 塞了就分不清"用户没调过"和"用户调回了 100"。
+        let s: Settings = serde_json::from_str("{}").expect("必须能解析");
+        assert!(s.zoom.is_empty());
     }
 
     #[test]
@@ -556,6 +715,7 @@ mod tests {
             running_since: None,
             laps: Vec::new(),
             fired: false,
+            folder_id: Some("f1".into()),
             created_at: 4,
         };
 
@@ -565,7 +725,9 @@ mod tests {
         assert!(json.contains("\"remainingMs\""));
         assert!(json.contains("\"durationMs\""));
         assert!(json.contains("\"createdAt\""));
+        assert!(json.contains("\"folderId\":\"f1\""), "分类字段也要驼峰：{json}");
         assert!(!json.contains("ends_at"), "不该出现下划线命名");
+        assert!(!json.contains("folder_id"), "不该出现下划线命名");
     }
 
     #[test]
@@ -639,6 +801,7 @@ mod tests {
             running_since: None,
             laps: vec![100, 200],
             fired: false,
+            folder_id: None,
             created_at: 1_700_000_000_000,
         };
 

@@ -1,0 +1,40 @@
+/* ============================================================
+   拖拽（排序 + 归类）
+   为什么不用 HTML5 拖放、判定为什么用矩形而不是 elementFromPoint：
+   见 lib/drag-drop.ts 的文件头。
+   ============================================================ */
+
+/* 正在被拖的东西：压暗，明确"我拎起来的是这个" */
+.drag-source {
+  opacity: 0.45;
+}
+
+/* 指针下方的文件夹卡片：描边 + 淡底，明确"松手就放这儿" */
+.foldertile--over .foldertile__open {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+/* 插入位置提示：在目标条目的边缘画一条强调色线。
+   纵向列表画上下边；横向 / 网格用带 -x 的那两个，画左右边。 */
+.drag-over-before {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.drag-over-after {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.drag-over-before-x {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.drag-over-after-x {
+  box-shadow: inset -2px 0 0 var(--accent);
+}
+
+/* 拖拽期间整页用抓取光标，让"现在是在拖东西"一直可见 */
+.dragging,
+.dragging * {
+  cursor: grabbing !important;
+}

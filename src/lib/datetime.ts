@@ -39,7 +39,9 @@ export function formatStopwatch(ms: number): string {
 
 /** 本地日期键，`YYYY-MM-DD`。 */
 export function dateKey(d: Date = new Date()): string {
-  const y = d.getFullYear();
+  // 年份必须补足四位。年份 100–999 时不补零会产出 `100-01-01` 这种非 4 位键，
+  // 而 `isRealDateKey` 的正则要求 4 位 —— 自己产出的键自己认不出来。
+  const y = String(d.getFullYear()).padStart(4, "0");
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
@@ -50,13 +52,98 @@ export function todayKey(): string {
   return dateKey(new Date());
 }
 
+/**
+ * 校验一个 `YYYY-MM-DD` 字符串是不是**真实存在**的日期。
+ *
+ * 光靠正则挡不住 `2026-02-30`、`2026-13-01` 这类值：格式是对的，日期不存在。
+ * 做法是构造出来再比对——`new Date(2026, 1, 30)` 会被自动进位成 3 月 2 日，
+ * 年月日三个字段有一个对不上，就说明原来那个日期不存在。
+ *
+ * 用户手打日期时靠它决定「采纳还是退回原值」（见 features/memo/Calendar.tsx）。
+ *
+ * # 为什么年份 < 100 直接判非法
+ *
+ * JS 会把 0–99 的年份当成 19xx（`new Date(26, 8, 25)` 拿到的是 **1926** 年），
+ * 所以下面的回环比对必然对不上，`0026-09-25` 会被静默退回 —— 用户看到的是
+ * "打了没反应"，不知道原因。与其"支持"一个年份只有两位数的日期
+ * （那样 `dateKey` 会产出非 4 位的键、日历翻页会跳到 1926 年），不如明确拒绝。
+ *
+ * 内部日期运算仍有年份安全的构造（见 `localDate`），那是给老数据/手改文件兜底的，
+ * 不是给用户输入放行的理由。
+ */
+export function isRealDateKey(s: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const [y, m, d] = s.split("-").map(Number);
+  if (y < 100) return false;
+  const dt = new Date(y, m - 1, d);
+  return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
+}
+
+/** 月历网格里的一个格子。 */
+export interface MonthCell {
+  /** `YYYY-MM-DD`，可以直接当作选中值写回去。 */
+  key: string;
+  /** 日号（1~31），用于显示。 */
+  day: number;
+  /** 是否属于目标月份。`false` 表示这是上月末或下月初的补位。 */
+  inMonth: boolean;
+}
+
+/**
+ * 生成月历网格：固定 6 行 × 7 列 = 42 格，**周一开头**。
+ *
+ * @param year - 四位年份
+ * @param month - 月份，**0 基**（和 JS `Date` 一致，1 月是 0）
+ *
+ * 为什么固定 42 格而不是"够用就行"：**翻月时高度不能跳**。
+ * 高度一跳，鼠标底下的「下个月」按钮就会移位，连点两下很容易点空。
+ *
+ * 上月末与下月初的补位也会一并返回，怎么显示交给调用方——
+ * 日历里把它们淡化但仍然可点，点了就直接跳过去。
+ */
+export function monthGrid(year: number, month: number): MonthCell[] {
+  // getDay() 是 0=周日，换算成"周一开头"的偏移量
+  const offset = (localDate(year, month, 1).getDay() + 6) % 7;
+  const cells: MonthCell[] = [];
+  for (let i = 0; i < 42; i++) {
+    // 让 Date 自己进位跨月，比手算天数安全（闰年、月末都对）
+    const d = localDate(year, month, 1 - offset + i);
+    cells.push({ key: dateKey(d), day: d.getDate(), inMonth: d.getMonth() === month });
+  }
+  return cells;
+}
+
+/**
+ * 按本地时区构造一个日期，**并且不被 JS 的「0–99 年份」规则改写**。
+ *
+ * `new Date(26, 8, 25)` 拿到的是 **1926** 年 —— JS 规定 0–99 的年份一律加 1900。
+ * 用户手打 `0026-09-25` 就会被悄悄挪到 1926 年：提醒立刻误弹、日历整年错位。
+ *
+ * 做法：先用一个**必定合法**的日期建对象，再 `setFullYear(y, m, d)` 一次把
+ * 年月日全设掉。三个参数一起给，溢出（`day` 为 0、负数、或超过当月天数）
+ * 会按**目标年份**的月长去算。
+ *
+ * ⚠️ 不能先 `new Date(2000, month, day)` 再 `setFullYear(year)`：
+ * 那样溢出是在**2000 年**（闰年）算的，2 月的天数就和目标年份对不上 ——
+ * 例如求"2026 年 3 月的第 0 天"会被 2000 年的闰年 2 月带成 3 月 1 日而不是 2 月 28 日。
+ * 这条曾经真的写错过，被"每月 31 日夹到 2 月 28 日"的测试抓了出来。
+ *
+ * 这是本项目里**唯一**构造本地日期的地方，改这一处就够。
+ */
+function localDate(year: number, month: number, day: number, hh = 0, mm = 0): Date {
+  const d = new Date(2000, 0, 1, hh, mm, 0, 0);
+  d.setFullYear(year, month, day);
+  return d;
+}
+
 /** 把 `YYYY-MM-DD` 与 `HH:MM` 组合成本地时区的绝对毫秒。 */
 export function combineLocal(dateStr: string, timeStr: string): number {
   const [y, m, d] = dateStr.split("-").map(Number);
   const [hh, mm] = timeStr.split(":").map(Number);
-  // 用 new Date(y, m-1, d, hh, mm) 而不是解析字符串：
-  // 前者明确按本地时区解释，后者在不同引擎里对 "YYYY-MM-DD" 的处理不一致
-  return new Date(y, (m ?? 1) - 1, d ?? 1, hh ?? 0, mm ?? 0, 0, 0).getTime();
+  // 按本地时区构造，而不是解析字符串：
+  // 后者在不同引擎里对 "YYYY-MM-DD" 的处理不一致。
+  // 年份的安全性由 localDate 负责（见它的说明）。
+  return localDate(y ?? 2000, (m ?? 1) - 1, d ?? 1, hh ?? 0, mm ?? 0).getTime();
 }
 
 /** 把绝对毫秒拆成 `{ date: "YYYY-MM-DD", time: "HH:MM" }`（本地时区）。 */
@@ -127,14 +214,43 @@ export const REPEAT_OPTIONS = [
 export type RepeatValue = (typeof REPEAT_OPTIONS)[number]["value"];
 
 /**
+ * 把「某个日期 + 规则里的钟点」合成绝对毫秒。
+ *
+ * # 为什么不能直接 `new Date(y, m, d, hh, mm)`
+ *
+ * 夏令时春季跳变当天，`02:30` 这个本地时刻**根本不存在**，
+ * 引擎会悄悄把它归一化成 `03:30`。而本函数的调用方是拿**上一次的结果**
+ * 反推钟点的 —— 一旦把归一化后的 `03:30` 存回去当成新基准，
+ * 用户设的「每天 02:30」就**永久**变成「每天 03:30」，再也回不来。
+ *
+ * 所以这里检测归一化：钟点对不上就往后找第一个该钟点真实存在的日期。
+ * 代价是跳变当天少提醒一次；但「少提醒一天」远好于「钟点被悄悄改掉」。
+ */
+function atLocalTime(
+  year: number,
+  month: number,
+  day: number,
+  hh: number,
+  mm: number,
+): number {
+  for (let i = 0; i < 3; i += 1) {
+    const d = localDate(year, month, day + i, hh, mm);
+    if (d.getHours() === hh && d.getMinutes() === mm) return d.getTime();
+  }
+  // 夏令时缺口最多 1 小时，正常走不到这里；真到了也不抛错，返回最后一次结果
+  return localDate(year, month, day, hh, mm).getTime();
+}
+
+/**
  * 已知的本次提醒时刻，算出下一次该提醒的时刻。
  *
  * @param current 刚刚触发的那一次提醒的绝对毫秒
  * @param repeat  重复规则
  * @returns 下一次的绝对毫秒；`none` 返回 null
  *
- * 实现要点：先改日期再**显式重设时分秒**，
- * 这样夏令时切换当天墙上时钟依然指向同一个钟点。
+ * 实现要点：**钟点取自规则（`current` 的时分），日期单独往后推**，
+ * 两者最后由 [`atLocalTime`] 合成。日期推进交给 `Date` 自己进位，
+ * 比手算天数安全（闰年、月末都对）。
  */
 export function nextOccurrence(current: number, repeat: RepeatValue): number | null {
   if (repeat === "none") return null;
@@ -143,41 +259,41 @@ export function nextOccurrence(current: number, repeat: RepeatValue): number | n
   const hour = base.getHours();
   const minute = base.getMinutes();
   const dayOfMonth = base.getDate();
-
-  const d = new Date(current);
-  // 每次把秒与毫秒清零，避免第一次设定时带上的零头一直累加
-  const reset = () => {
-    d.setHours(hour, minute, 0, 0);
-    return d.getTime();
-  };
+  const year = base.getFullYear();
+  const month = base.getMonth();
+  const day = base.getDate();
 
   switch (repeat) {
-    case "daily": {
-      d.setDate(d.getDate() + 1);
-      return reset();
-    }
-    case "weekly": {
-      d.setDate(d.getDate() + 7);
-      return reset();
-    }
+    case "daily":
+      return atLocalTime(year, month, day + 1, hour, minute);
+
+    case "weekly":
+      return atLocalTime(year, month, day + 7, hour, minute);
+
     case "monthly": {
       // 先跳到下个月的同一天。JS 在"1月31日 + 1个月"时会溢出到 3 月 3 日，
-      // 这里检测到溢出就夹到目标月的最后一天（2 月 28/29 日），
+      // 这里夹到目标月的最后一天（2 月 28/29 日），
       // 否则用户设的"每月 31 日提醒"会在 2 月变成 3 月 3 日，非常反直觉。
-      d.setDate(1);
-      d.setMonth(d.getMonth() + 1);
-      const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
-      d.setDate(Math.min(dayOfMonth, lastDay));
-      return reset();
+      const target = localDate(year, month + 1, 1);
+      const lastDay = localDate(target.getFullYear(), target.getMonth() + 1, 0).getDate();
+      return atLocalTime(
+        target.getFullYear(),
+        target.getMonth(),
+        Math.min(dayOfMonth, lastDay),
+        hour,
+        minute,
+      );
     }
+
     case "weekday": {
-      d.setDate(d.getDate() + 1);
       // 跳过周六周日。用循环而不是判断两次，跨周时更稳。
-      while (d.getDay() === 0 || d.getDay() === 6) {
-        d.setDate(d.getDate() + 1);
+      const probe = localDate(year, month, day + 1);
+      while (probe.getDay() === 0 || probe.getDay() === 6) {
+        probe.setDate(probe.getDate() + 1);
       }
-      return reset();
+      return atLocalTime(probe.getFullYear(), probe.getMonth(), probe.getDate(), hour, minute);
     }
+
     default:
       return null;
   }
@@ -199,8 +315,13 @@ export function nextOccurrence(current: number, repeat: RepeatValue): number | n
  *
  * 所以循环上限给得很宽（两万次，覆盖五十多年的每日提醒），
  * 且循环耗尽时还有一层兜底，绝不允许把过去时刻返回出去。
- * 单次循环只是一次日期运算，即使跑满上限也在一毫秒量级，
- * 而且只有"填了一个很久以前的时刻"才会走到这里。
+ *
+ * # 代价（别低估）
+ *
+ * "单次循环一毫秒量级"这个说法是**错的**：实测跑满两万次要 **56–96ms**
+ * （工作日规则最慢）。所以调用方**不要**在渲染路径上每帧调它 ——
+ * 备忘编辑器的预览必须 `useMemo` 到「日期/时刻/重复规则」这三个字段上，
+ * 否则在正文里每敲一个字都要重付一次。
  */
 export function firstOccurrence(
   wanted: number,

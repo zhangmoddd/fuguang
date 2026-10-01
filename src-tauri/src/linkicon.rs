@@ -41,7 +41,52 @@ pub fn extract(path: &str) -> Option<IconData> {
     if path.is_empty() {
         return None;
     }
+    // 网络路径一律不碰。前端拿不到图标就退回内置图标，用户完全无感；
+    // 而"为了画一个图标去连一台陌生主机"是不能接受的代价（见 touches_network）。
+    if touches_network(path) {
+        return None;
+    }
     unsafe { extract_inner(path) }
+}
+
+/// 判断这个路径会不会让 Shell 去访问网络。
+///
+/// # 为什么必须拦
+///
+/// `SHGetFileInfoW` 不带 `SHGFI_USEFILEATTRIBUTES` 时会**真实解析**路径。
+/// 对 `\\attacker\share\x.exe` 这种 UNC 路径，Windows 会去连 SMB 并做 NTLM 认证 ——
+/// 于是「打开链接页」这个动作就变成了「把当前用户的 NetNTLM 响应发给攻击者指定的主机」，
+/// 可以离线破解或做中继。
+///
+/// 链接目标是完全自由的字符串（可以从别人给的备份里导进来），
+/// 而链接页**渲染即自动提取图标、不需要任何点击**，所以这一步是零点击可达的，
+/// 必须在调用 Shell 之前拦住。
+///
+/// 顺带的好处：不可达主机不再让 `SHGetFileInfoW` 阻塞到 SMB 超时（几十秒）拖住界面。
+///
+/// # 为什么不做「映射网络驱动器」的检查
+///
+/// 那需要 `GetDriveTypeW` + `DRIVE_REMOTE`，而该常量在这个版本的 windows-sys 里位于
+/// `Win32::System::WindowsProgramming` —— 为一个判断引入整个绑定模块不划算。
+/// 更要紧的是**它不是攻击者可控的**：盘符映射是用户自己的配置，
+/// 攻击者无法凭空让 `Z:` 指向他的服务器。UNC 才是唯一的零点击通道。
+fn touches_network(path: &str) -> bool {
+    let p = path.trim();
+
+    // UNC：`\\server\share\...`、`\\?\UNC\server\share`，以及正斜杠写法
+    if p.starts_with("\\\\") || p.starts_with("//") {
+        return true;
+    }
+
+    // 带协议头的 URL（http://、ftp://…）：Shell 同样会去连网络。
+    // 前端对 `kind === "url"` 已经跳过，但链接类型本身也能被备份文件改掉，
+    // 所以这里必须自己再挡一次，不能依赖前端的判断。
+    // Windows 文件名里不可能出现 `:`（除盘符），所以这个子串不会误伤本地路径。
+    if p.contains("://") {
+        return true;
+    }
+
+    false
 }
 
 /// # Safety
@@ -301,5 +346,37 @@ mod tests {
         // 4096 / 3 = 1365 组余 1 字节，所以 1366*4 = 5464 字符
         assert_eq!(encoded.len(), 5464);
         assert!(encoded.ends_with("=="), "4096 不能被 3 整除，末尾应有补位");
+    }
+
+    #[test]
+    fn unc_路径会被判定为网络路径() {
+        // 这一条守的是「导入别人的备份 → 打开链接页 → 自动向攻击者主机做 NTLM 认证」。
+        // 判定必须覆盖各种写法，漏一种就等于没拦。
+        for bad in [
+            r"\\attacker\share\x.exe",
+            r"\\?\UNC\attacker\share\x.exe",
+            r"\\10.0.0.1\c$\Windows\notepad.exe",
+            "//attacker/share/x.exe",
+            r"  \\attacker\share\x.exe  ", // 前后空格不该让它绕过
+            "http://attacker/x.ico",
+            "https://attacker/x.exe",
+            "ftp://attacker/x.exe",
+        ] {
+            assert!(touches_network(bad), "必须拦住：{bad}");
+        }
+    }
+
+    #[test]
+    fn 普通本地路径不会被误判成网络路径() {
+        // 误判的代价是"图标不显示了"，所以也要钉住正常路径
+        for good in [
+            r"C:\Windows\notepad.exe",
+            r"D:\software\浮光\fuguang.exe",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "notepad.exe",
+            "",
+        ] {
+            assert!(!touches_network(good), "不该拦住：{good}");
+        }
     }
 }

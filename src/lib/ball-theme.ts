@@ -30,8 +30,6 @@ export interface BallTheme {
   mark: string;
   /** 描边颜色。浅色球放在浅色桌面上全靠它分得开。 */
   border: string;
-  /** 投影。 */
-  shadow: string;
 }
 
 export const BALL_THEMES: BallTheme[] = [
@@ -41,8 +39,6 @@ export const BALL_THEMES: BallTheme[] = [
     background: "#ffffff",
     mark: "#1d4ed8",
     border: "rgba(0, 0, 0, 0.14)",
-    // 白球在白色桌面上几乎融为一体，所以投影要比深色球重一些
-    shadow: "0 2px 10px rgba(0, 0, 0, 0.26), 0 1px 3px rgba(0, 0, 0, 0.14)",
   },
   {
     id: "soft-blue",
@@ -50,7 +46,6 @@ export const BALL_THEMES: BallTheme[] = [
     background: "linear-gradient(135deg, #7fb2ff 0%, #4a86e8 100%)",
     mark: "#ffffff",
     border: "rgba(255, 255, 255, 0.55)",
-    shadow: "0 2px 10px rgba(0, 0, 0, 0.24)",
   },
   {
     id: "graphite",
@@ -58,7 +53,6 @@ export const BALL_THEMES: BallTheme[] = [
     background: "linear-gradient(135deg, #5a6070 0%, #2e323c 100%)",
     mark: "#ffffff",
     border: "rgba(255, 255, 255, 0.32)",
-    shadow: "0 2px 10px rgba(0, 0, 0, 0.32)",
   },
   {
     id: "dark",
@@ -66,7 +60,6 @@ export const BALL_THEMES: BallTheme[] = [
     background: "linear-gradient(135deg, #3a4356 0%, #1b2130 100%)",
     mark: "#ffffff",
     border: "rgba(255, 255, 255, 0.28)",
-    shadow: "0 2px 10px rgba(0, 0, 0, 0.34)",
   },
   {
     id: "purple",
@@ -74,7 +67,6 @@ export const BALL_THEMES: BallTheme[] = [
     background: "linear-gradient(135deg, #9b7bff 0%, #5b3fc4 100%)",
     mark: "#ffffff",
     border: "rgba(255, 255, 255, 0.5)",
-    shadow: "0 2px 10px rgba(0, 0, 0, 0.26)",
   },
   {
     id: "teal",
@@ -82,7 +74,6 @@ export const BALL_THEMES: BallTheme[] = [
     background: "linear-gradient(135deg, #4fd1c5 0%, #0e9384 100%)",
     mark: "#ffffff",
     border: "rgba(255, 255, 255, 0.5)",
-    shadow: "0 2px 10px rgba(0, 0, 0, 0.26)",
   },
   {
     id: "classic-blue",
@@ -90,7 +81,6 @@ export const BALL_THEMES: BallTheme[] = [
     background: "linear-gradient(135deg, #6aa8ff 0%, #2b4fa0 100%)",
     mark: "#ffffff",
     border: "rgba(255, 255, 255, 0.55)",
-    shadow: "0 2px 10px rgba(0, 0, 0, 0.28)",
   },
 ];
 
@@ -114,5 +104,4 @@ export function applyBallTheme(id: string): void {
   style.setProperty("--ball-bg", theme.background);
   style.setProperty("--ball-mark", theme.mark);
   style.setProperty("--ball-border", theme.border);
-  style.setProperty("--ball-shadow", theme.shadow);
 }

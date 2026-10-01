@@ -140,15 +140,16 @@ textarea {
      这里的默认值对应"白底蓝标"，保证 JS 还没跑起来时也是对的。 */
   background: var(--ball-bg, #ffffff);
   border: 1px solid var(--ball-border, rgba(0, 0, 0, 0.14));
-  box-shadow: var(--ball-shadow, 0 2px 10px rgba(0, 0, 0, 0.26));
-  transition: transform 0.12s ease, box-shadow 0.12s ease;
+  /* 投影已去掉。球窗口内容区实测 136×56，而球体外径 54px，
+     上下只剩 1px 余量：任何模糊投影都会被窗口边缘齐平切断，
+     看起来像球左右各挂着一团黑影，所以改成只靠描边与桌面区分。 */
+  transition: transform 0.12s ease;
 }
 
 .ball:hover {
+  /* 悬停只放大，不再叠投影：原来这里额外加了一层 drop-shadow，
+     压在静止投影上会让人看到阴影变多、变深。 */
   transform: scale(1.06);
-  /* 悬停时把投影加大一档。不能直接改 --ball-shadow（那是配色的一部分），
-     所以在这里叠一层额外的投影。 */
-  filter: drop-shadow(0 3px 6px rgba(0, 0, 0, 0.22));
 }
 
 .ball:active {
@@ -426,6 +427,9 @@ textarea {
   flex-shrink: 0;
 }
 
+/* 列表密度。`--density` 由文本片段页按 Ctrl+滚轮的档位写在 .snip 根节点上，
+   默认 1。只缩放「间距与内边距」，不动字号——字号是设置页里那个
+   「界面字号」，两套混在一起用户就说不清自己调的是哪个了。 */
 .snip__list {
   flex: 1;
   min-height: 0;
@@ -433,7 +437,7 @@ textarea {
   padding: 0 10px 10px;
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: calc(7px * var(--density, 1));
 }
 
 .snip__empty {
@@ -449,7 +453,7 @@ textarea {
   background: var(--bg-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 8px 10px;
+  padding: calc(8px * var(--density, 1)) calc(10px * var(--density, 1));
 }
 
 .card:hover {
@@ -460,7 +464,7 @@ textarea {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-bottom: 4px;
+  margin-bottom: calc(4px * var(--density, 1));
 }
 
 .card__star {
@@ -490,16 +494,16 @@ textarea {
   color: var(--text-dim);
   line-height: 1.5;
   word-break: break-all;
-  margin-bottom: 5px;
+  margin-bottom: calc(5px * var(--density, 1));
 }
 
 .card__note {
   font-size: var(--fs-sm);
   color: var(--text-faint);
   line-height: 1.5;
-  padding-left: 7px;
+  padding-left: calc(7px * var(--density, 1));
   border-left: 2px solid var(--border-strong);
-  margin-bottom: 6px;
+  margin-bottom: calc(6px * var(--density, 1));
 }
 
 .card__actions {

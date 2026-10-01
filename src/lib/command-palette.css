@@ -1,0 +1,181 @@
+/* ============================================================
+   全局搜索命令面板（Ctrl+K）
+   颜色一律取自 styles.css 的 :root 变量，深浅主题切换时才不会漏改。
+   ============================================================ */
+
+.palette-layer {
+  position: fixed;
+  /* `top` 由组件量出「标题栏 + 页签栏」的实际高度后内联设置 —— 别在这里写死，
+     也别用 `inset: 0`：那会压住页签栏，而 PanelWindow 明确承诺
+     "页签栏和标题栏仍然可见"。字号是用户可调的，硬编码的高度迟早对不上。 */
+  left: 0;
+  right: 0;
+  bottom: 0;
+  /* 要压过文件夹的「移动到…」选择器（z-index 50） */
+  z-index: 60;
+  display: flex;
+  justify-content: center;
+  /* 靠上而不是垂直居中：搜索框在顶部，视线落点和打字位置就一致 */
+  align-items: flex-start;
+  padding: 10px 14px 14px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.palette {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 380px;
+  max-height: 100%;
+  background: var(--bg-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.22);
+  /* 圆角要裁住里面的行，否则高亮行的直角会露在圆角外面 */
+  overflow: hidden;
+}
+
+.palette__search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.palette__searchicon {
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.palette__input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  outline: none;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-base);
+}
+
+.palette__input::placeholder {
+  color: var(--text-faint);
+}
+
+/* 出错时留在面板上：粘贴失败之类的情况必须让用户看到，
+   静默关掉会让人以为"点了没反应" */
+.palette__error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 11px;
+  background: rgba(217, 45, 32, 0.1);
+  color: var(--danger);
+  font-size: var(--fs-sm);
+  flex-shrink: 0;
+}
+
+.palette__list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 5px;
+}
+
+.palette__hint {
+  padding: 14px 10px;
+  color: var(--text-faint);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+}
+
+.palette__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.palette__row--on {
+  background: var(--accent-soft);
+}
+
+.palette__rowicon {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.palette__row--on .palette__rowicon {
+  color: var(--accent);
+}
+
+.palette__text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.palette__title {
+  font-size: var(--fs-md);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.palette__detail {
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.palette__kind {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-hover);
+  color: var(--text-faint);
+  font-size: var(--fs-2xs);
+}
+
+.palette__foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 11px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-raised);
+  flex-shrink: 0;
+}
+
+.palette__keys {
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+.palette__keys kbd {
+  display: inline-block;
+  padding: 0 4px;
+  margin: 0 1px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-solid);
+  font-family: inherit;
+  font-size: var(--fs-2xs);
+  color: var(--text-dim);
+}
+
+.palette__count {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+  flex-shrink: 0;
+}

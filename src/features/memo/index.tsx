@@ -25,11 +25,10 @@
  *    所以前端在收到提醒事件后必须自己把 `remindAt` 推到下一次，
  *    否则重复提醒只会响一次。
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   Bell,
   BellOff,
-  CalendarDays,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -49,14 +48,16 @@ import {
   formatDateHuman,
   formatMoment,
   formatUntil,
-  nextOccurrence,
   splitLocal,
   todayKey,
 } from "../../lib/datetime";
+import { advanceRepeats } from "../../lib/repeat-advance";
+import { useZoom } from "../../lib/zoom";
 import type { FeatureModule } from "../registry";
 
-import "./memo.css";
+import { DatePicker } from "./Calendar";
 
+import "./memo.css";
 /** 空笔记工厂。`date` 由调用方给定：新建时默认落在当前翻到的那一天。 */
 function emptyMemo(date: string): Memo {
   const now = Date.now();
@@ -121,70 +122,39 @@ export function MemoPanel() {
   const [feedback, setFeedback] = useState<string | null>(null);
 
   /**
-   * 正在推进的笔记 id。
+   * 定时重渲染，让界面跟着时间走。
    *
-   * 用 ref 而不是 state：它只是防重入的闸门，不需要触发渲染。
-   * 后端在提醒被推进后又广播一次 `memos` 变化，如果第二次事件到达时
-   * 前一次写回还没落地，就会拿着同一份旧数据再算一次下一次，
-   * 结果是提醒被连推两次（跳过一轮）。所以同一 id 只允许有一次推进在飞。
+   * `formatUntil()`（卡片上的「还有 N 分钟」）和 `todayKey()`（今天/昨天）都是
+   * **渲染期求值**的，没有重渲染来源就会冻住：卡片上一直写着"还有 5 分钟"，
+   * 跨午夜后昨天仍标着"今天"、「回到今天」按钮也一直是禁用状态。
+   * 而主面板是"隐藏不销毁"的（`lib.rs` 只对面板做 prevent_close），
+   * 所以重新打开也不会重算 —— 必须有个心跳。
+   *
+   * 30 秒够用：文案最细的粒度是分钟。定时器页用 100ms 是因为它要显示秒。
    */
-  const advancing = useRef<Set<string>>(new Set());
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    const id = window.setInterval(() => forceTick((n) => n + 1), 30_000);
+    return () => window.clearInterval(id);
+  }, []);
 
   /**
-   * 推进已经弹过窗的重复提醒。
+   * 列表密度缩放（Ctrl + 滚轮）。
    *
-   * 触发条件是 `firedFor === remindAt`，也就是 Rust 侧已经为当前这个
-   * `remindAt` 弹过窗了。此时把它推到下一次并把 `firedFor` 清空，
-   * 这样到下一次到点时条件会重新成立，重复提醒才能一直响下去。
-   *
-   * `repeat === "none"` 的笔记**刻意不动**：它只提醒一次，
-   * 保持 `firedFor` 等于 `remindAt` 反而是好事——Rust 侧的幂等判断
-   * 会因此永远不会为它再弹第二次。
+   * 备忘不做文件夹：它的组织维度是日期，再叠一层分类只会让
+   * 「今天记了什么」变难找。所以这里只有缩放。
    */
-  const advanceRepeats = async (list: Memo[]) => {
-    const due = list.filter(
-      (m) =>
-        m.remindAt !== null &&
-        m.firedFor !== null &&
-        m.firedFor === m.remindAt &&
-        m.repeat !== "none" &&
-        !advancing.current.has(m.id),
-    );
-    if (due.length === 0) return;
+  const zoom = useZoom("memo");
 
-    const saved: Memo[] = [];
-    for (const memo of due) {
-      advancing.current.add(memo.id);
-      try {
-        // `due` 是 filter 出来的新数组，TS 不会把里面的收窄带过来，
-        // 所以这里再取一次局部变量做判空。同时也兜住极端情况：
-        // 万一 remindAt 是 null（数据被手动改过），没有「上一次」可推，跳过就好。
-        const current = memo.remindAt;
-        if (current === null) continue;
-
-        const next = nextOccurrence(current, memo.repeat);
-        // 上面的 filter 已经排掉了 repeat === "none"，正常走不到这里；
-        // 这一步是让类型收窄，同时兜住数据被手动改成非法组合的情况。
-        if (next === null) continue;
-
-        // 再过一道 firstOccurrence：如果系统时钟被往前调过（或休眠很久后
-        // 一次醒来），算出来的「下一次」可能仍然在过去，直接写回去会立刻再弹一次。
-        const updated: Memo = {
-          ...memo,
-          remindAt: firstOccurrence(next, memo.repeat),
-          firedFor: null,
-          updatedAt: Date.now(),
-        };
-        await api.memoSave(updated);
-        saved.push(updated);
-      } catch (err) {
-        setError(String(err));
-      } finally {
-        // 失败也解除闸门：下次事件来了应该允许重试，否则这条提醒会永久卡住。
-        advancing.current.delete(memo.id);
-      }
-    }
-
+  /**
+   * 推进已经弹过窗的重复提醒，并把改动并回本地列表。
+   *
+   * 真正的逻辑在 `lib/repeat-advance.ts` —— 它必须也能在**备忘页没挂载**时跑，
+   * 否则默认页签是「文本片段」的用户会永远收不到第二次重复提醒。
+   * 这里只负责把结果合并进界面状态。
+   */
+  const advance = async (list: Memo[]) => {
+    const { saved } = await advanceRepeats(list, setError);
     if (saved.length === 0) return;
     // 只改动被推进的那几条，不整表覆盖：用户在推进期间新加的笔记不能丢。
     setMemos((prev) => prev.map((m) => saved.find((s) => s.id === m.id) ?? m));
@@ -213,7 +183,7 @@ export function MemoPanel() {
 
     void (async () => {
       const list = await load();
-      if (!disposed) await advanceRepeats(list);
+      if (!disposed) await advance(list);
 
       // onStateChanged 返回 Promise<UnlistenFn>，卸载时一定要调用它，
       // 否则面板被销毁后回调仍会触发，对着已卸载组件 setState。
@@ -221,7 +191,7 @@ export function MemoPanel() {
         if (disposed || !what.includes("memos")) return;
         void (async () => {
           const fresh = await load();
-          if (!disposed) await advanceRepeats(fresh);
+          if (!disposed) await advance(fresh);
         })();
       });
       // 订阅建立之前组件就卸载了的极端情况：立刻退订
@@ -296,7 +266,13 @@ export function MemoPanel() {
   const isToday = selected === todayKey();
 
   return (
-    <div className="memo">
+    <div
+      className="memo"
+      // 滚轮监听挂在整页根节点上：鼠标停在日期条、日历上时也该能缩放。
+      // 普通滚轮不受影响（见 lib/zoom.ts）。
+      ref={zoom.ref}
+      style={{ "--density": String(zoom.percent / 100) } as CSSProperties}
+    >
       {/* 日期条：整个功能的主入口，「翻日记」这个动作就靠它 */}
       <div className="memo__daybar">
         <button
@@ -332,18 +308,9 @@ export function MemoPanel() {
         </button>
       </div>
 
-      {/* 直接跳日期。原生 date 控件比自己搓日历可靠，也不引依赖 */}
+      {/* 直接跳日期。弹层是自绘的，为什么不用原生 date 控件见 Calendar.tsx */}
       <div className="memo__jump">
-        <CalendarDays size={13} className="memo__jumpicon" />
-        <input
-          className="field__input memo__jumpinput"
-          type="date"
-          value={selected}
-          onChange={(e) => {
-            // 用户清空日期框时 e.target.value 是空串，保留原选择而不是崩掉
-            if (e.target.value) setSelected(e.target.value);
-          }}
-        />
+        <DatePicker value={selected} onChange={setSelected} />
         <span className="memo__count">这一天 {visible.length} 条</span>
       </div>
 
@@ -463,6 +430,34 @@ function MemoEditor({
   const [remindDate, setRemindDate] = useState(initial?.date ?? "");
   const [remindTime, setRemindTime] = useState(initial?.time ?? "09:00");
   const [repeat, setRepeat] = useState<Repeat>(draft.repeat);
+
+  /**
+   * 让提醒预览跟着时间走。
+   *
+   * `firstOccurrence` 内部用 `Date.now()`，所以预览是**有时效**的：
+   * 编辑器开着跨过所填时刻之后，"将在 今天 HH:MM"就变成了错的
+   * （保存时 `submit` 会重新取值，实际排到明天）。`useMemo` 必须有个随时间
+   * 变化的依赖，否则这段缓存会把错误结论一直显示下去 ——
+   * 而预览存在的唯一目的就是"在保存之前把这件事告诉用户"。
+   */
+  const [nowTick, setNowTick] = useState(0);
+  useEffect(() => {
+    const id = window.setInterval(() => setNowTick((n) => n + 1), 30_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  /**
+   * 提醒预览：**算一次就够，别放在渲染里现算**。
+   *
+   * `firstOccurrence` 在"提醒日期是很久以前"时要跑满两万次循环，实测
+   * **56–96ms**（工作日规则最慢，见它的说明）。原来这段写在 JSX 的立即执行
+   * 函数里，于是**在正文 / 标题 / 标签里每敲一个字都要重付一次** —— 输入明显卡顿。
+   */
+  const preview = useMemo(() => {
+    const wanted = combineLocal(remindDate, remindTime || "09:00");
+    const actual = firstOccurrence(wanted, repeat);
+    return { actual, moved: actual !== wanted };
+  }, [remindDate, remindTime, repeat, nowTick]);
 
   const titleRef = useRef<HTMLInputElement>(null);
 
@@ -637,24 +632,15 @@ function MemoEditor({
 
         {reminderOn && (
           <div className="memo__preview">
-            {(() => {
-              // 实时预览，把「填的时刻已经过去」这件事在保存之前就告诉用户，
-              // 而不是等他保存完发现提醒跑到了明天而一头雾水。
-              const wanted = combineLocal(remindDate, remindTime || "09:00");
-              const actual = firstOccurrence(wanted, repeat);
-              const moved = actual !== wanted;
-              const rule = repeat !== "none" ? `，${repeatLabel(repeat)}` : "";
-              return (
-                <>
-                  <Bell size={12} />
-                  <span>
-                    {moved ? "这个时刻已经过了，改到 " : "将在 "}
-                    {formatMoment(actual)}
-                    {rule}提醒
-                  </span>
-                </>
-              );
-            })()}
+            {/* 实时预览，把「填的时刻已经过去」这件事在保存之前就告诉用户，
+                而不是等他保存完发现提醒跑到了明天而一头雾水。
+                算法在 preview 那个 useMemo 里，别挪回渲染里。 */}
+            <Bell size={12} />
+            <span>
+              {preview.moved ? "这个时刻已经过了，改到 " : "将在 "}
+              {formatMoment(preview.actual)}
+              {repeat !== "none" ? `，${repeatLabel(repeat)}` : ""}提醒
+            </span>
           </div>
         )}
       </div>

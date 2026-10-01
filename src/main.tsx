@@ -7,8 +7,9 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 
-import { api } from "./lib/api";
+import { api, onStateChanged } from "./lib/api";
 import { applyBallTheme } from "./lib/ball-theme";
+import { advanceRepeatsOnce } from "./lib/repeat-advance";
 import { applyFontSize } from "./lib/ui-scale";
 import { AlertWindow } from "./windows/AlertWindow";
 import { BallWindow } from "./windows/BallWindow";
@@ -44,6 +45,26 @@ void api
   });
 
 /**
+ * 后台维护：把「已经弹过、且需要重复」的备忘推进到下一次提醒时刻。
+ *
+ * 必须放在这里 —— 每个窗口都会执行这段入口代码，而悬浮球窗口是常驻的。
+ *
+ * 原来这件事只在 `features/memo/index.tsx` 的挂载逻辑里做，但主面板**只挂载当前页签**，
+ * 默认页签是「文本片段」。于是用户不打开备忘页时：Rust 到点弹窗并记下
+ * `firedFor = remindAt`，却没有任何代码把 `remindAt` 推到下一次 ——
+ * 幂等判断从此永远成立，**重复提醒永久静默**，重启也不恢复。
+ *
+ * 数据推进是数据层的职责，不该由某个页面有没有被挂载来决定。
+ * 详见 `lib/repeat-advance.ts`。
+ */
+void advanceRepeatsOnce();
+void onStateChanged((what) => {
+  if (what.includes("memos")) void advanceRepeatsOnce();
+}).catch(() => {
+  /* 订阅不上只影响这条后台推进，不该影响界面 */
+});
+
+/**
  * 全局关掉 WebView2 自带的右键菜单。
  *
  * 桌面软件里弹出「刷新 / 另存为 / 打印 / 检查」这套浏览器菜单非常出戏，
@@ -59,6 +80,28 @@ document.addEventListener(
     e.preventDefault();
   },
   { capture: true },
+);
+
+/**
+ * 关掉 WebView2 自带的「Ctrl + 滚轮缩放整个界面」。
+ *
+ * 桌面软件里没有"网页缩放"这个概念，而且那个缩放**没有菜单可以还原**——
+ * 用户不小心按到 Ctrl 滚一下，整个界面就变大或变小且再也回不去，
+ * 只能去翻 WebView2 的数据目录，看起来就像软件坏了。
+ *
+ * 更要紧的是：浮光自己用 Ctrl + 滚轮做页签缩放（见 `lib/zoom.ts`）。
+ * 各处实现不同步的话，同一个手势在有的页签缩放内容、在别的页签
+ * 缩放整个界面，行为就没法解释了。所以这里全局拦掉，
+ * 由需要它的页签自己在容器上接管。
+ *
+ * 同样必须在**捕获阶段**：默认行为发生在冒泡之前。
+ */
+document.addEventListener(
+  "wheel",
+  (e) => {
+    if (e.ctrlKey) e.preventDefault();
+  },
+  { capture: true, passive: false },
 );
 
 const container = document.getElementById("root");

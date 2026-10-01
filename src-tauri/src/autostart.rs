@@ -66,26 +66,53 @@ fn open_run_key(create: bool) -> Result<HKEY, String> {
     Ok(hkey)
 }
 
+/// 开发模式（debug 构建）下拒绝开启自启时给出的说明。
+///
+/// 这段话会原样出现在设置页的错误提示里，所以要同时讲清「为什么」和「怎么办」。
+///
+/// 为什么必须拒绝：debug 构建**不内嵌前端**，它的窗口地址是 `tauri.conf.json`
+/// 里的 `devUrl`（`http://127.0.0.1:4173`），也就是 Vite 开发服务器。
+/// 开机自启发生在登录那一刻，那时开发服务器根本不在，WebView2 拿不到页面，
+/// 于是小球和面板里显示的都是浏览器的「无法访问此页面」——
+/// 这正是用户实测踩到的那个坑，光靠设置页写一行小字提示挡不住。
+const DEV_BUILD_REFUSAL: &str = "开发模式（调试版）不能设为开机自启：\
+调试版没有把界面打包进 exe，运行时要去连本机的开发服务器 127.0.0.1:4173；\
+开机时那个服务器不在，小球和面板里只会显示浏览器的「无法访问此页面」。\
+请改用正式版 exe（先跑一次 2-重新编译.bat，产物在 src-tauri\\target\\release\\fuguang.exe）再开启自启。";
+
 /// 设置开机自启。
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
+    // 关闭永远允许：用户可能正被一个写坏了的启动项困住，必须能自救。
+    if enabled && cfg!(debug_assertions) {
+        return Err(DEV_BUILD_REFUSAL.into());
+    }
+
+    // 先把**可能失败**的准备工作做完，再打开注册表键。
+    //
+    // 不能把 `current_exe_path()?` 放进下面那个分支里：它一旦失败会直接返回，
+    // 跳过 `RegCloseKey`，泄漏一个 HKEY。凡是"已经拿到资源、后面还有可能 `?` 返回"
+    // 的写法都有这个毛病；把会失败的活提到取资源之前，是最省事的根治。
+    let value = if enabled {
+        // Run 键的值需要带引号，否则路径含空格时 Windows 会解析错
+        Some(wide(&format!("\"{}\"", current_exe_path()?)))
+    } else {
+        None
+    };
+
     let hkey = open_run_key(true)?;
     let name = wide(VALUE_NAME);
 
     let status = unsafe {
-        if enabled {
-            let exe = current_exe_path()?;
-            // Run 键的值需要带引号，否则路径含空格时 Windows 会解析错
-            let value = wide(&format!("\"{exe}\""));
-            RegSetValueExW(
+        match &value {
+            Some(value) => RegSetValueExW(
                 hkey,
                 name.as_ptr(),
                 0,
                 REG_SZ,
                 value.as_ptr() as *const u8,
                 (value.len() * std::mem::size_of::<u16>()) as u32,
-            )
-        } else {
-            RegDeleteValueW(hkey, name.as_ptr())
+            ),
+            None => RegDeleteValueW(hkey, name.as_ptr()),
         }
     };
 
@@ -99,25 +126,330 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// 查询当前是否已开启自启。
+/// 读取 Run 键里记录的启动命令行，去掉外层引号。
 ///
-/// 注意这是"注册表里有没有这个值"，不代表用户没在任务管理器里禁用它。
-/// 对设置页的开关来说这个语义足够。
-pub fn is_enabled() -> bool {
-    let Ok(hkey) = open_run_key(false) else {
-        return false;
-    };
+/// 值不存在、类型不对、或读失败都返回 `None`——对调用方来说这三者等价：
+/// 都表示"没有一条可用的自启记录"。
+fn read_registered_path(hkey: HKEY) -> Option<String> {
     let name = wide(VALUE_NAME);
+    // Run 键的值最长也就几百字符，1024 个 UTF-16 码元足够；
+    // 真被塞了更长的东西会返回 ERROR_MORE_DATA，这里按"没有记录"处理。
+    let mut buf = [0u16; 1024];
+    let mut len = (buf.len() * std::mem::size_of::<u16>()) as u32;
+
     let status = unsafe {
         RegQueryValueExW(
             hkey,
             name.as_ptr(),
             std::ptr::null(),
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut u8,
+            &mut len,
         )
     };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+
+    // len 是**字节**数，含结尾的 NUL，所以要除以 2 再裁掉那个 NUL
+    let units = (len as usize) / std::mem::size_of::<u16>();
+    let text = String::from_utf16_lossy(&buf[..units.min(buf.len())]);
+    let text = text.trim_end_matches('\0').trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+/// 从 Run 键的值里取出**可执行文件路径**。取不出来时返回 `None`。
+///
+/// # 为什么不能直接拿整个值去判断
+///
+/// Run 的值是**命令行**，不是路径。Windows 开机时按 `CreateProcess` 的规则解析它，
+/// 所以 `"C:\x\浮光\fuguang.exe" --minimized` 是**完全合法、能正常工作**的一条自启项。
+/// 而把整串丢给 `Path::exists()` 必然为假 —— 那就会把这条好记录当成"失效"删掉。
+///
+/// # 为什么"取不出来"要单独表达
+///
+/// 未加引号**且含空格**的写法是有歧义的：Windows 会从 `c:\program.exe` 开始
+/// 逐个尝试更长的前缀，所以 `C:\Program Files\浮光\fuguang.exe` 这样写**也能启动**，
+/// 而"第一个空白之前"只会得到 `C:\Program` —— 拿它去判存在必然为假，
+/// 于是把一条**指向浮光自己、且完全能用**的记录删掉。
+///
+/// 判不准就不要判：返回 `None`，调用方据此保守处理（不删、不认作已开启）。
+fn exe_path_of(command: &str) -> Option<&str> {
+    let s = command.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = s.strip_prefix('"') {
+        // 带引号：取引号内。引号没闭合、或引号内是空的 → 判不准
+        return rest.split('"').next().filter(|p| !p.is_empty());
+    }
+
+    // 未加引号却含空格 → 有歧义，见上面的说明
+    if s.contains(char::is_whitespace) {
+        return None;
+    }
+
+    Some(s)
+}
+
+/// 判断注册表里记的路径是不是就是当前这个 exe。
+///
+/// 大小写不敏感、正反斜杠等价、忽略结尾的分隔符：
+/// Windows 路径这几种写法都指向同一个文件，逐字节比较会把它们当成两个程序。
+fn same_exe(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        s.replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    }
+    !a.is_empty() && !b.is_empty() && norm(a) == norm(b)
+}
+
+/// 查询当前是否已开启自启。
+///
+/// **只认指向当前这个 exe 的记录**，而不是"值存不存在"。
+///
+/// 为什么：开发模式曾经把自己写进过 Run 键（指向 `target\debug\fuguang.exe`）。
+/// 如果只看值在不在，用户从正式版里打开设置页会看到开关是"已开启"，
+/// 但开机启动的其实是那个调试版——界面上什么都没错，实际启动的却是另一个程序。
+/// 这正是用户实测踩到的坑：以为自启的是正式版，开机出来的却是一个报错页。
+///
+/// 另外，用户可能在「任务管理器 → 启动」里手动禁用了这条记录，
+/// 那种情况这里读不到（记录仍在），语义上仍算"已开启"。
+pub fn is_enabled() -> bool {
+    let Ok(hkey) = open_run_key(false) else {
+        return false;
+    };
+    let registered = read_registered_path(hkey);
     unsafe { RegCloseKey(hkey) };
-    status == ERROR_SUCCESS
+
+    let Some(registered) = registered else {
+        return false;
+    };
+    match current_exe_path() {
+        // 比的是**可执行文件路径**，不是整条命令行 ——
+        // `"…\fuguang.exe" --minimized` 也是在启动我们这个 exe，不能算"未开启"。
+        // 取不出路径时返回 false（保守：宁可不认，也不要误报"已开启"）
+        Ok(me) => exe_path_of(&registered).is_some_and(|exe| same_exe(exe, &me)),
+        Err(_) => false,
+    }
+}
+
+/// 该不该把 Run 键里那条记录当成"失效"清掉。
+///
+/// 抽成纯函数是为了能直接单测 —— 这段判定决定了"删不删用户的注册表"，
+/// 收得够不够紧必须能被验证，而不是靠读一遍代码觉得没问题。
+///
+/// # 三道闸门，缺一不可
+///
+/// 1. 值名是我们自己的（固定为 `浮光`，只有本程序会写它）；
+/// 2. 它指向的**不是**当前这个 exe（比的是命令行里的可执行文件路径）；
+/// 3. 它指向的那个文件**确实不存在**，而且那看起来是个绝对路径。
+///
+/// 第 3 条那个"绝对路径"的附加条件是为了不误删第三方写的值：
+/// `%LOCALAPPDATA%\…` 这类待展开的写法我们没展开，`Path::exists()` 会判不存在，
+/// 但它其实能正常工作。只有形如 `X:\…` 或 `\\…` 的绝对路径才允许被判"失效"。
+///
+/// @param registered 注册表里记的**命令行**
+/// @param current_exe 当前进程的 exe 路径；拿不到时传 `None`（保守：不删）
+fn should_clean(registered: &str, current_exe: Option<&str>) -> bool {
+    // 取不出可执行文件路径（空值、引号没闭合、未加引号却含空格）→ 判不准，不碰
+    let Some(exe) = exe_path_of(registered) else {
+        return false;
+    };
+
+    // 指向我们自己 → 这是一条**好的**记录，当然不动
+    let is_us = current_exe.map(|me| same_exe(exe, me)).unwrap_or(false);
+    if is_us {
+        return false;
+    }
+
+    // 不是绝对路径（环境变量、相对路径、或者干脆是段垃圾）→ 不碰
+    if !looks_absolute(exe) {
+        return false;
+    }
+
+    // 目标文件还在 → 可能是另一个目录下的正式版，别碰别人的自启
+    !std::path::Path::new(exe).exists()
+}
+
+/// 看起来是不是一条**绝对路径**（`X:\…` 或 `\\server\…`）。
+///
+/// 只用来给"删不删"加一道保守闸门：判不准就当它不是绝对路径，于是不删。
+fn looks_absolute(path: &str) -> bool {
+    let b = path.as_bytes();
+    // 盘符形式：`C:\`
+    let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
+    // UNC 形式：`\\server\share`
+    let unc = path.starts_with("\\\\");
+    drive || unc
+}
+
+/// 清理「指向一个已经不存在的 exe」的自启项。启动时调一次。
+///
+/// # 为什么必须清理，而不是只把界面改对
+///
+/// 旧版调试版**没有**拒绝开启自启，所以它能把 `…\target\debug\fuguang.exe`
+/// 写进 Run 键；那份 exe 后来被删掉了。此时 `is_enabled()` 会（正确地）显示
+/// "未开启" —— 但**注册表里那条记录还在**，开机照样去启动一个不存在的文件。
+/// 用户看到开关是关的，根本不会去点它，于是这条坏记录永久留存，
+/// "开机出现一个报错的悬浮球"这个坑也就一直没被填掉。
+///
+/// 删除条件由 [`should_clean`] 决定，只有"不是我们自己、且目标文件确实不存在"
+/// 才删 —— 那种记录只会让开机多一次失败，删掉不会破坏任何能正常工作的配置。
+pub fn clean_stale_entry() {
+    let Ok(hkey) = open_run_key(false) else {
+        return;
+    };
+    let registered = read_registered_path(hkey);
+
+    let Some(registered) = registered else {
+        unsafe { RegCloseKey(hkey) };
+        return;
+    };
+
+    let me = current_exe_path().ok();
+    if !should_clean(&registered, me.as_deref()) {
+        unsafe { RegCloseKey(hkey) };
+        return;
+    }
+
+    let name = wide(VALUE_NAME);
+    let status = unsafe { RegDeleteValueW(hkey, name.as_ptr()) };
+    unsafe { RegCloseKey(hkey) };
+
+    if status == ERROR_SUCCESS {
+        eprintln!("[浮光] 已清理失效的开机自启项（目标已不存在）：{registered}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 路径比较忽略大小写与斜杠方向() {
+        // 同一份 exe 在注册表里可能是任意一种写法，逐字节比较会误判成"没开启"
+        assert!(same_exe(
+            r"D:\software\浮光\fuguang.exe",
+            r"d:/SOFTWARE/浮光/FUGUANG.EXE"
+        ));
+        assert!(same_exe(
+            r"D:\software\浮光\fuguang.exe",
+            r"D:\software\浮光\fuguang.exe\"
+        ));
+    }
+
+    #[test]
+    fn 指向别的程序时不算已开启() {
+        // 这一条是本次修复的核心：注册表里躺着**另一个** exe 的路径时，
+        // 设置页必须显示"未开启"，否则用户会以为自启的就是当前这个正式版
+        assert!(!same_exe(
+            r"D:\Project\codex\浮光\src-tauri\target\debug\fuguang.exe",
+            r"D:\software\浮光\fuguang.exe"
+        ));
+        assert!(!same_exe("", r"D:\software\浮光\fuguang.exe"));
+        assert!(!same_exe(r"D:\software\浮光\fuguang.exe", ""));
+    }
+
+    #[test]
+    fn 调试版不允许开启自启() {
+        // debug 构建下开启自启必须被拒绝，否则开机出来的是"无法访问此页面"。
+        // release 构建下这条断言不成立，所以只在 debug 下检查。
+        if cfg!(debug_assertions) {
+            let err = set_enabled(true).expect_err("调试版不该允许开启自启");
+            assert!(err.contains("开发模式"), "错误信息要能看懂：{err}");
+        }
+    }
+
+    #[test]
+    fn 失效自启项的判定收得很紧() {
+        // 这段判定决定"删不删用户的注册表"，三个分支都必须钉住 ——
+        // 删错一次就是把用户能用的自启搞没了。
+        let me = r"D:\software\浮光\fuguang.exe";
+        let existing = std::env::temp_dir().to_string_lossy().to_string();
+        let missing = std::env::temp_dir()
+            .join("fuguang-绝对不存在的文件-9f3a.exe")
+            .to_string_lossy()
+            .to_string();
+
+        // 指向我们自己 → 这是一条**好的**记录，绝不能删
+        assert!(!should_clean(me, Some(me)), "不能删自己的自启项");
+
+        // 指向别的 exe、但那个文件还在 → 可能是另一份安装，别碰别人的自启
+        assert!(!should_clean(&existing, Some(me)), "目标还在就不能删");
+
+        // 指向一个已经不存在的文件 → 这才是要清的坏记录
+        assert!(should_clean(&missing, Some(me)), "目标不存在就该清掉");
+
+        // 拿不到当前 exe 路径时保守处理：只要目标还在就不动
+        assert!(!should_clean(&existing, None));
+    }
+
+    #[test]
+    fn 带参数的自启项只要目标还在就不能删() {
+        // Run 的值是**命令行**，带参数完全合法。用当前测试进程自己的 exe
+        // 当一个"确实存在"的目标。
+        let existing_exe = std::env::current_exe()
+            .expect("有 exe 路径")
+            .to_string_lossy()
+            .to_string();
+        let with_args = format!("\"{existing_exe}\" --minimized");
+
+        // 老实现把整串当路径 → `Path::exists()` 判假 → 删掉一条**能正常工作**的自启项
+        assert!(
+            !should_clean(&with_args, None),
+            "带参数的值不能因为整串不是路径就被当成失效"
+        );
+
+        // 对照组：真的指向不存在的绝对路径时，才该清
+        assert!(should_clean(r"D:\绝对不存在的目录-9f3a\fuguang.exe", None));
+    }
+
+    #[test]
+    fn 非绝对路径的自启值一律不碰() {
+        // 环境变量写法我们没展开，`Path::exists()` 会判假 ——
+        // 但它其实能正常工作，不能因此删掉
+        assert!(!should_clean(r"%LOCALAPPDATA%\浮光\fuguang.exe", None));
+        // 相对路径、光秃秃的文件名、垃圾串，一律不碰
+        assert!(!should_clean(r"fuguang.exe", None));
+        assert!(!should_clean(r".\fuguang.exe", None));
+        assert!(!should_clean("", None));
+    }
+
+    #[test]
+    fn 从命令行里取可执行文件路径() {
+        // 带引号：取引号内（路径本身含空格时必须这么写）
+        assert_eq!(
+            exe_path_of(r#""C:\soft\浮光\fuguang.exe" --minimized"#),
+            Some(r"C:\soft\浮光\fuguang.exe")
+        );
+        assert_eq!(
+            exe_path_of(r#"  "C:\a b\f.exe"  /silent  "#),
+            Some(r"C:\a b\f.exe")
+        );
+        // 不带引号且无空格：整串就是路径
+        assert_eq!(
+            exe_path_of(r"C:\soft\fuguang.exe"),
+            Some(r"C:\soft\fuguang.exe")
+        );
+        // 不带引号却含空格 → **有歧义，判不准**（见 exe_path_of 的说明）
+        assert_eq!(exe_path_of(r"C:\Program Files\浮光\fuguang.exe"), None);
+        // 坏值一律判不准
+        assert_eq!(exe_path_of(""), None);
+        assert_eq!(exe_path_of("\""), None);
+    }
+
+    #[test]
+    fn 未加引号且含空格的自启值判不准_一律不删() {
+        // Windows 对未加引号的含空格路径会从 `c:\program.exe` 开始逐个尝试更长的
+        // 前缀，所以 `C:\Program Files\浮光\fuguang.exe` 这样写**能正常工作**。
+        // 按"第一个空白之前"取会得到 `C:\Program`（不存在）—— 照它判就会误删一条
+        // 指向浮光自己、且完全能用的自启项。
+        assert!(!should_clean(r"C:\Program Files\浮光\fuguang.exe", None));
+    }
 }

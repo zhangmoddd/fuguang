@@ -55,6 +55,7 @@ if errorlevel 1 goto :clean_target
 echo.
 echo  Removing src-tauri\target\ ...
 if exist "src-tauri\target" rmdir /s /q "src-tauri\target"
+if exist "src-tauri\target" goto :clean_failed
 echo  Done. It will be regenerated on the next build.
 goto :done
 
@@ -62,9 +63,19 @@ goto :done
 echo.
 echo  Removing src-tauri\target\ ...
 if exist "src-tauri\target" rmdir /s /q "src-tauri\target"
+if exist "src-tauri\target" goto :clean_failed
 echo  Removing node_modules\ ...
 if exist "node_modules" rmdir /s /q "node_modules"
+if exist "node_modules" goto :clean_failed
 echo  Done. Run the dev-mode script next, it reinstalls deps.
+goto :done
+
+:clean_failed
+echo.
+echo  [WARN] Some folders are still there - something is holding them.
+echo         Close the dev-mode window and any running fuguang.exe,
+echo         then run this script again.
+echo         Nothing was reported as freed.
 goto :done
 
 :done

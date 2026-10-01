@@ -13,6 +13,7 @@
 //! - [`models`]     数据模型（时间语义见该文件顶部）
 //! - [`storage`]    数据目录与 JSON 原子读写
 //! - [`state`]      内存状态与持久化
+//! - [`backup`]     全量数据的导出与导入
 //! - [`scheduler`]  后台调度线程：到点弹提醒
 //!
 //! 界面
@@ -22,6 +23,7 @@
 //! - [`commands`]   暴露给前端的命令
 
 mod autostart;
+mod backup;
 mod ballmenu;
 mod commands;
 mod hotkey;
@@ -55,6 +57,7 @@ pub fn run() {
             commands::show_ball,
             commands::quit_app,
             commands::set_always_on_top,
+            commands::save_ball_pos,
             // 剪贴板
             commands::paste_text,
             commands::copy_text,
@@ -79,6 +82,14 @@ pub fn run() {
             commands::open_target,
             commands::reveal_path,
             commands::link_icon,
+            commands::classify_paths,
+            // 文件夹（链接 / 文本片段 / 计时器共用）
+            commands::folders_list,
+            commands::folder_save,
+            commands::folder_remove,
+            // 备份
+            commands::export_all,
+            commands::import_all,
             // 设置
             commands::settings_get,
             commands::settings_save,
@@ -95,6 +106,12 @@ pub fn run() {
             // 先把数据加载进内存。必须在创建窗口之前完成：
             // 前端一挂载就会调 timers_list / memos_list，那时状态必须已经就绪。
             app.manage(state::Store::load(&handle));
+
+            // 清理「指向一个已经不存在的 exe」的自启项。
+            // 不清理的话：设置页显示"未开启"（路径对不上），但注册表里那条记录
+            // 还在，开机照样去启动一个不存在的文件 —— 用户看到开关是关的，
+            // 根本不会去点它，这条坏记录就永久留存了。
+            autostart::clean_stale_entry();
 
             // 创建悬浮球：这是软件的常驻入口，必须在 setup 阶段就出现
             windows::create_ball(&handle)?;

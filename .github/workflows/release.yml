@@ -46,6 +46,12 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
+      # 版本号三处必须一致，且 tag 必须等于版本号。
+      # 不加这步的话会静默产出「标题 v0.2.0、安装包 0.1.0」的 Release。
+      # tag 由 GitHub 自动注入 GITHUB_REF_TYPE / GITHUB_REF_NAME，无需传参。
+      - name: 校验版本号
+        run: node scripts/check-version.mjs
+
       - name: 类型检查
         run: npx tsc -b --force
 
@@ -95,7 +101,8 @@ jobs:
             - 主面板打开时会取得焦点，你原来程序里的光标会暂时看不见
               （粘贴那一刻会还回去，插入位置不受影响）
             - 数据未加密，敏感内容只有列表遮罩这一层视觉保护
-            - 暂无全局热键，只能通过小球或托盘唤出面板
+            - 卸载时安装器里的「删除应用程序数据」删的是 identifier 目录，
+              真正的数据在 `%APPDATA%\浮光`，要彻底清理请手动删掉那个文件夹
 
             完整列表见 [README 的「已知限制」](https://github.com/${{ github.repository }}#已知限制)。
 

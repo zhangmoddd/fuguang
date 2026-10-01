@@ -41,6 +41,10 @@
   flex-shrink: 0;
 }
 
+/* 列表密度。`--density` 由计时页按 Ctrl+滚轮的档位写在 .tmr 根节点上，
+   默认 1。卡片的内边距由 styles.css 的 .card 统一缩放，这里补上
+   卡片之间的间距和卡片内部的行距。只动间距、不动字号——字号是设置页里
+   那个「界面字号」，两套混在一起用户就说不清自己调的是哪个了。 */
 .tmr__list {
   flex: 1;
   min-height: 0;
@@ -48,7 +52,7 @@
   padding: 0 10px 10px;
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: calc(7px * var(--density, 1));
 }
 
 .tmr__empty {
@@ -66,7 +70,7 @@
 .tmr__card {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: calc(6px * var(--density, 1));
 }
 
 /* 运行中的卡片：左侧一条强调色 + 强调边框。

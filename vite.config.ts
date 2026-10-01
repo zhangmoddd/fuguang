@@ -20,7 +20,10 @@ export default defineConfig({
     target: "chrome105",
     minify: "esbuild",
     sourcemap: false,
-    // 单文件产物更容易被 Tauri 打包命中，减少碎片请求
+    // 调高警告阈值。前端整包 gzip 后不到 100 KB，
+    // 默认 500 KB 的阈值对我们没有意义。
+    // （注意：这里**不**产出单文件 —— 产物是 index.html + 一个 js + 一个 css，
+    //   Tauri 会把整个 dist 内嵌进 exe，不需要为请求数做优化。）
     chunkSizeWarningLimit: 1200,
   },
 });

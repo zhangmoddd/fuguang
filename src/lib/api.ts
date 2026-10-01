@@ -58,6 +58,12 @@ export interface Timer {
   runningSince: number | null;
   laps: number[];
   fired: boolean;
+  /**
+   * 所属文件夹 id，`null` 表示在顶层。
+   *
+   * 后加字段：老数据里没有，Rust 侧 `#[serde(default)]` 会补成 `null`。
+   */
+  folderId: string | null;
   createdAt: number;
 }
 
@@ -97,6 +103,12 @@ export interface LinkItem {
   args: string | null;
   kind: LinkKind;
   order: number;
+  /**
+   * 所属文件夹 id，`null` 表示在顶层。
+   *
+   * 后加字段：老数据里没有，Rust 侧 `#[serde(default)]` 会补成 `null`。
+   */
+  folderId: string | null;
   createdAt: number;
 }
 
@@ -106,6 +118,72 @@ export interface IconData {
   height: number;
   /** RGBA 字节的 base64，长度应为 width*height*4。 */
   rgbaBase64: string;
+}
+
+// ===============================================================
+// 文件夹
+// ===============================================================
+
+/**
+ * 一个文件夹，用来给条目分类。
+ *
+ * 三个页签（链接 / 文本片段 / 计时器）**共用同一个列表**，靠 `feature` 区分归属，
+ * 所以取回来之后要先用 {@link foldersOf} 过滤。备忘不做文件夹：它的组织维度是日期。
+ *
+ * 嵌套用 `parentId` 表达，`null` 就是顶层。
+ */
+export interface Folder {
+  id: string;
+  /** 属于哪个页签，取值是 `FeatureModule.id`（`links` / `snippets` / `timer`）。 */
+  feature: string;
+  name: string;
+  /** 备注。名字要短才排得下，想写清楚用途就写在这里。 */
+  note: string;
+  /** 父文件夹 id，`null` 表示在顶层。 */
+  parentId: string | null;
+  order: number;
+  createdAt: number;
+}
+
+// ===============================================================
+// 文本片段
+// ===============================================================
+
+/**
+ * 一条文本片段。
+ *
+ * 它是**前端自己拥有**的数据类型：不像计时器 / 备忘 / 链接那样有对应的 Rust
+ * 结构，而是走通用的 `read_data` / `write_data` 直接读写 `snippets.json`。
+ *
+ * 定义放在这里而不是 `features/snippets` 里，是为了让 `lib/` 下的模块
+ * （全局搜索、命令面板）能引用它，不必反过来依赖某个功能模块——
+ * `lib` 依赖 `features` 是倒过来的，以后拆模块会很难受。
+ */
+export interface Snippet {
+  id: string;
+  /** 标题，用于快速辨认。 */
+  title: string;
+  /** 实际会被粘贴出去的正文。 */
+  content: string;
+  /** 备注，方便以后想起来这条是干什么用的；也参与搜索。 */
+  note: string;
+  /** 标签，便于分类。 */
+  tags: string[];
+  /** 是否敏感（账号密码类）：列表里遮罩显示。 */
+  sensitive: boolean;
+  /** 是否收藏：收藏项排在最前面。 */
+  starred: boolean;
+  /** 使用次数，用于「常用」排序。 */
+  uses: number;
+  /**
+   * 所属文件夹 id，`null` 表示在顶层。
+   *
+   * 后加字段：老数据里没有这一项，读出来是 `undefined`，
+   * 过滤时会把「没有」和「指向不存在的文件夹」都当成顶层。
+   */
+  folderId: string | null;
+  createdAt: number;
+  updatedAt: number;
 }
 
 // ===============================================================
@@ -137,6 +215,18 @@ export interface Settings {
    * 可选值与渲染方式见 `lib/ball-theme.ts`。
    */
   ballTheme: string;
+  /**
+   * 各页签的缩放百分比（100 = 默认大小）。
+   *
+   * 键是页签 id（见 `features/registry.ts`）。用一个 map 而不是"每个页签一个字段"：
+   * 页签是刻意做成可扩展的，每加一个都改数据模型不合理。
+   * 认不出来的键会原样留着——不影响显示，也不会因为卸载了某个页签就丢掉用户的选择。
+   *
+   * 取值范围由 Rust 侧 `models::ZOOM_MIN` / `ZOOM_MAX` 夹取，
+   * 前端也夹一次（见 `lib/zoom.ts`）：设置还没保存、只是先预览的路径
+   * 不该因为一个越界值把界面搞坏。
+   */
+  zoom: Record<string, number>;
 }
 
 // ===============================================================
@@ -154,6 +244,14 @@ export const api = {
   showBallMenu: () => invoke<void>("show_ball_menu"),
   setAlwaysOnTop: (label: string, value: boolean) =>
     invoke<void>("set_always_on_top", { label, value }),
+  /**
+   * 记住悬浮球当前的位置（小球窗口在移动后防抖调用）。
+   *
+   * 存进单独的 `window.json`，**不写设置**：设置是整份覆盖写的，
+   * 小球和主面板两个窗口各持一份副本，互相会冲掉
+   * （见 Rust 侧 `windows::FILE_WINDOW` 的说明）。
+   */
+  saveBallPos: (x: number, y: number) => invoke<void>("save_ball_pos", { x, y }),
 
   // ---- 剪贴板 ----
   /**
@@ -189,6 +287,36 @@ export const api = {
     invoke<void>("open_target", { target, args: args ?? null }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   linkIcon: (path: string) => invoke<IconData | null>("link_icon", { path }),
+  /**
+   * 判断一批路径各自是什么（拖拽添加链接时用）。
+   *
+   * 前端拿不到「这是不是目录」——Tauri 的拖放事件只给路径字符串，
+   * 所以只能让 Rust 读一次文件系统属性。判不出来时返回 `file`，不会报错。
+   */
+  classifyPaths: (paths: string[]) => invoke<LinkKind[]>("classify_paths", { paths }),
+
+  // ---- 文件夹（链接 / 文本片段 / 计时器共用）----
+  foldersList: () => invoke<Folder[]>("folders_list"),
+  folderSave: (folder: Folder) => invoke<void>("folder_save", { folder }),
+  /**
+   * 删除文件夹。
+   *
+   * 只会把**子文件夹**挂到被删文件夹的父级；文件夹里的**条目**要由调用方
+   * 先改挂过去（见 `lib/folders-ui.tsx` 的 `useFolders`）。
+   * 原因见 Rust 侧 `commands::folder_remove` 的说明。
+   */
+  folderRemove: (id: string) => invoke<void>("folder_remove", { id }),
+
+  // ---- 备份 ----
+  /** 把全部数据导出成一个备份文件。路径由保存对话框给出。 */
+  exportAll: (path: string) => invoke<void>("export_all", { path }),
+  /**
+   * 从备份文件恢复全部数据。**会覆盖当前数据**，调用前必须先让用户确认。
+   *
+   * 导入完成后前端要把面板整页重载：各功能模块的状态都是导入前那份，
+   * 不重载会显示已经不存在的数据。
+   */
+  importAll: (path: string) => invoke<void>("import_all", { path }),
 
   // ---- 设置 ----
   settingsGet: () => invoke<Settings>("settings_get"),

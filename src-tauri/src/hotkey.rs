@@ -63,14 +63,18 @@ struct Request {
     reply: mpsc::Sender<Result<(), String>>,
 }
 
-/// 当前实际注册成功的组合文本。用于设置页显示真实状态。
-static CURRENT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+/// 当前**实际注册成功**的组合。用于设置页显示真实状态，也用于换键失败时回滚。
+///
+/// 存整个 `Combo` 而不是只存显示文本：换键要先注销旧的、再注册新的，
+/// 而新键可能注册失败（被别的程序占用）—— 那时必须能把旧键**原样注册回去**，
+/// 注册需要的是 modifiers + vk，光有 "Ctrl+Shift+Space" 这个字符串不够。
+static CURRENT: OnceLock<Mutex<Option<Combo>>> = OnceLock::new();
 /// 待处理请求队列。
 static PENDING: OnceLock<Mutex<Vec<Request>>> = OnceLock::new();
 /// 消息循环线程 id，用于唤醒它。
 static THREAD_ID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
 
-fn current_slot() -> &'static Mutex<Option<String>> {
+fn current_slot() -> &'static Mutex<Option<Combo>> {
     CURRENT.get_or_init(|| Mutex::new(None))
 }
 fn pending_slot() -> &'static Mutex<Vec<Request>> {
@@ -134,6 +138,12 @@ fn process_requests() {
 
 /// 注册一个热键。**只在热键线程上调用。**
 fn register(combo: &Combo) -> Result<(), String> {
+    // 先记下当前生效的，换键失败时要把它恢复回去
+    let previous = current_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
     // 先注销旧的。失败也无所谓——可能本来就没注册。
     unsafe { UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID) };
 
@@ -149,16 +159,47 @@ fn register(combo: &Combo) -> Result<(), String> {
     };
 
     if ok == 0 {
-        // RegisterHotKey 返回 0 最常见的两种原因：
-        // 组合键已被别的程序占用，或系统保留了这个组合（例如 Win+L）。
-        *current_slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
-        return Err(format!(
-            "「{}」注册失败，可能已被其他程序占用，或属于系统保留的组合。换一个试试。",
-            combo.label
-        ));
+        // 新键没注册上，**必须把旧键恢复回去**。
+        //
+        // 不恢复的后果很隐蔽：用户只是"换一个试试"，新键被占用注册失败，
+        // 原来能用的热键却已经被注销了 —— 而他不知道，会以为热键还开着、
+        // 一直按一直没反应。设置文件里还写着旧组合，所以重启后又会"看起来配了"。
+        let restored = previous
+            .as_ref()
+            .map(|prev| unsafe {
+                RegisterHotKey(
+                    std::ptr::null_mut(),
+                    HOTKEY_ID,
+                    prev.modifiers | MOD_NOREPEAT,
+                    prev.vk,
+                ) != 0
+            })
+            .unwrap_or(false);
+
+        let restored_label = if restored {
+            previous.as_ref().map(|p| p.label.clone())
+        } else {
+            None
+        };
+        *current_slot().lock().unwrap_or_else(|e| e.into_inner()) = if restored {
+            previous
+        } else {
+            None
+        };
+
+        return Err(match restored_label {
+            Some(label) => format!(
+                "「{}」注册失败，可能已被其他程序占用，或属于系统保留的组合。已恢复原来的「{label}」。",
+                combo.label
+            ),
+            None => format!(
+                "「{}」注册失败，可能已被其他程序占用，或属于系统保留的组合。换一个试试。",
+                combo.label
+            ),
+        });
     }
 
-    *current_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(combo.label.clone());
+    *current_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(combo.clone());
     Ok(())
 }
 
@@ -211,7 +252,8 @@ pub fn current() -> Option<String> {
     current_slot()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clone()
+        .as_ref()
+        .map(|c| c.label.clone())
 }
 
 // ===============================================================

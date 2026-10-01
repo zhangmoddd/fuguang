@@ -25,16 +25,18 @@
  * 4. **图标是装饰品，提取失败一律静默降级**成按 kind 区分的内置图标。
  *    Rust 侧也约定「任何失败都返回 null，绝不 panic」，两边口径一致。
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
   AppWindow,
   Check,
   FileText,
   Folder,
+  FolderInput,
   Globe,
   Link2,
   Pencil,
+  Terminal,
   Trash2,
   TriangleAlert,
   X,
@@ -43,7 +45,18 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
-import { api, newId, type IconData, type LinkItem, type LinkKind } from "../../lib/api";
+import {
+  api,
+  newId,
+  type Folder as FolderItem,
+  type IconData,
+  type LinkItem,
+  type LinkKind,
+} from "../../lib/api";
+import { FolderBar, FolderEditor, FolderPicker, FolderTiles, useFolders } from "../../lib/folders-ui";
+import { firstPath } from "../../lib/dialog";
+import { useDragSort } from "../../lib/drag-drop";
+import { useZoom } from "../../lib/zoom";
 import type { FeatureModule } from "../registry";
 
 import "./links.css";
@@ -235,21 +248,6 @@ function kindOfPath(path: string): LinkKind {
   return "file";
 }
 
-/**
- * 从文件选择框的返回值里取一个路径。
- *
- * 类型上可能是 `string | string[] | null`，新版本也可能是别的形状，
- * 所以参数收成 `unknown` 做运行时收窄——升级依赖时这里不会变成编译错误。
- */
-function firstPath(result: unknown): string | null {
-  if (typeof result === "string") return result;
-  if (Array.isArray(result)) {
-    const first: unknown = result[0];
-    return typeof first === "string" ? first : null;
-  }
-  return null;
-}
-
 /** 与 Rust 侧 `links_list` 保持一致的排序：order 小的在前，同 order 按创建时间。 */
 function sortLinks(list: LinkItem[]): LinkItem[] {
   return [...list].sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
@@ -291,6 +289,16 @@ export function LinksPanel() {
   const [dragAvailable, setDragAvailable] = useState(true);
   /** 拖拽悬停中，用来高亮整块区域。 */
   const [dragActive, setDragActive] = useState(false);
+  /** 文件夹弹层。`target` 为 `null` 表示新建，否则是改名/改备注。 */
+  const [folderEditor, setFolderEditor] = useState<{
+    open: boolean;
+    target: FolderItem | null;
+  }>({ open: false, target: null });
+  /** 正在「移动到…」的那条链接。 */
+  const [movingId, setMovingId] = useState<string | null>(null);
+  /** 正在编辑启动参数的那条链接。 */
+  const [argsId, setArgsId] = useState<string | null>(null);
+  const [argsText, setArgsText] = useState("");
 
   /**
    * 重命名是否已被取消（按了 Esc）。
@@ -301,6 +309,15 @@ export function LinksPanel() {
   const renameAborted = useRef(false);
   /** 正在重命名的 id（ref 版）。Enter 提交后紧跟的 blur 要靠它来判断「已经结束了，别再存一次」。 */
   const renamingRef = useRef<string | null>(null);
+
+  /**
+   * 启动参数编辑的两个闸门，和重命名同款。
+   *
+   * Esc 取消会让输入框卸载、紧接着触发一次 blur，而 blur 的语义是「保存」；
+   * 没有这个闸门的话「Esc 取消」会被随后的 blur 又存回去。
+   */
+  const argsAborted = useRef(false);
+  const argsEditingRef = useRef<string | null>(null);
 
   // ---- 数据 ----
 
@@ -319,6 +336,117 @@ export function LinksPanel() {
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  // ---- 文件夹与缩放 ----
+
+  /**
+   * 把本页签在 `from` 文件夹下的链接改挂到 `to`。
+   *
+   * 只在删除文件夹时被调用。条目为什么由前端搬而不是 Rust 一起做，
+   * 见 `lib/folders-ui.tsx` 与 `commands::folder_remove` 的说明。
+   */
+  const moveItems = useCallback(
+    async (from: string, to: string | null) => {
+      const updated = links
+        .filter((l) => l.folderId === from)
+        .map((l) => ({ ...l, folderId: to }));
+      for (const link of updated) await api.linkSave(link);
+      if (updated.length === 0) return;
+      setLinks((prev) => prev.map((l) => updated.find((u) => u.id === l.id) ?? l));
+    },
+    [links],
+  );
+
+  const folders = useFolders("links", { moveItems });
+  const zoom = useZoom("links");
+
+  /**
+   * 当前文件夹里该显示的链接。
+   *
+   * `folderId` 指向一个**不存在**的文件夹时按顶层处理：删文件夹中途失败、
+   * 或用户手改过 JSON 都会留下这种条目。不兜的话它们会从界面上消失，
+   * 而数据其实还在。
+   */
+  const visible = useMemo(() => {
+    const known = new Set(folders.mine.map((f) => f.id));
+    return links.filter((l) => {
+      const folder = l.folderId && known.has(l.folderId) ? l.folderId : null;
+      return folder === folders.currentId;
+    });
+  }, [links, folders.mine, folders.currentId]);
+
+  /** 每个文件夹里有几条链接，显示在文件夹卡片上（只算直接子级）。 */
+  const folderCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const l of links) {
+      if (l.folderId) counts[l.folderId] = (counts[l.folderId] ?? 0) + 1;
+    }
+    return counts;
+  }, [links]);
+
+  /**
+   * 把 `draggedId` 插到 `targetId` 前面或后面，并给这一层重新编号。
+   *
+   * `order` 只在**同一层内**比较，所以直接重排成 `0..n-1` 就行——
+   * 不同文件夹之间即使 order 撞车也不会同时显示，看不出问题。
+   */
+  const reorderLinks = async (draggedId: string, targetId: string, before: boolean) => {
+    if (draggedId === targetId) return;
+
+    const list = [...visible];
+    const from = list.findIndex((l) => l.id === draggedId);
+    if (from < 0) return;
+    const [moved] = list.splice(from, 1);
+    const at = list.findIndex((l) => l.id === targetId);
+    if (at < 0) return;
+    list.splice(before ? at : at + 1, 0, moved);
+
+    // 只写 order 真的变了的那些：整层重写一遍会产生一堆无意义的磁盘写入
+    const changed = list
+      .map((link, order) => ({ link, order }))
+      .filter(({ link, order }) => link.order !== order);
+    if (changed.length === 0) return;
+
+    try {
+      for (const { link, order } of changed) await api.linkSave({ ...link, order });
+      setLinks((prev) =>
+        prev.map((l) => {
+          const hit = changed.find((c) => c.link.id === l.id);
+          return hit ? { ...l, order: hit.order } : l;
+        }),
+      );
+      setNotice({ kind: "ok", text: "已重新排序" });
+    } catch (err) {
+      setNotice({ kind: "error", text: `排序失败：${errorText(err)}` });
+    }
+  };
+
+  /**
+   * 拖拽：条目之间排序，或者把条目放进文件夹；文件夹自己也能同级排序。
+   *
+   * 链接页是网格，所以"插到前面还是后面"看**横轴**（见 `useDragSort` 的 axis）。
+   * 用的是指针事件自绘，不是 HTML5 拖放——原因见 `lib/drag-drop.ts`。
+   */
+  const drag = useDragSort({
+    axis: "horizontal",
+    onDrop: (draggedId, draggedKind, spot) => {
+      if (draggedKind === "folder") {
+        // 拖文件夹时候选全是 item 类型（见 useDragSort 的 collect），
+        // 落点就是"插到那个文件夹的前面/后面"
+        if (spot.kind === "item") void folders.reorder(draggedId, spot.id, spot.before);
+        return;
+      }
+      if (spot.kind === "folder") {
+        const link = links.find((l) => l.id === draggedId);
+        if (link) void moveTo(link, spot.id);
+        return;
+      }
+      void reorderLinks(draggedId, spot.id, spot.before);
+    },
+    // 链接格子的本体就是一个按钮（点了就打开），所以不能沿用"排除所有按钮"的默认值，
+    // 只排除那一排悬停操作按钮和就地重命名/参数输入框
+    ignoreSelector: ".links__actions, input",
+  });
 
   // 成功提示看一眼就够，2.4 秒自动消失；
   // 错误提示不自动消失——Rust 返回的「找不到文件，可能已被移动或删除」需要时间读完。
@@ -364,6 +492,9 @@ export function LinksPanel() {
         target: item.target,
         args: null,
         kind: item.kind,
+        // 新加的链接落在**当前所在的那个文件夹**里。
+        // 这是下钻浏览的自然语义：进去了再添加，东西就该在那一层。
+        folderId: folders.currentId,
         // 同一次批量里依次 +1，保证顺序稳定（时间戳可能同毫秒，排不出先后）
         order: base + i,
         createdAt: now + i,
@@ -393,7 +524,7 @@ export function LinksPanel() {
         });
       }
     },
-    [links],
+    [links, folders.currentId],
   );
 
   /** 加一条。 */
@@ -405,6 +536,26 @@ export function LinksPanel() {
   // ---- 拖拽添加 ----
 
   /**
+   * 拖进来的路径：先让 Rust 判类型，再加。
+   *
+   * 原来只按扩展名猜，于是拖进来的**文件夹一律被当成「文件」**，图标不对
+   * （README 的已知限制里记着这条）。判类型要读文件系统属性，只有 Rust 能做。
+   */
+  const addPaths = useCallback(
+    async (paths: string[]) => {
+      if (paths.length === 0) return;
+      try {
+        const kinds = await api.classifyPaths(paths);
+        await addMany(paths.map((p, i) => ({ target: p, kind: kinds[i] ?? "file" })));
+      } catch {
+        // 判类型失败不该拦住添加：退回按扩展名猜，行为和以前完全一样
+        await addMany(paths.map((p) => ({ target: p, kind: kindOfPath(p) })));
+      }
+    },
+    [addMany],
+  );
+
+  /**
    * 拖放处理器放在 ref 里，只让「注册监听」的 effect 依赖空数组。
    *
    * 处理器需要用到最新的 links（算 order）。如果把它写进 effect 的依赖，
@@ -414,8 +565,7 @@ export function LinksPanel() {
   // 每次渲染后刷新 ref，处理器永远是最新那份闭包
   useEffect(() => {
     dropRef.current = (paths: string[]) => {
-      if (paths.length === 0) return;
-      void addMany(paths.map((p) => ({ target: p, kind: kindOfPath(p) })));
+      void addPaths(paths);
     };
   });
 
@@ -535,6 +685,19 @@ export function LinksPanel() {
     }
   };
 
+  /**
+   * 把一条链接移到别的文件夹。`null` 表示移到顶层。
+   *
+   * 有了这个，「分类」才是完整的：不然新链接只能落在建它时所在的文件夹里，
+   * 想把已有的东西归类只能删了重加。
+   */
+  const moveTo = async (link: LinkItem, folderId: string | null) => {
+    setMovingId(null);
+    // 选的就是它现在待的那一层：什么都不做，也省一次白写的磁盘
+    if ((link.folderId ?? null) === folderId) return;
+    await persist({ ...link, folderId }, `已移动「${link.name}」`);
+  };
+
   const startRename = (link: LinkItem) => {
     renameAborted.current = false;
     renamingRef.current = link.id;
@@ -564,10 +727,48 @@ export function LinksPanel() {
     await persist({ ...link, name }, "已重命名");
   };
 
+  const startArgs = (link: LinkItem) => {
+    argsAborted.current = false;
+    argsEditingRef.current = link.id;
+    setArgsId(link.id);
+    setArgsText(link.args ?? "");
+  };
+
+  const cancelArgs = () => {
+    argsAborted.current = true;
+    argsEditingRef.current = null;
+    setArgsId(null);
+  };
+
+  const commitArgs = async (link: LinkItem) => {
+    // Enter 提交之后输入框会卸载并触发 blur，这里挡掉第二次提交
+    if (argsEditingRef.current !== link.id) return;
+    argsEditingRef.current = null;
+    setArgsId(null);
+
+    if (argsAborted.current) {
+      argsAborted.current = false;
+      return;
+    }
+
+    const text = argsText.trim();
+    // 空串存成 null：模型里 null 表示「没有参数」。
+    // 存空串会让「到底有没有参数」变得没法判断，界面上也说不清。
+    const args = text === "" ? null : text;
+    if (args === (link.args ?? null)) return;
+    await persist({ ...link, args }, "已保存启动参数");
+  };
+
   // ---- 渲染 ----
 
   return (
-    <div className="links">
+    <div
+      className="links"
+      // 滚轮监听挂在整页根节点上而不是只挂网格：鼠标停在文件夹卡片、
+      // 添加栏上时也应该能缩放。普通滚轮不受影响（见 lib/zoom.ts）。
+      ref={zoom.ref}
+      style={{ "--tile-scale": String(zoom.percent / 100) } as CSSProperties}
+    >
       {/* 添加栏：四个入口平分一行 */}
       <div className="links__addbar">
         <button
@@ -657,7 +858,48 @@ export function LinksPanel() {
         </div>
       )}
 
+      {/* 当前路径。放在内容区正上方：先看到「我在哪」，再看这一层有什么 */}
+      <div className="folderzone">
+        <FolderBar
+          trail={folders.trail}
+          onEnter={folders.enter}
+          onCreate={() => setFolderEditor({ open: true, target: null })}
+        />
+
+        {folderEditor.open && (
+          <FolderEditor
+            target={folderEditor.target}
+            onSubmit={(name, note) =>
+              folderEditor.target
+                ? folders.update(folderEditor.target, name, note)
+                : folders.create(name, note)
+            }
+            onClose={() => setFolderEditor({ open: false, target: null })}
+          />
+        )}
+      </div>
+
+      {folders.error && (
+        <div className="links__notice links__notice--error">
+          <TriangleAlert size={13} />
+          <span>文件夹出错：{folders.error}</span>
+        </div>
+      )}
+
       <div className={`links__grid${dragActive ? " links__grid--drop" : ""}`}>
+        {/* 子文件夹排在链接前面，和资源管理器一致。
+            FolderTiles 返回的是一排卡片、不带外层容器，所以能直接当网格子项用 */}
+        <FolderTiles
+          folders={folders.children}
+          counts={folderCounts}
+          dropTargetId={drag.over?.kind === "folder" ? drag.over.id : null}
+          dragProps={(id) => drag.handleProps(id, "folder")}
+          onEnter={folders.enter}
+          onEdit={(f) => setFolderEditor({ open: true, target: f })}
+          onRemove={(f) => void folders.remove(f)}
+          variant="grid"
+        />
+
         {loading && <div className="links__hint">正在读取数据…</div>}
 
         {!loading && links.length === 0 && (
@@ -671,13 +913,55 @@ export function LinksPanel() {
           </div>
         )}
 
-        {links.map((link) => (
+        {/* 有链接、但当前这一层是空的：要说清"是这一层空"而不是"一条都没有"，
+            否则用户会以为数据丢了 */}
+        {!loading &&
+          links.length > 0 &&
+          visible.length === 0 &&
+          folders.children.length === 0 && (
+            <div className="links__empty">
+              <Folder size={26} />
+              <p>{folders.currentId ? "这个文件夹里还没有链接。" : "这一层还没有链接。"}</p>
+              <p>用上面的按钮添加，或者点文件夹卡片进去。</p>
+            </div>
+          )}
+
+        {visible.map((link) => (
           <article
             key={link.id}
-            className={`links__tile${busyId === link.id ? " links__tile--busy" : ""}`}
-            title={link.target}
+            className={[
+              "links__tile",
+              busyId === link.id ? "links__tile--busy" : "",
+              drag.draggingId === link.id ? "drag-source" : "",
+              drag.overClass(link.id),
+            ]
+              .filter(Boolean)
+              .join(" ")}
+            title={link.args ? `${link.target}\n参数：${link.args}` : link.target}
+            {...drag.itemProps(link.id)}
           >
-            {renamingId === link.id ? (
+            {argsId === link.id ? (
+              <div className="links__tile-body">
+                <LinkGlyph link={link} />
+                <input
+                  className="links__rename"
+                  autoFocus
+                  value={argsText}
+                  placeholder="启动参数"
+                  title="例如 --profile work；留空表示不带参数"
+                  onChange={(e) => setArgsText(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void commitArgs(link);
+                    if (e.key === "Escape") {
+                      // 同重命名：Esc 只取消这次输入，别触发主面板的「收起面板」
+                      e.stopPropagation();
+                      cancelArgs();
+                    }
+                  }}
+                  onBlur={() => void commitArgs(link)}
+                />
+              </div>
+            ) : renamingId === link.id ? (
               <div className="links__tile-body">
                 <LinkGlyph link={link} />
                 <input
@@ -699,9 +983,19 @@ export function LinksPanel() {
               </div>
             ) : (
               <button
+                // 拖拽抓手：这个按钮就是链接格子的可拖区域。
+                // **必须显式标出来** —— drag-drop 里有一条内置的控件底线会拦掉
+                // 所有按钮（就是为了防"点删除变成拖卡片"），不标的话链接页
+                // 整个就拖不动了。属性名与 lib/drag-drop.ts 的 DRAG_HANDLE_ATTR 一致。
+                data-drag-handle
                 className="links__tile-body links__open"
                 disabled={busyId === link.id}
-                onClick={() => void launch(link)}
+                onClick={() => {
+                  // 拖完松手会紧跟一次 click。不吞掉的话，把链接拖进文件夹之后
+                  // 会顺手把它打开——用户完全预料不到。
+                  if (drag.consumeClick()) return;
+                  void launch(link);
+                }}
                 title={`打开：${link.target}`}
               >
                 <LinkGlyph link={link} />
@@ -709,8 +1003,25 @@ export function LinksPanel() {
               </button>
             )}
 
-            {/* 悬停才出现：平时不抢视线，鼠标移上来才给这两个破坏性/修改性操作 */}
+            {/* 悬停才出现：平时不抢视线，鼠标移上来才给这几个修改性/破坏性操作 */}
             <div className="links__actions">
+              <button
+                className="iconbtn"
+                onClick={() => setMovingId(link.id)}
+                title="移动到文件夹"
+              >
+                <FolderInput size={12} />
+              </button>
+              {/* 启动参数只对程序和文件有意义；网址加了也没人消费 */}
+              {link.kind !== "url" && (
+                <button
+                  className="iconbtn"
+                  onClick={() => startArgs(link)}
+                  title="启动参数（例如 --profile work）"
+                >
+                  <Terminal size={12} />
+                </button>
+              )}
               <button className="iconbtn" onClick={() => startRename(link)} title="重命名">
                 <Pencil size={12} />
               </button>
@@ -728,6 +1039,19 @@ export function LinksPanel() {
 
       {dragAvailable && !loading && links.length > 0 && (
         <div className="links__footer">把文件或文件夹拖进面板也能添加</div>
+      )}
+
+      {movingId && (
+        <FolderPicker
+          folders={folders.mine}
+          current={links.find((l) => l.id === movingId)?.folderId ?? null}
+          onPick={(id) => {
+            const link = links.find((l) => l.id === movingId);
+            if (link) void moveTo(link, id);
+            else setMovingId(null);
+          }}
+          onClose={() => setMovingId(null)}
+        />
       )}
     </div>
   );

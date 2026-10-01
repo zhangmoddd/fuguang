@@ -91,8 +91,13 @@
   padding: 9px 10px 10px;
   display: grid;
   /* auto-fill + minmax：420px 的面板正好排 4 列，窗口被拉伸时自动变多，
-     不需要写任何 JS 去算列数 */
-  grid-template-columns: repeat(auto-fill, minmax(86px, 1fr));
+     不需要写任何 JS 去算列数。
+
+     86px 这个基数乘上 --tile-scale 就是「图标大小」缩放：
+     该变量由 index.tsx 按 Ctrl+滚轮的档位写在 .links 根节点上，
+     默认 1（不缩放）。文件夹卡片的高度也用同一个变量，
+     这样两者永远一样大。 */
+  grid-template-columns: repeat(auto-fill, minmax(calc(86px * var(--tile-scale, 1)), 1fr));
   gap: 6px;
   align-content: start;
 }
@@ -129,7 +134,8 @@
 .links__tile {
   position: relative;
   display: flex;
-  height: 92px;
+  /* 高度跟着 --tile-scale 一起变，否则放大图标后格子会被文字撑成细长条 */
+  height: calc(92px * var(--tile-scale, 1));
   background: var(--bg-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -153,8 +159,10 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 7px;
-  padding: 10px 6px;
+  /* 间距与内边距同样跟着缩放：只放大图标而留着原来的内边距，
+     小档位下文字会被挤出格子 */
+  gap: calc(7px * var(--tile-scale, 1));
+  padding: calc(10px * var(--tile-scale, 1)) calc(6px * var(--tile-scale, 1));
   background: transparent;
   border: 0;
   color: var(--text);
@@ -173,8 +181,9 @@
 }
 
 .links__glyph {
-  width: 40px;
-  height: 40px;
+  /* 这就是「图标大小」本身 */
+  width: calc(40px * var(--tile-scale, 1));
+  height: calc(40px * var(--tile-scale, 1));
   object-fit: contain;
   flex-shrink: 0;
   /* 图标不该吃掉点击：整块格子才是热区 */
@@ -183,7 +192,7 @@
 
 /* 内置图标比真实图标「重」，缩一圈视觉重量才相当（box-sizing 是 border-box，padding 往内收） */
 .links__glyph--builtin {
-  padding: 7px;
+  padding: calc(7px * var(--tile-scale, 1));
   color: var(--text-dim);
 }
 
@@ -238,11 +247,19 @@
 }
 
 .links__actions .iconbtn {
-  width: 20px;
-  height: 20px;
+  /* 跟着缩放一起变。不缩的话小档位下这一排按钮会比格子还宽，
+     而 .links__tile 是 overflow: hidden，最左边那个会被直接裁掉。 */
+  width: calc(20px * var(--tile-scale, 1));
+  height: calc(20px * var(--tile-scale, 1));
   /* 压在图标右上角，必须有实底，否则和图标叠在一起看不清 */
   background: var(--bg-solid);
   border: 1px solid var(--border);
+}
+
+/* lucide 的尺寸是写死在 svg 属性上的，CSS 能覆盖它 */
+.links__actions .iconbtn svg {
+  width: calc(12px * var(--tile-scale, 1));
+  height: calc(12px * var(--tile-scale, 1));
 }
 
 /* 覆盖通用 .iconbtn:hover 的透明底：这里要的是实底，否则会透出下面的图标 */

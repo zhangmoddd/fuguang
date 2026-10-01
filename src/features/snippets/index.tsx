@@ -10,13 +10,14 @@
  * - 敏感条目在列表里默认遮罩成圆点，悬停才显示，防止录屏或旁人扫到
  * - 不做加密（避免用户忘密码后数据永久无法恢复），只做视觉遮罩
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   Check,
   Clipboard,
   Copy,
   Eye,
   EyeOff,
+  FolderInput,
   Pencil,
   Plus,
   Search,
@@ -26,35 +27,23 @@ import {
   X,
 } from "lucide-react";
 
-import { api, type PasteOutcome } from "../../lib/api";
+import { api, type Folder as FolderItem, type PasteOutcome, type Snippet } from "../../lib/api";
+import {
+  FolderBar,
+  FolderEditor,
+  FolderPicker,
+  FolderTiles,
+  useFolders,
+} from "../../lib/folders-ui";
+import { useDragSort } from "../../lib/drag-drop";
 import { newId, usePersistentState } from "../../lib/store";
+import { useZoom } from "../../lib/zoom";
 import type { FeatureModule } from "../registry";
-
-/** 一条文本片段。 */
-export interface Snippet {
-  id: string;
-  /** 标题，用于快速辨认。 */
-  title: string;
-  /** 实际会被粘贴出去的正文。 */
-  content: string;
-  /** 备注，方便以后想起来这条是干什么用的；也参与搜索。 */
-  note: string;
-  /** 标签，便于分类。 */
-  tags: string[];
-  /** 是否敏感（账号密码类）：列表里遮罩显示。 */
-  sensitive: boolean;
-  /** 是否收藏：收藏项排在最前面。 */
-  starred: boolean;
-  /** 使用次数，用于「常用」排序。 */
-  uses: number;
-  createdAt: number;
-  updatedAt: number;
-}
 
 const DATA_FILE = "snippets.json";
 
-/** 空片段工厂。 */
-function emptySnippet(): Snippet {
+/** 空片段工厂。新建时默认落在当前翻到的那个文件夹里。 */
+function emptySnippet(folderId: string | null = null): Snippet {
   const now = Date.now();
   return {
     id: newId(),
@@ -65,6 +54,7 @@ function emptySnippet(): Snippet {
     sensitive: false,
     starred: false,
     uses: 0,
+    folderId,
     createdAt: now,
     updatedAt: now,
   };
@@ -115,6 +105,13 @@ export function SnippetsPanel() {
   /** 哪些条目的遮罩被临时揭开。 */
   const [revealed, setRevealed] = useState<Set<string>>(new Set());
   const searchRef = useRef<HTMLInputElement>(null);
+  /** 文件夹弹层。`target` 为 `null` 表示新建，否则是改名/改备注。 */
+  const [folderEditor, setFolderEditor] = useState<{
+    open: boolean;
+    target: FolderItem | null;
+  }>({ open: false, target: null });
+  /** 正在「移动到…」的那条片段。 */
+  const [movingId, setMovingId] = useState<string | null>(null);
 
   // 打开面板就聚焦搜索框：这个功能 90% 的使用路径是「搜索 → 点击」
   useEffect(() => {
@@ -128,10 +125,54 @@ export function SnippetsPanel() {
     return () => window.clearTimeout(t);
   }, [feedback]);
 
-  const visible = useMemo(
-    () => sortSnippets(snippets.filter((s) => matches(s, query.trim()))),
-    [snippets, query],
+  // ---- 文件夹与缩放 ----
+
+  /**
+   * 把本页签在 `from` 文件夹下的片段改挂到 `to`。
+   *
+   * 只在删除文件夹时被调用。文本片段走的是通用的 JSON 文件（`usePersistentState`），
+   * 所以这里直接改本地状态即可，防抖写入会负责落盘。
+   */
+  const moveItems = useCallback(
+    async (from: string, to: string | null) => {
+      update((prev) =>
+        prev.map((s) => (s.folderId === from ? { ...s, folderId: to } : s)),
+      );
+    },
+    [update],
   );
+
+  const folders = useFolders("snippets", { moveItems });
+  const zoom = useZoom("snippets");
+
+  /**
+   * 当前文件夹里的片段。
+   *
+   * `folderId` 指向一个**不存在**的文件夹时按顶层处理：删文件夹中途失败、
+   * 或用户手改过 JSON 都会留下这种条目。不兜的话它们会从界面上消失，
+   * 而数据其实还在。
+   */
+  const inFolder = useMemo(() => {
+    const known = new Set(folders.mine.map((f) => f.id));
+    return snippets.filter((s) => {
+      const folder = s.folderId && known.has(s.folderId) ? s.folderId : null;
+      return folder === folders.currentId;
+    });
+  }, [snippets, folders.mine, folders.currentId]);
+
+  const visible = useMemo(
+    () => sortSnippets(inFolder.filter((s) => matches(s, query.trim()))),
+    [inFolder, query],
+  );
+
+  /** 每个文件夹里有几条片段，显示在文件夹卡片上（只算直接子级）。 */
+  const folderCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const s of snippets) {
+      if (s.folderId) counts[s.folderId] = (counts[s.folderId] ?? 0) + 1;
+    }
+    return counts;
+  }, [snippets]);
 
   /** 记录一次使用（次数 +1、更新时间刷新），用于排序。 */
   const bumpUse = (id: string) => {
@@ -148,11 +189,13 @@ export function SnippetsPanel() {
     bumpUse(s.id);
 
     if (outcome.ok) {
-      setFeedback(
-        outcome.target
-          ? `已粘贴到「${truncate(outcome.target, 18)}」`
-          : "已粘贴",
-      );
+      const base = outcome.target
+        ? `已粘贴到「${truncate(outcome.target, 18)}」`
+        : "已粘贴";
+      // ⚠️ 成功时也可能带回一条**必须让用户看到**的警告：剪贴板里原来是图片/文件，
+      // 或者这次没能还原成功 —— 那意味着他原来复制的东西已经没了。
+      // 只在失败分支读 `message` 的话，这条提示在成功路径上就是死代码。
+      setFeedback(outcome.message ? `${base}；${outcome.message}` : base);
     } else {
       // 降级路径：内容已经躺在剪贴板里了，明确告诉用户手动 Ctrl+V
       setFeedback(outcome.message ?? "已复制到剪贴板，请手动 Ctrl+V");
@@ -191,6 +234,40 @@ export function SnippetsPanel() {
     );
   };
 
+  /**
+   * 把一条片段移到别的文件夹。`null` 表示移到顶层。
+   *
+   * 刻意**不动 `updatedAt`**：排序里「最近更新优先」，而归类不是改内容，
+   * 一动时间戳就会把这条莫名其妙顶到列表最前面。
+   */
+  const moveTo = (s: Snippet, folderId: string | null) => {
+    setMovingId(null);
+    if ((s.folderId ?? null) === folderId) return;
+    update((prev) => prev.map((x) => (x.id === s.id ? { ...x, folderId } : x)));
+    setFeedback(`已移动「${s.title}」`);
+  };
+
+  /**
+   * 拖拽：把片段放进文件夹，以及文件夹自己同级排序。
+   *
+   * **片段之间不做手动排序**：这个列表的顺序是刻意自动排的
+   * （收藏优先 → 使用次数多优先 → 最近更新优先）。给某几条钉一个手动位置
+   * 会和那套语义打架——用户会说不清"为什么这条不动"。
+   * 所以这里用 `handleProps`（能拖）而不是 `itemProps`（能当排序落点）。
+   */
+  const drag = useDragSort({
+    axis: "vertical",
+    onDrop: (draggedId, draggedKind, spot) => {
+      if (draggedKind === "folder") {
+        if (spot.kind === "item") void folders.reorder(draggedId, spot.id, spot.before);
+        return;
+      }
+      if (spot.kind !== "folder") return;
+      const target = snippets.find((x) => x.id === draggedId);
+      if (target) moveTo(target, spot.id);
+    },
+  });
+
   const toggleReveal = (id: string) => {
     setRevealed((prev) => {
       const next = new Set(prev);
@@ -211,7 +288,13 @@ export function SnippetsPanel() {
   }
 
   return (
-    <div className="snip">
+    <div
+      className="snip"
+      // 滚轮监听挂在整页根节点上：鼠标停在搜索栏、文件夹卡片上时也该能缩放。
+      // 普通滚轮不受影响（见 lib/zoom.ts）。
+      ref={zoom.ref}
+      style={{ "--density": String(zoom.percent / 100) } as CSSProperties}
+    >
       {/* 搜索栏：整个功能的主入口 */}
       <div className="snip__searchbar">
         <Search size={14} className="snip__searchicon" />
@@ -231,10 +314,10 @@ export function SnippetsPanel() {
 
       <div className="snip__toolbar">
         <span className="snip__count">
-          共 {snippets.length} 条
+          {folders.currentId ? `本文件夹 ${inFolder.length} 条` : `共 ${snippets.length} 条`}
           {query && ` · 命中 ${visible.length} 条`}
         </span>
-        <button className="btn btn--primary" onClick={() => setEditing(emptySnippet())}>
+        <button className="btn btn--primary" onClick={() => setEditing(emptySnippet(folders.currentId))}>
           <Plus size={13} />
           新建
         </button>
@@ -249,10 +332,47 @@ export function SnippetsPanel() {
 
       {error && <div className="snip__error">数据读写异常：{error}</div>}
 
+      {/* 当前路径。放在列表上方：先看到「我在哪」，再看这一层有什么 */}
+      <div className="folderzone">
+        <FolderBar
+          trail={folders.trail}
+          onEnter={folders.enter}
+          onCreate={() => setFolderEditor({ open: true, target: null })}
+        />
+
+        {folderEditor.open && (
+          <FolderEditor
+            target={folderEditor.target}
+            onSubmit={(name, note) =>
+              folderEditor.target
+                ? folders.update(folderEditor.target, name, note)
+                : folders.create(name, note)
+            }
+            onClose={() => setFolderEditor({ open: false, target: null })}
+          />
+        )}
+      </div>
+
+      {folders.error && (
+        <div className="snip__error">文件夹出错：{folders.error}</div>
+      )}
+
       <div className="snip__list">
+        {/* 子文件夹排在片段前面，和资源管理器一致 */}
+        <FolderTiles
+          folders={folders.children}
+          counts={folderCounts}
+          dropTargetId={drag.over?.kind === "folder" ? drag.over.id : null}
+          dragProps={(id) => drag.handleProps(id, "folder")}
+          onEnter={folders.enter}
+          onEdit={(f) => setFolderEditor({ open: true, target: f })}
+          onRemove={(f) => void folders.remove(f)}
+          variant="list"
+        />
+
         {loading && <div className="snip__empty">正在读取数据…</div>}
 
-        {!loading && visible.length === 0 && (
+        {!loading && visible.length === 0 && folders.children.length === 0 && (
           <div className="snip__empty">
             {snippets.length === 0 ? (
               <>
@@ -260,8 +380,10 @@ export function SnippetsPanel() {
                 <br />
                 点右上角「新建」加一条，比如你的邮箱、常用地址、一段格式模板。
               </>
-            ) : (
+            ) : query ? (
               <>没有匹配「{query}」的片段。</>
+            ) : (
+              <>这个文件夹里还没有片段。</>
             )}
           </div>
         )}
@@ -269,7 +391,11 @@ export function SnippetsPanel() {
         {visible.map((s) => {
           const shown = s.sensitive && !revealed.has(s.id);
           return (
-            <article key={s.id} className="card">
+            <article
+              key={s.id}
+              className={`card${drag.draggingId === s.id ? " drag-source" : ""}`}
+              {...drag.handleProps(s.id)}
+            >
               <div className="card__head">
                 {s.starred && <Star size={12} className="card__star" fill="currentColor" />}
                 <span className="card__title">{s.title}</span>
@@ -313,6 +439,13 @@ export function SnippetsPanel() {
                 >
                   <Star size={13} fill={s.starred ? "currentColor" : "none"} />
                 </button>
+                <button
+                  className="iconbtn"
+                  onClick={() => setMovingId(s.id)}
+                  title="移动到文件夹"
+                >
+                  <FolderInput size={13} />
+                </button>
                 <button className="iconbtn" onClick={() => setEditing(s)} title="编辑">
                   <Pencil size={13} />
                 </button>
@@ -326,6 +459,19 @@ export function SnippetsPanel() {
           );
         })}
       </div>
+
+      {movingId && (
+        <FolderPicker
+          folders={folders.mine}
+          current={snippets.find((s) => s.id === movingId)?.folderId ?? null}
+          onPick={(id) => {
+            const target = snippets.find((s) => s.id === movingId);
+            if (target) moveTo(target, id);
+            else setMovingId(null);
+          }}
+          onClose={() => setMovingId(null)}
+        />
+      )}
     </div>
   );
 }

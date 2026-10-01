@@ -3,7 +3,10 @@
 //! 设计决策：小球 / 主面板 / 提醒弹窗是三个独立窗口，各自可以单独显示、隐藏、置顶。
 //! 好处是提醒弹窗不会把主面板一起拽出来，隐藏主面板也不会影响小球。
 
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+
+use crate::storage;
 
 /// 悬浮球窗口标签。
 pub const BALL: &str = "ball";
@@ -15,6 +18,85 @@ pub const PANEL: &str = "panel";
 /// 但窗口骨架和创建逻辑先放好，后续功能直接调用即可。
 /// 这里显式放行 dead_code，避免后来者看到警告顺手删掉这段已经写好的代码。
 pub const ALERT: &str = "alert";
+
+/// 窗口几何的持久化文件。
+///
+/// # 为什么不塞进 `settings.json`
+///
+/// **窗口几何是运行时状态，不是用户偏好。** 更要紧的是：小球和主面板是两个
+/// 独立窗口，都会写设置文件，而 `settings_save` 是**整份覆盖写**——
+/// 设置页手里那份是它打开时读的，小球拖完存了新位置之后，
+/// 用户在设置页随便改一项就会把位置冲回旧值。
+/// 分开一个文件，这类互相覆盖就不可能发生。
+const FILE_WINDOW: &str = "window.json";
+
+/// 需要跨重启记住的窗口几何。
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowState {
+    /// 悬浮球窗口左上角（**逻辑**像素）。
+    ///
+    /// 存逻辑像素而不是物理像素：物理像素在不同缩放比例的屏幕上不可比，
+    /// 换一台机器读回来就会跑到别的地方。
+    #[serde(default)]
+    pub ball_x: Option<f64>,
+    /// 见 [`WindowState::ball_x`]。
+    #[serde(default)]
+    pub ball_y: Option<f64>,
+}
+
+/// 校验一个待保存的悬浮球位置。
+///
+/// 抽成独立函数是为了能直接单测——`save_ball_position` 需要 `AppHandle`，
+/// 单测里造不出一个真的 Tauri 应用。
+///
+/// 负数**必须放行**：副屏摆主屏左边时 x 就是负的，把它当非法值会让
+/// 那半边屏幕的用户永远存不下位置。
+fn validate_position(x: f64, y: f64) -> Result<(), String> {
+    if !x.is_finite() || !y.is_finite() {
+        return Err("位置不是有效数字".into());
+    }
+    Ok(())
+}
+
+/// 读回持久化的窗口几何。文件不存在或损坏时返回默认值。
+fn load_window_state(app: &AppHandle) -> WindowState {
+    storage::read_json(app, FILE_WINDOW, WindowState::default())
+}
+
+/// 记住悬浮球当前的位置，供下次启动恢复。
+pub fn save_ball_position(app: &AppHandle, x: f64, y: f64) -> Result<(), String> {
+    validate_position(x, y)?;
+
+    let mut state = load_window_state(app);
+    state.ball_x = Some(x);
+    state.ball_y = Some(y);
+    storage::write_json(app, FILE_WINDOW, &state)
+}
+
+/// 把小球放回用户上次拖到的位置。
+///
+/// 返回 `false` 表示"没有可用记录"，调用方应该退回默认位置。
+/// 两种情况都会返回 `false`：
+/// 1. 从来没存过；
+/// 2. 存的位置**现在不在任何屏幕上**——用户拔掉了那块副屏、或者改了显示器排列。
+///    这种情况下硬摆过去，小球会落在屏幕外，用户根本够不着它。
+fn restore_ball_position(app: &AppHandle, ball: &WebviewWindow) -> bool {
+    let saved = load_window_state(app);
+    let (Some(x), Some(y)) = (saved.ball_x, saved.ball_y) else {
+        return false;
+    };
+
+    // 逻辑 → 物理，才能用 monitor_from_point 判断"这个点还在不在屏幕上"
+    let scale = ball.scale_factor().unwrap_or(1.0);
+    let px = (x * scale).round() as i32;
+    let py = (y * scale).round() as i32;
+    if monitor_at(app, px, py).is_none() {
+        return false;
+    }
+
+    ball.set_position(tauri::LogicalPosition::new(x, y)).is_ok()
+}
 
 /// 小球窗口尺寸（逻辑像素）。圆形，所以宽高一致。
 pub const BALL_SIZE: f64 = 56.0;
@@ -65,7 +147,10 @@ pub fn create_ball(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .visible(false)
         .build()?;
 
-    place_ball_at_default(app, &win);
+    // 优先回到用户上次拖到的位置；没有记录（或那块屏幕已经不在了）才用默认位置
+    if !restore_ball_position(app, &win) {
+        place_ball_at_default(app, &win);
+    }
     win.show()?;
     Ok(win)
 }
@@ -135,6 +220,15 @@ pub fn show_panel(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         return Ok(win);
     }
 
+    // 置顶与否由**设置**决定，不再硬编码 true。
+    // 硬编码的后果：用户在设置页明确关掉的「面板保持置顶」每次开机都被还原，
+    // 而设置文件里还写着 false —— 界面和实际行为互相打脸。
+    let always_on_top = {
+        let store = app.state::<crate::state::Store>();
+        let st = store.lock();
+        st.settings.panel_always_on_top
+    };
+
     let win = WebviewWindowBuilder::new(app, PANEL, WebviewUrl::App("index.html#/panel".into()))
         .title("浮光·主面板")
         .inner_size(PANEL_WIDTH, PANEL_HEIGHT)
@@ -143,7 +237,7 @@ pub fn show_panel(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .decorations(false)
         .transparent(true)
         .shadow(true)
-        .always_on_top(true)
+        .always_on_top(always_on_top)
         .skip_taskbar(true)
         .focused(true)
         .visible(false)
@@ -155,7 +249,16 @@ pub fn show_panel(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     Ok(win)
 }
 
-/// 让主面板出现在小球旁边，并保证不超出屏幕。
+/// 取包含指定物理坐标的那块显示器。
+///
+/// 多显示器下**不能用 `primary_monitor`**：小球被拖到副屏之后，
+/// 用主屏的尺寸去夹取坐标会把面板夹回主屏——
+/// 表现就是"点了小球，面板出现在另一个屏幕上"。
+fn monitor_at(app: &AppHandle, x: i32, y: i32) -> Option<tauri::Monitor> {
+    app.monitor_from_point(x as f64, y as f64).ok().flatten()
+}
+
+/// 让主面板出现在小球旁边，并保证不超出**小球所在的那块屏幕**。
 fn position_panel_near_ball(app: &AppHandle, panel: &WebviewWindow) {
     // 小球不存在时（理论上不会）就直接不定位，面板用系统默认位置出现
     let Some(ball) = app.get_webview_window(BALL) else {
@@ -174,29 +277,30 @@ fn position_panel_near_ball(app: &AppHandle, panel: &WebviewWindow) {
     let panel_w = (PANEL_WIDTH * scale) as i32;
     let panel_h = (PANEL_HEIGHT * scale) as i32;
 
-    let screen_w = app
-        .primary_monitor()
-        .ok()
-        .flatten()
-        .map(|m| m.size().width as i32)
-        .unwrap_or(1920);
+    // 显示器**可能不在原点**：副屏摆在主屏左边时它的 x 是负数。
+    // 所以四个边界都得用显示器自己的 position + size 算，不能从 0 起算。
+    let (screen_x, screen_y, screen_w, screen_h) = match monitor_at(app, ball_pos.x, ball_pos.y) {
+        Some(m) => (
+            m.position().x,
+            m.position().y,
+            m.size().width as i32,
+            m.size().height as i32,
+        ),
+        // 拿不到显示器信息时退回保守值：宁可位置不理想，也不要算出屏幕外
+        None => (0, 0, 1920, 1080),
+    };
 
     // 优先放小球左侧；左边放不下就放右侧
     let mut x = ball_pos.x - panel_w - gap;
-    if x < 0 {
+    if x < screen_x {
         x = ball_pos.x + ball_size.width as i32 + gap;
     }
-    // 左右都放不下时贴边
-    x = x.clamp(0, (screen_w - panel_w).max(0));
+    let max_x = (screen_x + screen_w - panel_w).max(screen_x);
+    x = x.clamp(screen_x, max_x);
 
-    // 垂直方向与小球对齐，但不超出屏幕
-    let screen_h = app
-        .primary_monitor()
-        .ok()
-        .flatten()
-        .map(|m| m.size().height as i32)
-        .unwrap_or(1080);
-    let y = ball_pos.y.clamp(0, (screen_h - panel_h).max(0));
+    // 垂直方向与小球对齐，但不超出这块屏幕
+    let max_y = (screen_y + screen_h - panel_h).max(screen_y);
+    let y = ball_pos.y.clamp(screen_y, max_y);
 
     let _ = panel.set_position(tauri::PhysicalPosition::new(x, y));
 }
@@ -278,4 +382,44 @@ fn urlencode(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 副屏在主屏左边时的负坐标必须被接受() {
+        // 这是最容易写错的一条：把 x < 0 当成非法值，会让副屏摆在主屏左边的
+        // 用户永远存不下位置——每次开机小球都跳回主屏右侧
+        assert!(validate_position(-120.5, 300.0).is_ok());
+        assert!(validate_position(0.0, 0.0).is_ok());
+        assert!(validate_position(1920.0, 1080.0).is_ok());
+    }
+
+    #[test]
+    fn 非有限的位置会被拒绝() {
+        // 写进去之后下次启动会把窗口摆到屏幕外，表现是"小球不见了"，
+        // 而用户没有任何办法把它找回来
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(validate_position(bad, 10.0).is_err(), "{bad} 应该被拒绝");
+            assert!(validate_position(10.0, bad).is_err(), "{bad} 应该被拒绝");
+        }
+    }
+
+    #[test]
+    fn 窗口几何是驼峰命名且缺字段时有默认值() {
+        let state = WindowState {
+            ball_x: Some(-10.0),
+            ball_y: Some(20.0),
+        };
+        let json = serde_json::to_string(&state).expect("序列化");
+        assert!(json.contains("\"ballX\""), "实际：{json}");
+        assert!(!json.contains("ball_x"), "不该出现下划线命名");
+
+        // 老文件（或将来只存了别的窗口）缺这两个字段时不能解析失败
+        let empty: WindowState = serde_json::from_str("{}").expect("必须能解析");
+        assert_eq!(empty.ball_x, None);
+        assert_eq!(empty.ball_y, None);
+    }
 }

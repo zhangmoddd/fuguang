@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "./api";
+import { WriteCoordinator } from "./write-coordinator";
 
 /** 写入防抖延迟。太短会频繁写盘，太长会在异常退出时丢更多数据。 */
 const WRITE_DEBOUNCE_MS = 400;
@@ -28,23 +29,61 @@ export function usePersistentState<T>(file: string, initial: T) {
 
   /** 最新的值，供 flush 使用，避免闭包捕获旧值。 */
   const latest = useRef<T>(initial);
-  /** 是否有未落盘的改动。 */
-  const dirty = useRef(false);
+  /** 写盘版本协调：解决"写盘飞行期间的新改动被误清"（见 write-coordinator.ts）。 */
+  const coord = useRef(new WriteCoordinator());
+  /** 本地是否发生过改动。回读磁盘时用它判断"能不能拿磁盘盖掉本地"。 */
+  const touched = useRef(false);
+  /** 连续写失败次数：给重试做退避，并设个上限（磁盘真写不了时不能一直撞）。 */
+  const failures = useRef(0);
   const timer = useRef<number | null>(null);
 
   /** 立即把当前值写入磁盘。 */
   const flush = useCallback(async () => {
-    if (!dirty.current) return;
+    const writing = coord.current.begin();
+    if (writing === null) {
+      // 没有待写内容，或者**已经有写盘在飞**。
+      //
+      // 这里**不能**顺手把定时器清掉：清了之后，万一在飞的那次写失败
+      // （它只调 fail()、不 commit），就再没有任何东西安排下一次写盘了 ——
+      // 用户若就此不再改动并退出，最后一次编辑会永久丢失。
+      return;
+    }
+
     if (timer.current !== null) {
       window.clearTimeout(timer.current);
       timer.current = null;
     }
+
     try {
       await api.writeData(file, latest.current);
-      dirty.current = false;
       setError(null);
+      failures.current = 0;
+      // 写盘期间用户又改了：必须立刻再写一次。
+      // 旧实现这里是无条件 `dirty = false`，那一次改动就永远落不了盘 ——
+      // 而且 beforeunload / 窗口隐藏的兜底落盘走的也是这个函数，同样会早退。
+      if (coord.current.commit(writing)) {
+        timer.current = window.setTimeout(() => {
+          void flush();
+        }, 0);
+      }
     } catch (err) {
+      // 写失败：解除"在飞"标记但不动版本号，于是 dirty 保持为真
+      coord.current.fail();
       setError(String(err));
+
+      // 而且必须**自己再排一次**：此刻 dirty 为真、却没有任何定时器在等
+      // （`begin()` 早退那条路径已经把定时器清掉了）。只靠"下次 update 会排"
+      // 是不够的 —— 用户可能就此不再改动，直接从托盘退出。
+      // 加上限 + 递增间隔：磁盘真的写不了时不能每 400ms 撞一次。
+      if (failures.current < 3) {
+        failures.current += 1;
+        timer.current = window.setTimeout(
+          () => {
+            void flush();
+          },
+          WRITE_DEBOUNCE_MS * failures.current,
+        );
+      }
     }
   }, [file]);
 
@@ -55,7 +94,7 @@ export function usePersistentState<T>(file: string, initial: T) {
       try {
         const loaded = await api.readData<T>(file);
         if (cancelled) return;
-        if (loaded !== null && loaded !== undefined) {
+        if (loaded !== null && loaded !== undefined && !touched.current) {
           setValue(loaded);
           latest.current = loaded;
         }
@@ -77,7 +116,8 @@ export function usePersistentState<T>(file: string, initial: T) {
         const next =
           typeof updater === "function" ? (updater as (p: T) => T)(prev) : updater;
         latest.current = next;
-        dirty.current = true;
+        touched.current = true;
+        coord.current.markDirty();
 
         if (timer.current !== null) window.clearTimeout(timer.current);
         timer.current = window.setTimeout(() => {

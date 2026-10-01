@@ -12,6 +12,7 @@ import {
   BellRing,
   ClipboardCheck,
   Command,
+  Download,
   FolderOpen,
   Info,
   Palette,
@@ -21,9 +22,12 @@ import {
   Settings as SettingsIcon,
   Type,
 } from "lucide-react";
+import { ask, open, save } from "@tauri-apps/plugin-dialog";
 
 import { api, emitSettingsChanged, type Settings } from "../../lib/api";
 import { BALL_THEMES, applyBallTheme } from "../../lib/ball-theme";
+import { todayKey } from "../../lib/datetime";
+import { firstPath } from "../../lib/dialog";
 import { FONT_SIZE_PRESETS, applyFontSize } from "../../lib/ui-scale";
 import type { FeatureModule } from "../registry";
 
@@ -72,6 +76,15 @@ export function SettingsPanel() {
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedHint, setSavedHint] = useState<string | null>(null);
+  /**
+   * 备份操作的提示。
+   *
+   * 和 `savedHint` 分开：它要显示完整路径、要留着让用户读完，
+   * 不能像「已保存」那样两秒就消失。
+   */
+  const [backupNote, setBackupNote] = useState<string | null>(null);
+  /** 备份 / 恢复进行中，用来禁用按钮防止连点。 */
+  const [backupBusy, setBackupBusy] = useState(false);
 
   useEffect(() => {
     void (async () => {
@@ -123,6 +136,75 @@ export function SettingsPanel() {
       setSavedHint("已保存");
     } catch (err) {
       setError(String(err));
+    }
+  };
+
+  /**
+   * 导出全部数据。
+   *
+   * 路径交给系统保存对话框：让用户自己挑地方（U 盘、网盘同步目录…）
+   * 比固定导到数据文件夹旁边有用得多——备份的意义就是"放到别处"。
+   */
+  const exportBackup = async () => {
+    setBackupNote(null);
+    try {
+      const picked = await save({
+        title: "导出全部数据",
+        // 默认文件名带日期：攒了几份备份之后，一眼能看出哪份是什么时候的
+        defaultPath: `浮光备份-${todayKey()}.json`,
+        filters: [{ name: "浮光备份", extensions: ["json"] }],
+      });
+      // 用户取消时返回 null，这不是错误，什么都不用说
+      if (!picked) return;
+
+      setBackupBusy(true);
+      await api.exportAll(picked);
+      setBackupNote(`已导出到 ${picked}`);
+    } catch (err) {
+      setBackupNote(`导出失败：${String(err)}`);
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  /**
+   * 从备份恢复。
+   *
+   * 三步：选文件 → **明确确认** → 导入后重载界面。
+   * 中间那步不能省：它会覆盖全部数据，而且没有撤销。
+   */
+  const importBackup = async () => {
+    setBackupNote(null);
+    try {
+      const picked = firstPath(
+        await open({
+          title: "选择浮光的备份文件",
+          multiple: false,
+          directory: false,
+          filters: [{ name: "浮光备份", extensions: ["json"] }],
+        }),
+      );
+      if (!picked) return;
+
+      const confirmed = await ask(
+        "导入会用备份里的内容覆盖当前的全部数据（文本片段、计时器、备忘、链接、文件夹、设置）。\n当前数据会被替换，无法撤销。要继续吗？",
+        { title: "从备份恢复", kind: "warning", okLabel: "覆盖导入", cancelLabel: "取消" },
+      );
+      if (!confirmed) return;
+
+      setBackupBusy(true);
+      await api.importAll(picked);
+
+      // 先把新设置广播给小球窗口——它不会跟着面板一起重载，不广播的话
+      // 悬浮球会一直停在导入前的配色。
+      await emitSettingsChanged(await api.settingsGet());
+
+      // 再让面板整页重载：四个功能模块的内存状态都还是导入前那份，
+      // 不重载就会显示已经不存在的数据（点了没反应，最难排查）。
+      window.location.reload();
+    } catch (err) {
+      setBackupNote(`导入失败：${String(err)}`);
+      setBackupBusy(false);
     }
   };
 
@@ -311,7 +393,6 @@ export function SettingsPanel() {
                   style={{
                     background: theme.background,
                     borderColor: theme.border,
-                    boxShadow: theme.shadow,
                   }}
                 >
                   <span
@@ -347,11 +428,16 @@ export function SettingsPanel() {
         <div className="settings__note">
           开机启动的是这个文件：
           <code className="settings__code">{exePath}</code>
-          {/* 开发模式下这个路径指向 target\debug，勾选自启会启动调试版，
-              不提醒的话用户会以为正式版自启了 */}
+          {/* 开发模式下这个路径指向 target\debug。调试版不内嵌前端，
+              开机时连不上开发服务器就会显示浏览器的「无法访问此页面」，
+              所以后端会直接拒绝开启，这里提前把原因说清楚，别让用户以为是软件坏了 */}
           {exePath.includes("target") && (
             <span className="settings__warn">
-              注意：当前是开发模式，路径指向编译产物目录。正式安装后再开这个开关才指向安装目录。
+              注意：当前跑的是开发模式（调试版）。调试版没有把界面打包进 exe，
+              开机时连不上开发服务器，小球和面板只会显示浏览器的「无法访问此页面」，
+              所以这个开关在开发模式下会被拒绝。
+              想要开机自启，请先跑一次 <code className="settings__code">2-重新编译.bat</code>，
+              再用 <code className="settings__code">src-tauri\target\release\fuguang.exe</code> 启动本软件。
             </span>
           )}
         </div>
@@ -499,6 +585,30 @@ export function SettingsPanel() {
           <FolderOpen size={13} />
           打开数据文件夹
         </button>
+
+        <div className="settings__row settings__row--spaced">
+          <Download size={15} className="settings__icon" />
+          <span className="settings__label">
+            导出 / 恢复
+            <em className="settings__hint">
+              把全部数据打成一个 JSON 文件。换电脑、重装系统之前导一份出来，
+              以后用它一键恢复
+            </em>
+          </span>
+          <button className="btn" disabled={backupBusy} onClick={() => void exportBackup()}>
+            导出
+          </button>
+          <button className="btn" disabled={backupBusy} onClick={() => void importBackup()}>
+            恢复
+          </button>
+        </div>
+
+        {backupNote && (
+          <div className="settings__note">
+            <Info size={13} />
+            <span>{backupNote}</span>
+          </div>
+        )}
 
         <div className="settings__note settings__note--warn">
           <Info size={13} />

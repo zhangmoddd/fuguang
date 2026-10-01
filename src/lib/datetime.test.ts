@@ -28,6 +28,8 @@ import {
   formatMoment,
   formatStopwatch,
   formatUntil,
+  isRealDateKey,
+  monthGrid,
   nextOccurrence,
   splitLocal,
   todayKey,
@@ -468,5 +470,134 @@ describe.skipIf(DST)("夏令时（当前时区无夏令时，已跳过）", () =
       "[浮光] 当前时区没有夏令时，夏令时断言已跳过。" +
         "用 `npm run test:dst` 在 America/New_York 下再跑一遍。",
     );
+  });
+});
+
+// ===============================================================
+// 日期键校验
+// ===============================================================
+
+describe("isRealDateKey", () => {
+  it("接受合法日期", () => {
+    expect(isRealDateKey("2026-09-25")).toBe(true);
+    expect(isRealDateKey("2024-02-29")).toBe(true); // 闰年的 2 月 29 日确实存在
+    expect(isRealDateKey("2026-01-01")).toBe(true);
+    expect(isRealDateKey("2026-12-31")).toBe(true);
+  });
+
+  it("拒绝格式不对的输入", () => {
+    // 这些是手打日期时真实会出现的中间态（用户正打到一半就失焦了）
+    expect(isRealDateKey("")).toBe(false);
+    expect(isRealDateKey("2026-9-25")).toBe(false); // 月份没补零
+    expect(isRealDateKey("2026/09/25")).toBe(false); // 用了斜杠
+    expect(isRealDateKey("20260925")).toBe(false);
+    expect(isRealDateKey("2026-09-25 ")).toBe(false); // 尾随空格
+    expect(isRealDateKey("abc")).toBe(false);
+  });
+
+  it("拒绝格式对但日期不存在的值", () => {
+    // 这一组是正则挡不住的：必须把日期构造出来再比对才能发现
+    expect(isRealDateKey("2026-02-30")).toBe(false);
+    expect(isRealDateKey("2026-02-29")).toBe(false); // 2026 不是闰年
+    expect(isRealDateKey("2026-04-31")).toBe(false); // 4 月只有 30 天
+    expect(isRealDateKey("2026-13-01")).toBe(false); // 没有 13 月
+    expect(isRealDateKey("2026-00-10")).toBe(false); // 没有 0 月
+    expect(isRealDateKey("2026-01-00")).toBe(false); // 没有 0 日
+    expect(isRealDateKey("2026-01-32")).toBe(false); // 1 月只有 31 天
+  });
+});
+
+// ===============================================================
+// 月历网格
+// ===============================================================
+
+describe("monthGrid", () => {
+  it("固定 42 格，周一开头", () => {
+    // 2026-09-01 是周二，所以首格是 8 月 31 日（周一）
+    const g = monthGrid(2026, 8);
+    expect(g).toHaveLength(42);
+    expect(g[0].key).toBe("2026-08-31");
+    expect(g[41].key).toBe("2026-10-11");
+  });
+
+  it("标出哪些格子属于本月", () => {
+    const own = monthGrid(2026, 8).filter((c) => c.inMonth);
+    expect(own).toHaveLength(30); // 9 月 30 天
+    expect(own[0].key).toBe("2026-09-01");
+    expect(own[own.length - 1].key).toBe("2026-09-30");
+  });
+
+  it("1 号正好是周一时，首格就是 1 号本身", () => {
+    // 2026-06-01 是周一，这是"不需要补位"的边界
+    const g = monthGrid(2026, 5);
+    expect(g[0].key).toBe("2026-06-01");
+    expect(g[0].inMonth).toBe(true);
+    expect(g.filter((c) => c.inMonth)).toHaveLength(30);
+  });
+
+  it("2 月按闰年取 29 天、平年取 28 天", () => {
+    expect(monthGrid(2024, 1).filter((c) => c.inMonth)).toHaveLength(29);
+    expect(monthGrid(2026, 1).filter((c) => c.inMonth)).toHaveLength(28);
+  });
+
+  it("键唯一，且 inMonth 与键所属月份一致", () => {
+    // 跨月补位最容易出现"显示 1 号、键却是别的月份的 1 号"这类错位。
+    // 注意 monthGrid 的月份是 0 基：传 11 拿到的是 12 月。
+    const g = monthGrid(2026, 11);
+    expect(new Set(g.map((c) => c.key)).size).toBe(42);
+    for (const c of g) {
+      expect(Number(c.key.slice(-2))).toBe(c.day);
+      expect(c.key.startsWith("2026-12")).toBe(c.inMonth);
+    }
+  });
+
+  it("年份小于 100 的输入被明确拒绝，内部构造也不会被挪到 1900 年代", () => {
+    // 先把 JS 的既有行为钉住：new Date(26, 8, 25) 拿到的是 **1926** 年。
+    // 不知道这一点，下面的断言就看不出是在防什么。
+    expect(new Date(26, 8, 25).getFullYear()).toBe(1926);
+
+    // 对外：**明确拒绝**，而不是静默退回原值让用户不知道为什么。
+    // 与其"支持"两位数年份（dateKey 会产出非 4 位键、日历翻页跳到 1926），
+    // 不如让用户改一个正常年份。
+    expect(isRealDateKey("0026-09-25")).toBe(false);
+    expect(isRealDateKey("1926-09-25")).toBe(true);
+    expect(isRealDateKey("2026-02-30")).toBe(false);
+    expect(isRealDateKey("2026-13-01")).toBe(false);
+
+    // 对内：即便真的进来了（老数据 / 手改文件），构造也不能被悄悄挪走
+    const d = new Date(combineLocal("0026-09-25", "08:00"));
+    expect(d.getFullYear()).toBe(26);
+    expect(d.getMonth()).toBe(8);
+    expect(d.getDate()).toBe(25);
+    expect(monthGrid(26, 8).filter((c) => c.inMonth)).toHaveLength(30);
+  });
+
+  it("dateKey 的年份一定补足四位", () => {
+    // 年份 100–999 不补零会产出 "100-01-01" 这种非 4 位键，
+    // 而 isRealDateKey 的正则要求 4 位 —— 自己产出的键自己认不出来。
+    expect(dateKey(new Date(2026, 0, 5))).toBe("2026-01-05");
+    expect(dateKey(new Date(100, 0, 5))).toBe("0100-01-05");
+    // 补零之后闭环成立：自己产出的键自己认得出
+    expect(isRealDateKey(dateKey(new Date(100, 0, 5)))).toBe(true);
+  });
+
+  it("连续推进时墙上时钟不会漂移（夏令时跳变也不例外）", () => {
+    // 在无夏令时的时区（Asia/Shanghai）这条恒成立；
+    // 用 `npm run test:dst` 在 America/New_York 下跑才真正有意义 ——
+    // 美东 2026-03-08 的 02:00–02:59 这个本地时刻**不存在**，
+    // 旧实现会被引擎归一化成 03:30，并把这个 03:30 当成新基准，
+    // 于是"每天 02:30"被**永久**改成"每天 03:30"。
+    // 钟点是用户设的规则，任何情况下都不该被改掉。
+    let t = combineLocal("2026-03-06", "02:30");
+    const times: string[] = [splitLocal(t).time];
+
+    for (let i = 0; i < 10; i += 1) {
+      const next = nextOccurrence(t, "daily");
+      expect(next).not.toBeNull();
+      t = next as number;
+      times.push(splitLocal(t).time);
+    }
+
+    expect(new Set(times)).toEqual(new Set(["02:30"]));
   });
 });

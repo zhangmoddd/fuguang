@@ -103,8 +103,16 @@ fn evaluate_timers(timers: &mut [Timer], now: i64, out: &mut Evaluation) {
                 // 阶段切换：专注结束进入休息，休息结束进入专注。
                 // 立刻为下一个阶段设好结束时刻并清掉 fired，
                 // 这样番茄钟能自己一直循环下去，不需要前端参与。
-                let focus_ms = (t.focus_minutes as i64) * 60_000;
-                let break_ms = (t.break_minutes as i64) * 60_000;
+                // 下限 1 分钟，**不能省**。
+                //
+                // `focus_minutes` / `break_minutes` 在 Rust 侧没有任何校验，
+                // 而 `timers.json` 是纯文本、用户能手动编辑，`#[serde(default)]`
+                // 也只管字段缺失、管不了显式的 0。一旦是 0：
+                //   `ends_at = now + 0` → 每个 tick（500ms）都判定"又到点了" →
+                //   弹窗风暴 + 每 500ms 写一次盘 + `rounds` 无限膨胀。
+                // 正常路径前端会拦住 0，但数据文件是可以被手改的。
+                let focus_ms = (t.focus_minutes.max(1) as i64) * 60_000;
+                let break_ms = (t.break_minutes.max(1) as i64) * 60_000;
 
                 let (next_phase, next_len, body) = match t.phase {
                     Some(PomodoroPhase::Break) => (
@@ -273,15 +281,17 @@ fn run(app: &AppHandle, first: bool) {
 /// 落盘被修改的集合。
 fn persist(app: &AppHandle, timers: bool, memos: bool) {
     let store = app.state::<Store>();
+    // 走 `state::persist` 而不是自己 clone 再 save：快照必须在写锁内取。
+    // 自己先 clone 的话，手里这份是**调用时刻**的旧快照，
+    // 落盘时会把并发命令刚写进去的新数据整份盖回去
+    // （已复现：编辑被回滚、删掉的计时器复活）。
     if timers {
-        let list = store.lock().timers.clone();
-        if let Err(e) = state::save_timers(app, &list) {
+        if let Err(e) = state::persist(app, || store.lock().timers.clone(), state::save_timers) {
             eprintln!("[浮光] 保存计时器失败：{e}");
         }
     }
     if memos {
-        let list = store.lock().memos.clone();
-        if let Err(e) = state::save_memos(app, &list) {
+        if let Err(e) = state::persist(app, || store.lock().memos.clone(), state::save_memos) {
             eprintln!("[浮光] 保存备忘录失败：{e}");
         }
     }
@@ -335,6 +345,7 @@ mod tests {
             running_since: None,
             laps: Vec::new(),
             fired: false,
+            folder_id: None,
             created_at: 0,
         }
     }
@@ -450,8 +461,33 @@ mod tests {
     }
 
     #[test]
-    fn 番茄钟休息结束回到专注且轮数不变() {
+    fn 番茄钟时长为零也不会变成弹窗风暴() {
+        // `timers.json` 是纯文本、可以被手改。focus/break 为 0 时如果不兜底，
+        // `ends_at = now + 0` 会让**每个 tick（500ms）**都判定"又到点了"：
+        // 弹窗风暴 + 每 500ms 写一次盘 + rounds 无限膨胀。
+        // 正常路径前端会拦住 0，但数据文件拦不住。
         let mut t = timer("p", TimerKind::Pomodoro, Some(NOW));
+        t.phase = Some(PomodoroPhase::Focus);
+        t.focus_minutes = 0;
+        t.break_minutes = 0;
+        let mut timers = vec![t];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1, "这一次到点还是要提醒的");
+        let ends = timers[0].ends_at.expect("下一阶段必须排好时刻");
+        assert!(
+            ends > NOW,
+            "下一阶段必须落在未来，否则下一个 tick 立刻又到点，实际：{ends} vs {NOW}"
+        );
+        // 再跑一次：时刻没到，就不该再弹
+        let again = evaluate(&mut timers, &mut memos, NOW);
+        assert!(again.alerts.is_empty(), "不该每 500ms 弹一次");
+    }
+
+    #[test]
+    fn 番茄钟休息结束回到专注且轮数不变() {        let mut t = timer("p", TimerKind::Pomodoro, Some(NOW));
         t.phase = Some(PomodoroPhase::Break);
         t.rounds = 3;
         t.focus_minutes = 25;

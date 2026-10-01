@@ -71,24 +71,134 @@
   flex-shrink: 0;
 }
 
-.memo__jumpicon {
+.memo__count {
+  font-size: var(--fs-sm);
   color: var(--text-faint);
+  white-space: nowrap;
   flex-shrink: 0;
 }
 
-.memo__jumpinput {
-  width: auto;
+/* ---- 日期选择器（自绘，为什么不用原生 date 控件见 Calendar.tsx） ----
+   面板宽 420px，弹层固定 236px：从左边距 10px 起，右边还剩一百多像素，
+   既不顶到面板边缘，也不会像原生弹层那样盖住日期框本身。 */
+
+.datepicker {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* 左侧日历图标是**可点**的，不再只是装饰。
+   原来它是个纯 <svg>，和原生控件右侧自带的图标长得一样却点不动。 */
+.datepicker__open {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.datepicker__open:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.datepicker__input {
   flex: 1;
   min-width: 0;
   font-size: var(--fs-md);
   padding: 4px 6px;
 }
 
-.memo__count {
-  font-size: var(--fs-sm);
-  color: var(--text-faint);
+.datepicker__popup {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  /* 要压过下面的笔记卡片 */
+  z-index: 30;
+  width: 236px;
+  padding: 8px;
+  background: var(--bg-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16);
+}
+
+.datepicker__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.datepicker__title {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
   white-space: nowrap;
-  flex-shrink: 0;
+}
+
+.datepicker__week,
+.datepicker__grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+}
+
+.datepicker__weekday {
+  padding-bottom: 2px;
+  text-align: center;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+.datepicker__day {
+  height: 26px;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+
+.datepicker__day:hover {
+  background: var(--bg-hover);
+}
+
+/* 上下月补位的日期淡化，但仍然可点：点了就直接跳过去 */
+.datepicker__day--out {
+  color: var(--text-faint);
+  opacity: 0.55;
+}
+
+/* 今天用内描边标出，把实心色留给"选中"，两种状态就不会打架 */
+.datepicker__day--today {
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+.datepicker__day--selected,
+.datepicker__day--selected:hover {
+  background: var(--accent);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.datepicker__foot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
 }
 
 /* ---- 工具条 ---- */
@@ -142,6 +252,11 @@
 
 /* ---- 列表 ---- */
 
+/* 列表密度。`--density` 由备忘页按 Ctrl+滚轮的档位写在 .memo 根节点上，
+   默认 1。只缩放间距与内边距、不动字号——字号是设置页里那个「界面字号」，
+   两套混在一起用户就说不清自己调的是哪个了。
+
+   备忘不做文件夹（它的组织维度是日期），所以这里只有缩放。 */
 .memo__list {
   flex: 1;
   min-height: 0;
@@ -149,7 +264,7 @@
   padding: 0 10px 10px;
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: calc(7px * var(--density, 1));
 }
 
 .memo__empty {
@@ -166,7 +281,7 @@
   background: var(--bg-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 8px 10px;
+  padding: calc(8px * var(--density, 1)) calc(10px * var(--density, 1));
 }
 
 .memo__card:hover {
@@ -177,7 +292,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-bottom: 4px;
+  margin-bottom: calc(4px * var(--density, 1));
 }
 
 .memo__title {
@@ -202,7 +317,7 @@
   color: var(--text-dim);
   line-height: 1.55;
   word-break: break-all;
-  margin-bottom: 6px;
+  margin-bottom: calc(6px * var(--density, 1));
 }
 
 /* 提醒状态条。用强调色描边把它和正文区分开：
@@ -212,8 +327,8 @@
   align-items: center;
   gap: 5px;
   flex-wrap: wrap;
-  padding: 4px 7px;
-  margin-bottom: 6px;
+  padding: calc(4px * var(--density, 1)) calc(7px * var(--density, 1));
+  margin-bottom: calc(6px * var(--density, 1));
   border-radius: 6px;
   background: var(--accent-soft);
   color: var(--accent);

@@ -18,10 +18,11 @@
  * 靠 `kind` 区分，各自只用自己那部分字段（字段语义见 `src/lib/api.ts`）。
  * 它们混在同一个列表里，每条都有用户自己起的名字，运行中的排在最前面。
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   Clock,
   Flag,
+  FolderInput,
   Pause,
   Play,
   Plus,
@@ -31,8 +32,17 @@ import {
 } from "lucide-react";
 
 import { api, newId, onStateChanged } from "../../lib/api";
-import type { PomodoroPhase, Timer, TimerKind } from "../../lib/api";
+import type { Folder as FolderItem, PomodoroPhase, Timer, TimerKind } from "../../lib/api";
 import { formatDuration, formatMoment, formatStopwatch } from "../../lib/datetime";
+import { useDragSort } from "../../lib/drag-drop";
+import {
+  FolderBar,
+  FolderEditor,
+  FolderPicker,
+  FolderTiles,
+  useFolders,
+} from "../../lib/folders-ui";
+import { useZoom } from "../../lib/zoom";
 import type { FeatureModule } from "../registry";
 
 import "./timer.css";
@@ -202,6 +212,13 @@ export function TimerPanel() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  /** 文件夹弹层。`target` 为 `null` 表示新建，否则是改名/改备注。 */
+  const [folderEditor, setFolderEditor] = useState<{
+    open: boolean;
+    target: FolderItem | null;
+  }>({ open: false, target: null });
+  /** 正在「移动到…」的那条计时器。 */
+  const [movingId, setMovingId] = useState<string | null>(null);
 
   /**
    * 所有卡片共用的"现在"。
@@ -268,6 +285,55 @@ export function TimerPanel() {
 
   const ordered = useMemo(() => sortTimers(timers), [timers]);
 
+  // ---- 文件夹与缩放 ----
+
+  /**
+   * 把本页签在 `from` 文件夹下的计时器改挂到 `to`。
+   *
+   * 只在删除文件夹时被调用。
+   *
+   * 这里刻意**先重新拉一次最新数据**再写：计时器在后台会被调度线程改
+   * （倒计时到点标记完成、番茄钟翻阶段），拿界面上那份旧快照写回去
+   * 会把那些改动冲掉——表现就是「到点了却又弹一次」。
+   */
+  const moveItems = useCallback(
+    async (from: string, to: string | null) => {
+      const fresh = await api.timersList();
+      for (const t of fresh.filter((x) => x.folderId === from)) {
+        await api.timerSave({ ...t, folderId: to });
+      }
+      await reload();
+    },
+    [reload],
+  );
+
+  const folders = useFolders("timer", { moveItems });
+  const zoom = useZoom("timer");
+
+  /**
+   * 当前文件夹里的计时器。
+   *
+   * `folderId` 指向一个**不存在**的文件夹时按顶层处理：删文件夹中途失败、
+   * 或用户手改过 JSON 都会留下这种条目。不兜的话它们会从界面上消失，
+   * 而数据其实还在。
+   */
+  const visible = useMemo(() => {
+    const known = new Set(folders.mine.map((f) => f.id));
+    return ordered.filter((t) => {
+      const folder = t.folderId && known.has(t.folderId) ? t.folderId : null;
+      return folder === folders.currentId;
+    });
+  }, [ordered, folders.mine, folders.currentId]);
+
+  /** 每个文件夹里有几条计时器，显示在文件夹卡片上（只算直接子级）。 */
+  const folderCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const t of timers) {
+      if (t.folderId) counts[t.folderId] = (counts[t.folderId] ?? 0) + 1;
+    }
+    return counts;
+  }, [timers]);
+
   /**
    * 每条计时器的写入队列。
    *
@@ -310,17 +376,69 @@ export function TimerPanel() {
 
   const removeTimer = async (id: string) => {
     setTimers((prev) => prev.filter((t) => t.id !== id));
-    try {
-      await api.timerRemove(id);
-      setError(null);
-    } catch (err) {
-      setError(`删除失败：${String(err)}`);
-      void reload();
-    }
+
+    // 删除必须排在同一个 id 的写入队列**后面**。
+    //
+    // 直接发命令的话，排队中的 `timerSave` 会在删除之后才落库，而
+    // `timer_save` 是 upsert（找不到就 push）—— 已删除的计时器会**复活**：
+    // 界面上看不到它（`timer_save` 不广播变化），但调度线程照样为它弹提醒，
+    // 重启后它又回到列表里，用户还删不掉。
+    // 触发条件很常见：连点两次「开始/计次」之后立刻点删除。
+    const previous = writeQueue.current.get(id) ?? Promise.resolve();
+    const queued = previous
+      .catch(() => undefined)
+      .then(() => api.timerRemove(id))
+      .then(
+        () => setError(null),
+        (err) => {
+          setError(`删除失败：${String(err)}`);
+          void reload();
+        },
+      )
+      .finally(() => {
+        if (writeQueue.current.get(id) === queued) {
+          writeQueue.current.delete(id);
+        }
+      });
+
+    writeQueue.current.set(id, queued);
+    await queued;
   };
 
-  // ---- 倒计时 ----
+  /**
+   * 把一条计时器移到别的文件夹。`null` 表示移到顶层。
+   *
+   * 走 `saveTimer` 而不是直接调 `timerSave`：它带着按 id 串行的写入队列，
+   * 和界面上的开始/暂停共用同一套落库顺序，失败时也会自动回滚界面状态。
+   */
+  const moveTo = (t: Timer, folderId: string | null) => {
+    setMovingId(null);
+    if ((t.folderId ?? null) === folderId) return;
+    saveTimer({ ...t, folderId });
+  };
 
+  /**
+   * 拖拽：把计时器放进文件夹，以及文件夹自己同级排序。
+   *
+   * **计时器之间不做手动排序**：这个列表的顺序是刻意自动排的
+   * （运行中的在最前，其余按创建时间），正在跑的那条会自己往上冒。
+   * 给某几条钉一个手动位置会和那套语义打架，所以这里用 `handleProps`
+   * （能拖）而不是 `itemProps`（能当排序落点）。
+   */
+  const drag = useDragSort({
+    axis: "vertical",
+    onDrop: (draggedId, draggedKind, spot) => {
+      if (draggedKind === "folder") {
+        if (spot.kind === "item") void folders.reorder(draggedId, spot.id, spot.before);
+        return;
+      }
+      if (spot.kind !== "folder") return;
+      const target = timers.find((x) => x.id === draggedId);
+      if (target) moveTo(target, spot.id);
+    },
+  });
+
+  // ---- 倒计时 ----
   /**
    * 开始。也用于已完成（`fired`）的「重新开始」：两者都是"按设定时长重新跑一轮"。
    *
@@ -419,13 +537,22 @@ export function TimerPanel() {
   /** 新建完成：收起表单并落盘。时长等信息已经在表单里写进 Timer 了。 */
   const createTimer = (timer: Timer) => {
     setCreating(false);
-    saveTimer(timer);
+    // 归属由面板决定：表单不知道用户当前在哪个文件夹里
+    saveTimer({ ...timer, folderId: folders.currentId });
   };
 
   return (
-    <div className="tmr">
+    <div
+      className="tmr"
+      // 滚轮监听挂在整页根节点上：鼠标停在工具栏、文件夹卡片上时也该能缩放。
+      // 普通滚轮不受影响（见 lib/zoom.ts）。
+      ref={zoom.ref}
+      style={{ "--density": String(zoom.percent / 100) } as CSSProperties}
+    >
       <div className="tmr__toolbar">
-        <span className="tmr__count">共 {timers.length} 条</span>
+        <span className="tmr__count">
+          {folders.currentId ? `本文件夹 ${visible.length} 条` : `共 ${timers.length} 条`}
+        </span>
         <button className="btn btn--primary" onClick={() => setCreating((v) => !v)}>
           <Plus size={13} />
           新建
@@ -436,24 +563,68 @@ export function TimerPanel() {
 
       {error && <div className="tmr__error">{error}</div>}
 
+      {/* 当前路径。放在列表上方：先看到「我在哪」，再看这一层有什么 */}
+      <div className="folderzone">
+        <FolderBar
+          trail={folders.trail}
+          onEnter={folders.enter}
+          onCreate={() => setFolderEditor({ open: true, target: null })}
+        />
+
+        {folderEditor.open && (
+          <FolderEditor
+            target={folderEditor.target}
+            onSubmit={(name, note) =>
+              folderEditor.target
+                ? folders.update(folderEditor.target, name, note)
+                : folders.create(name, note)
+            }
+            onClose={() => setFolderEditor({ open: false, target: null })}
+          />
+        )}
+      </div>
+
+      {folders.error && <div className="tmr__error">文件夹出错：{folders.error}</div>}
+
       <div className="tmr__list">
+        {/* 子文件夹排在计时器前面，和资源管理器一致 */}
+        <FolderTiles
+          folders={folders.children}
+          counts={folderCounts}
+          dropTargetId={drag.over?.kind === "folder" ? drag.over.id : null}
+          dragProps={(id) => drag.handleProps(id, "folder")}
+          onEnter={folders.enter}
+          onEdit={(f) => setFolderEditor({ open: true, target: f })}
+          onRemove={(f) => void folders.remove(f)}
+          variant="list"
+        />
+
         {loading && <div className="tmr__empty">正在读取数据…</div>}
 
-        {!loading && ordered.length === 0 && (
+        {!loading && visible.length === 0 && folders.children.length === 0 && (
           <div className="tmr__empty">
-            还没有任何计时器。
-            <br />
-            点右上角「新建」加一个：煮蛋的倒计时、一个番茄钟，或者一块秒表。
+            {timers.length === 0 ? (
+              <>
+                还没有任何计时器。
+                <br />
+                点右上角「新建」加一个：煮蛋的倒计时、一个番茄钟，或者一块秒表。
+              </>
+            ) : (
+              <>这个文件夹里还没有计时器。</>
+            )}
           </div>
         )}
 
-        {ordered.map((t) => {
+        {visible.map((t) => {
           const state = stateOf(t);
           const meta = metaOf(t, state);
           return (
             <article
               key={t.id}
-              className={`card tmr__card${state === "running" ? " tmr__card--running" : ""}`}
+              className={`card tmr__card${state === "running" ? " tmr__card--running" : ""}${
+                drag.draggingId === t.id ? " drag-source" : ""
+              }`}
+              {...drag.handleProps(t.id)}
             >
               <div className="tmr__head">
                 <span className="tmr__name">{t.name}</span>
@@ -605,6 +776,14 @@ export function TimerPanel() {
                 )}
 
                 <button
+                  className="iconbtn"
+                  onClick={() => setMovingId(t.id)}
+                  title="移动到文件夹"
+                >
+                  <FolderInput size={13} />
+                </button>
+
+                <button
                   className="iconbtn iconbtn--danger tmr__delete"
                   onClick={() => void removeTimer(t.id)}
                   title="删除"
@@ -616,6 +795,19 @@ export function TimerPanel() {
           );
         })}
       </div>
+
+      {movingId && (
+        <FolderPicker
+          folders={folders.mine}
+          current={timers.find((t) => t.id === movingId)?.folderId ?? null}
+          onPick={(id) => {
+            const target = timers.find((t) => t.id === movingId);
+            if (target) moveTo(target, id);
+            else setMovingId(null);
+          }}
+          onClose={() => setMovingId(null)}
+        />
+      )}
     </div>
   );
 }
@@ -702,6 +894,8 @@ function TimerCreator({
       runningSince: null,
       laps: [],
       fired: false,
+      // 归属由面板决定（只有它知道用户当前在哪个文件夹里）
+      folderId: null,
       createdAt,
     };
     onCreate(timer);

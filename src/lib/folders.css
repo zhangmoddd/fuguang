@@ -1,0 +1,310 @@
+/* ============================================================
+   文件夹（链接 / 文本片段 / 计时器共用）
+   颜色一律取自 styles.css 的 :root 变量，深浅主题切换时才不会漏改。
+   ============================================================ */
+
+/* 面包屑 + 弹层的定位容器。弹层要相对它绝对定位，
+   所以这一层必须是 relative——各功能直接用它包住 <FolderBar>。 */
+.folderzone {
+  position: relative;
+  flex-shrink: 0;
+}
+
+/* ---- 面包屑 ---- */
+
+.folderbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.folderbar__trail {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  /* 路径长了要能横向滚，但不显示滚动条：420px 里一条滚动条很碍眼 */
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.folderbar__trail::-webkit-scrollbar {
+  display: none;
+}
+
+.folderbar__step {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.folderbar__sep {
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.folderbar__crumb {
+  padding: 3px 6px;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.folderbar__crumb:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+/* 当前所在的那一级：加粗并用强调色，一眼看出"我在哪" */
+.folderbar__crumb--current {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* ---- 文件夹卡片 ----
+   卡片不套外层容器，由各页的容器负责排版（见 FolderTiles 的说明）。
+   链接页的网格列宽由 `--tile-scale` 决定，所以这里也用同一个变量算高度，
+   缩放时文件夹卡片和图标格子才会一起变大变小。 */
+
+.foldertile {
+  position: relative;
+  display: flex;
+}
+
+.foldertile__open {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-md);
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.foldertile__open:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+/* 链接页的网格里：竖排，高度和图标格子一致 */
+.foldertile--grid .foldertile__open {
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 6px;
+  height: calc(92px * var(--tile-scale, 1));
+  text-align: center;
+}
+
+.foldertile__icon {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.foldertile__text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.foldertile--grid .foldertile__text {
+  align-items: center;
+}
+
+.foldertile__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.foldertile__note {
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 条数徽标。网格里排在名字下面，列表里靠右。 */
+.foldertile__count {
+  flex-shrink: 0;
+  min-width: 16px;
+  padding: 1px 5px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--fs-2xs);
+  text-align: center;
+}
+
+/* 改名 / 删除平时藏起来：文件夹卡片的主要动作是"进去"，
+   两个按钮一直摆着会让一层里全是按钮。 */
+.foldertile__actions {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  display: flex;
+  gap: 1px;
+  padding: 1px;
+  background: var(--bg-solid);
+  border-radius: 6px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.foldertile:hover .foldertile__actions,
+.foldertile:focus-within .foldertile__actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* ---- 新建 / 改名弹层 ---- */
+
+.folderedit {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 10px;
+  right: 10px;
+  /* 要压过下面的条目 */
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  background: var(--bg-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16);
+}
+
+.folderedit__title {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.folderedit__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+/* 保存失败的提示。必须画在弹层**内部**：
+   写进外面的错误条会被这个浮层整个盖住，用户看不到（见 FolderEditor.submit）。 */
+.folderedit__error {
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--danger, #c0392b);
+  background: color-mix(in srgb, var(--danger, #c0392b) 12%, transparent);
+  border-radius: 6px;
+  padding: 6px 8px;
+  word-break: break-all;
+}
+
+/* ---- 「移动到…」选择器 ----
+   居中浮层，不用贴条目定位：三个页签的内容区都是 overflow-y: auto，
+   贴着条目弹的气泡会被裁掉一半（见 FolderPicker 的说明）。 */
+
+.folderpick-layer {
+  position: fixed;
+  inset: 0;
+  /* 要压过列表、面包屑、弹层编辑器 */
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.folderpick {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 280px;
+  /* 文件夹很多时浮层不能长过面板，超出部分在列表里滚 */
+  max-height: 70%;
+  padding: 10px;
+  background: var(--bg-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
+}
+
+.folderpick__title {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.folderpick__list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.folderpick__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* 左边距由行内样式按层级给，这里只给其余三边 */
+  padding: 5px 9px;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.folderpick__row:hover {
+  background: var(--bg-hover);
+}
+
+/* 条目当前所在的层：标出来，避免用户选了个"原地不动"的目标还以为没生效 */
+.folderpick__row--on {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.folderpick__icon {
+  flex-shrink: 0;
+}
+
+.folderpick__hint {
+  padding: 8px;
+  color: var(--text-faint);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+}
+
+.folderpick__actions {
+  display: flex;
+  justify-content: flex-end;
+}

@@ -11,7 +11,7 @@
  * 2. **窗口复用**时 Rust 通过 `alert:content` 事件推送新内容。
  *    窗口已存在时只调 `show()` 会显示上一条提醒的旧文字，所以必须走事件。
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Bell, Check } from "lucide-react";
 
@@ -32,69 +32,106 @@ function readParams(): { title: string; body: string } {
 
 export function AlertWindow() {
   const [info, setInfo] = useState(readParams);
-  /** 用户是否在设置里关掉了提示音。 */
-  const soundEnabled = useRef(true);
 
-  // 读一次设置，决定要不要响
-  useEffect(() => {
-    void (async () => {
-      try {
-        const s = await api.settingsGet();
-        soundEnabled.current = s.alertSound;
-      } catch {
-        // 读不到设置就按"响"处理，提醒比安静更重要
-      }
-    })();
-  }, []);
+  /**
+   * 每收到一次推送就 +1，用来给提示音 effect 一个"这次是新的提醒"的信号。
+   *
+   * 不能让提示音只依赖 `info.title` / `info.body`：两条内容**完全相同**的提醒
+   * （同一个每日提醒再次到点，或多条汇总时文案都是「N 条提醒」）会让依赖不变、
+   * effect 不重跑 —— 表现为**只弹窗不响铃**，用户会以为提示音坏了。
+   */
+  const [arrival, setArrival] = useState(0);
 
   // 接收复用窗口时推送的新内容
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let disposed = false;
+
     void onAlertContent((payload) => {
       setInfo({ title: payload.title, body: payload.body });
+      setArrival((n) => n + 1);
     }).then((fn) => {
-      unlisten = fn;
+      // 订阅是异步建立的，可能还没建立组件就卸载了。
+      // 这是全项目唯一一处曾经漏掉这个保护的地方（其余 5 处订阅都有），
+      // 漏掉的后果是监听器永远不退订：StrictMode 下每次挂载都漏一个，热更新再漏一个。
+      if (disposed) fn();
+      else unlisten = fn;
     });
-    return () => unlisten?.();
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   /** 播放提示音。
    *
    *  用 WebAudio 合成而不是打包音频文件：省掉几百 KB 体积，
-   *  而且不需要处理资源路径，用户也不会看到额外的 mp3 文件。 */
+   *  而且不需要处理资源路径，用户也不会看到额外的 mp3 文件。
+   *
+   *  # 为什么「读设置」必须写在同一个 effect 里面
+   *
+   *  原来是先用一个 effect 把设置读进 ref、再在这个 effect 里**同步**消费它。
+   *  React 按声明顺序同步执行 effect，而 `settingsGet` 是一次跨进程往返，
+   *  不可能在同一个 tick 里 resolve —— 所以这里读到的永远是 ref 的初始值 `true`。
+   *  结果就是设置页里关掉「提醒时播放提示音」从来没有生效过。
+   *
+   *  而这个窗口点「知道了」会被真正销毁（`lib.rs` 只对主面板做 prevent_close），
+   *  所以每一条提醒都是全新挂载 —— 等于**每一条提醒都会响**。
+   */
   useEffect(() => {
-    if (!soundEnabled.current) return;
+    let cancelled = false;
+    let ctx: AudioContext | null = null;
 
-    try {
-      // 兼容旧 WebView2：AudioContext 缺失时退回 webkit 前缀版本
-      const w = window as unknown as {
-        AudioContext?: typeof AudioContext;
-        webkitAudioContext?: typeof AudioContext;
-      };
-      const Ctx = w.AudioContext ?? w.webkitAudioContext;
-      if (!Ctx) return;
-      const ctx = new Ctx();
+    void (async () => {
+      let enabled = true;
+      try {
+        enabled = (await api.settingsGet()).alertSound;
+      } catch {
+        // 读不到设置就按"响"处理：提醒比安静更重要
+      }
+      // 等设置回来时组件可能已经卸载 / 内容已经换成下一条
+      if (cancelled || !enabled) return;
 
-      // 两声「叮」，比单声更容易被注意到
-      const now = ctx.currentTime;
-      [0, 0.22].forEach((offset, i) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.value = i === 0 ? 880 : 1174;
-        gain.gain.setValueAtTime(0.0001, now + offset);
-        gain.gain.exponentialRampToValueAtTime(0.25, now + offset + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.18);
-        osc.connect(gain).connect(ctx.destination);
-        osc.start(now + offset);
-        osc.stop(now + offset + 0.2);
-      });
+      try {
+        // 兼容旧 WebView2：AudioContext 缺失时退回 webkit 前缀版本
+        const w = window as unknown as {
+          AudioContext?: typeof AudioContext;
+          webkitAudioContext?: typeof AudioContext;
+        };
+        const Ctx = w.AudioContext ?? w.webkitAudioContext;
+        if (!Ctx) return;
+        const audio = new Ctx();
+        // 记到外层，卸载时才能关掉；下面一律用 audio，
+        // 因为 TS 不会把外层可变量在闭包里的赋值当成收窄
+        ctx = audio;
 
-      return () => void ctx.close();
-    } catch {
-      // 音频不可用不影响提醒本身，静默忽略
-    }
-  }, [info.title, info.body]);
+        // 两声「叮」，比单声更容易被注意到
+        const now = audio.currentTime;
+        [0, 0.22].forEach((offset, i) => {
+          const osc = audio.createOscillator();
+          const gain = audio.createGain();
+          osc.type = "sine";
+          osc.frequency.value = i === 0 ? 880 : 1174;
+          gain.gain.setValueAtTime(0.0001, now + offset);
+          gain.gain.exponentialRampToValueAtTime(0.25, now + offset + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.18);
+          osc.connect(gain).connect(audio.destination);
+          osc.start(now + offset);
+          osc.stop(now + offset + 0.2);
+        });
+      } catch {
+        // 音频不可用不影响提醒本身，静默忽略
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      void ctx?.close();
+    };
+    // `arrival` 必须在依赖里：内容完全相同的两条提醒只靠 title/body 是区分不出来的，
+    // 依赖不变 → effect 不重跑 → 只弹窗不响铃（详见 arrival 的说明）。
+  }, [info.title, info.body, arrival]);
 
   const close = async () => {
     await getCurrentWindow().close();

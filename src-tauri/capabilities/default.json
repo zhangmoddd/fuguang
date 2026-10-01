@@ -1,27 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "浮光各窗口的默认权限集。",
+  "description": "浮光各窗口的默认权限集。只列前端**真正会调用**的能力：窗口的显示/隐藏/定位/置顶全部走 Rust 命令（commands.rs），不经 ACL；opener 插件只被 Rust 调用，前端从不 import 它。多给的权限不会让功能更好，只会让「哪些权限是必需的」变得读不出来。",
   "windows": ["ball", "panel", "alert"],
   "permissions": [
     "core:default",
 
     "core:window:allow-start-dragging",
-    "core:window:allow-set-position",
-    "core:window:allow-outer-position",
-    "core:window:allow-scale-factor",
-    "core:window:allow-hide",
-    "core:window:allow-show",
     "core:window:allow-close",
-    "core:window:allow-set-focus",
-    "core:window:allow-set-always-on-top",
-    "core:window:allow-is-visible",
 
     "core:event:default",
-
-    "core:webview:allow-internal-toggle-devtools",
-
-    "opener:default",
 
     "dialog:default"
   ]

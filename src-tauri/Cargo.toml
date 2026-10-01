@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "浮光 - 轻量 Windows 桌面悬浮工具箱"
 authors = ["fuguang contributors"]
 edition = "2021"
-rust-version = "1.77"
+# 依赖树实际要求的下限：tauri 2.11.6 / tauri-build / tauri-utils / tauri-macros /
+# tauri-codegen 的 rust-version 都是 1.77.2。写 1.77 会让按文档装 1.77.0 的人
+# 编译失败，且报错指向依赖而不是本项目。
+rust-version = "1.77.2"
 
 [lib]
 # Tauri 2 要求移动端使用 cdylib/staticlib；桌面端用 rlib 让 main.rs 调用。

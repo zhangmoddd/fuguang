@@ -6,22 +6,74 @@
  * 所以以后新增功能不需要改动这个文件。
  */
 import { useEffect, useMemo, useState } from "react";
-import { Pin, PinOff, X } from "lucide-react";
+import { Pin, PinOff, Search, X } from "lucide-react";
 
 import { DEFAULT_FEATURE_ID, sortedFeatures } from "../features/registry";
-import { api } from "../lib/api";
+import { api, emitSettingsChanged, onSettingsChanged } from "../lib/api";
+import { CommandPalette } from "../lib/command-palette";
 
 export function PanelWindow() {
   const features = useMemo(() => sortedFeatures(), []);
   const [activeId, setActiveId] = useState(DEFAULT_FEATURE_ID);
   const [pinned, setPinned] = useState(true);
+  /** 全局搜索面板是否打开。 */
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
   const active = features.find((f) => f.id === activeId) ?? features[0];
 
-  // Esc 收起面板；数字键 1-9 快速切页签。
+  // 图钉的初值必须**读设置**，不能硬编码 true。
+  // 面板窗口创建时就是按设置决定置顶的（见 windows.rs 的 show_panel），
+  // 这里硬编码会让图标和真实状态对不上：用户明明关了置顶，
+  // 图标却显示"已钉住"，点一下还"没反应"（因为本来就是关的）。
+  useEffect(() => {
+    void (async () => {
+      try {
+        setPinned((await api.settingsGet()).panelAlwaysOnTop);
+      } catch {
+        /* 读不到就按默认（置顶）显示 */
+      }
+    })();
+  }, []);
+
+  // 设置页改「面板保持置顶」时，图钉和**窗口本身**都要跟着变。
+  //
+  // 只改图标是不够的：窗口的置顶标志只在创建时按设置设一次（见 `windows.rs`
+  // 的 `show_panel`），而设置页改完并不会重建窗口 —— 那样图标显示"未钉住"、
+  // 窗口却仍然压在最上层，等于让图标撒谎。这恰恰是本次要修的那类毛病，
+  // 所以监听器里必须把标志也真正套用一次。
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+
+    void onSettingsChanged((s) => {
+      setPinned(s.panelAlwaysOnTop);
+      // 这个监听器就活在面板窗口里，所以窗口必然存在，可以直接套用
+      void api.setAlwaysOnTop("panel", s.panelAlwaysOnTop).catch(() => {
+        /* 套用失败只影响置顶，不该影响界面其余部分 */
+      });
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // Ctrl+K 全局搜索；Esc 收起面板；数字键 1-9 快速切页签。
   // 这些快捷键让用户不用鼠标也能操作，是「效率工具」的基本素养。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Ctrl+K 放在最前面：**输入框里也要能唤出**。
+      // 用户可能正在片段里搜东西，突然想起"这条其实记在备忘里"。
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((v) => !v);
+        return;
+      }
+
       // 正在输入框里打字时不要拦截数字键
       const target = e.target as HTMLElement | null;
       const typing =
@@ -47,7 +99,26 @@ export function PanelWindow() {
   const togglePin = async () => {
     const next = !pinned;
     setPinned(next);
-    await api.setAlwaysOnTop("panel", next);
+
+    // 第一步：把窗口真正置顶 / 取消置顶。**只有它失败才该把图标翻回去。**
+    try {
+      await api.setAlwaysOnTop("panel", next);
+    } catch {
+      setPinned(!next);
+      return;
+    }
+
+    // 第二步：落盘。这一步失败**不能**回滚图标 —— 窗口已经真的改了，
+    // 翻回去只会让图标撒第二次谎（图标说"未置顶"、窗口却压在最上层）。
+    // 落盘失败只影响"下次启动还记不记得"，界面保持与窗口的真实状态一致。
+    try {
+      const fresh = await api.settingsGet();
+      const saved = { ...fresh, panelAlwaysOnTop: next };
+      await api.settingsSave(saved);
+      await emitSettingsChanged(saved);
+    } catch {
+      /* 存不下来只影响下次启动，界面按真实状态显示 */
+    }
   };
 
   if (!active) {
@@ -68,6 +139,16 @@ export function PanelWindow() {
         </span>
 
         <div className="panel__window-actions">
+          {/* 搜索按钮是 Ctrl+K 的可见入口：不给按钮的话，
+              这个功能只有读过文档的人才知道存在 */}
+          <button
+            className="iconbtn"
+            onClick={() => setPaletteOpen(true)}
+            title="全局搜索（Ctrl+K）"
+          >
+            <Search size={13} />
+          </button>
+
           <button
             className="iconbtn"
             onClick={() => void togglePin()}
@@ -111,6 +192,12 @@ export function PanelWindow() {
       <main className="panel__body">
         <Active />
       </main>
+
+      {/* 搜索面板盖在内容之上，但页签栏和标题栏仍然可见——
+          用户能一眼看出"我还在这四个页签的应用里" */}
+      {paletteOpen && (
+        <CommandPalette onClose={() => setPaletteOpen(false)} onNavigate={setActiveId} />
+      )}
     </div>
   );
 }

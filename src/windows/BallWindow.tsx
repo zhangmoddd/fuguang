@@ -50,6 +50,52 @@ export function BallWindow() {
   }, []);
 
   /**
+   * 记住小球的位置。
+   *
+   * 拖动是交给系统做的（`startDragging()`），我们收不到"拖完了"的回调，
+   * 所以改成监听窗口移动事件 + **防抖**：拖动过程中事件会连发几十上百次，
+   * 每来一次就写一遍文件太浪费。防抖窗口结束那次一定会写，
+   * 所以松手之后的最终位置不会丢。
+   *
+   * 位置存进单独的 `window.json`（见 `api.saveBallPos` 的说明），
+   * 不走设置文件——设置是整份覆盖写的，两个窗口各写一份会互相冲掉。
+   */
+  useEffect(() => {
+    let timer: number | null = null;
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+
+    void getCurrentWindow()
+      .onMoved(({ payload }) => {
+        if (timer !== null) window.clearTimeout(timer);
+        timer = window.setTimeout(() => {
+          timer = null;
+          void (async () => {
+            try {
+              // 按**逻辑**像素存：物理像素在不同缩放比例的屏幕上不可比，
+              // 换一台机器读回来就会跑到别的地方
+              const scale = await getCurrentWindow().scaleFactor();
+              await api.saveBallPos(payload.x / scale, payload.y / scale);
+            } catch {
+              /* 位置存不下来只影响"下次开机回到哪"，不该打断任何事 */
+            }
+          })();
+        }, 400);
+      })
+      .then((fn) => {
+        // 订阅是异步建立的，可能还没建立组件就卸载了
+        if (disposed) fn();
+        else unlisten = fn;
+      });
+
+    return () => {
+      disposed = true;
+      if (timer !== null) window.clearTimeout(timer);
+      unlisten?.();
+    };
+  }, []);
+
+  /**
    * 指针按下：先记下起点，但**不立即**进入拖动。
    *
    * 这里刻意不用 Tauri 的 `data-tauri-drag-region`：那个属性会吃掉 click 事件，

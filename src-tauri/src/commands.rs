@@ -21,16 +21,25 @@
 //! 所有"下一次提醒是什么时候""还剩多少毫秒"都由**前端**算好，
 //! 命令只负责存绝对值。原因见 [`crate::models`] 顶部说明。
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::linkicon::IconData;
-use crate::models::{Link, Memo, Settings, Timer};
+use crate::models::{Folder, Link, LinkKind, Memo, Settings, Timer};
 use crate::state::{self, Store};
-use crate::{autostart, ballmenu, hotkey, launcher, linkicon, platform, storage, windows};
+use crate::{autostart, backup, ballmenu, hotkey, launcher, linkicon, platform, storage, windows};
 
 // ===============================================================
 // 窗口与进程
 // ===============================================================
+
+/// 记住悬浮球当前的位置（小球窗口在移动后防抖调用）。
+///
+/// 单独存 `window.json` 而不是写设置：设置是**整份覆盖写**的，
+/// 小球和主面板两个窗口各持一份副本，互相会冲掉（见 `windows::FILE_WINDOW`）。
+#[tauri::command]
+pub async fn save_ball_pos(app: AppHandle, x: f64, y: f64) -> Result<(), String> {
+    windows::save_ball_position(&app, x, y)
+}
 
 /// 在悬浮球上弹出原生右键菜单。
 #[tauri::command]
@@ -156,7 +165,10 @@ pub async fn write_data(
     value: serde_json::Value,
 ) -> Result<(), String> {
     storage::safe_data_path(&app, &file)?;
-    storage::write_json(&app, &file, &value)
+    // 走写锁：`backup::import` 会写同一批文件（`snippets.json` 就是其中之一），
+    // 前端这次防抖写盘要是插在导入中间落盘，就会把刚恢复的数据盖掉。
+    // 这把锁只串行化**写盘**，读取完全不受影响。
+    state::with_write_lock(|| storage::write_json(&app, &file, &value))
 }
 
 /// 取数据目录路径。
@@ -194,27 +206,26 @@ pub async fn timers_list(app: AppHandle) -> Vec<Timer> {
 #[tauri::command]
 pub async fn timer_save(app: AppHandle, timer: Timer) -> Result<(), String> {
     let store = app.state::<Store>();
-    let list = {
+    {
         let mut st = store.lock();
         match st.timers.iter_mut().find(|t| t.id == timer.id) {
             Some(slot) => *slot = timer,
             None => st.timers.push(timer),
         }
-        st.timers.clone()
-    };
-    state::save_timers(&app, &list)
+    }
+    // 快照必须在写锁内重新取：拿锁外这份旧快照落盘，会覆盖掉并发写者的新数据
+    state::persist(&app, || store.lock().timers.clone(), state::save_timers)
 }
 
 /// 删除一个计时器。
 #[tauri::command]
 pub async fn timer_remove(app: AppHandle, id: String) -> Result<(), String> {
     let store = app.state::<Store>();
-    let list = {
+    {
         let mut st = store.lock();
         st.timers.retain(|t| t.id != id);
-        st.timers.clone()
-    };
-    state::save_timers(&app, &list)
+    }
+    state::persist(&app, || store.lock().timers.clone(), state::save_timers)
 }
 
 // ===============================================================
@@ -229,31 +240,58 @@ pub async fn memos_list(app: AppHandle) -> Vec<Memo> {
     list
 }
 
+/// 告诉所有窗口「备忘录变了」。
+///
+/// # 为什么备忘录需要广播，而计时器/链接暂时不用
+///
+/// 因为备忘有一条**别的窗口会替它改数据**的路径：后台推进重复提醒
+/// （`lib/repeat-advance.ts`，挂在每个窗口的入口，小球窗口常驻所以一直在跑）
+/// 会把 `remindAt` 推到下一次。
+///
+/// 不广播的后果有两层：
+/// 1. 主面板的备忘页不知道，一直显示**旧的**提醒时刻 —— `formatUntil` 会说
+///    "已到期"，用户以为重复提醒坏了；
+/// 2. 更糟：用户此时点「编辑」，编辑器里拿的是那份陈旧对象，保存时把
+///    `remindAt = 过期值` 整条写回去，而 Rust 的幂等判断 `fired_for == Some(at)`
+///    从此成立 —— **这条重复提醒永久卡死**，只能重启才可能被再推进一次。
+///
+/// 广播之后闭环是收敛的：推进 → 保存 → 广播 → 各窗口重新拉取 →
+/// 此时 `firedFor` 已是 null、没有可推进的 → 不会再保存、也不会再广播。
+fn notify_memos_changed(app: &AppHandle) {
+    let _ = app.emit("state-changed", serde_json::json!({ "what": ["memos"] }));
+}
+
 /// 新增或更新一条备忘录。
 #[tauri::command]
 pub async fn memo_save(app: AppHandle, memo: Memo) -> Result<(), String> {
     let store = app.state::<Store>();
-    let list = {
+    {
         let mut st = store.lock();
         match st.memos.iter_mut().find(|m| m.id == memo.id) {
             Some(slot) => *slot = memo,
             None => st.memos.push(memo),
         }
-        st.memos.clone()
-    };
-    state::save_memos(&app, &list)
+    }
+    let saved = state::persist(&app, || store.lock().memos.clone(), state::save_memos);
+    if saved.is_ok() {
+        notify_memos_changed(&app);
+    }
+    saved
 }
 
 /// 删除一条备忘录。
 #[tauri::command]
 pub async fn memo_remove(app: AppHandle, id: String) -> Result<(), String> {
     let store = app.state::<Store>();
-    let list = {
+    {
         let mut st = store.lock();
         st.memos.retain(|m| m.id != id);
-        st.memos.clone()
-    };
-    state::save_memos(&app, &list)
+    }
+    let saved = state::persist(&app, || store.lock().memos.clone(), state::save_memos);
+    if saved.is_ok() {
+        notify_memos_changed(&app);
+    }
+    saved
 }
 
 // ===============================================================
@@ -273,27 +311,25 @@ pub async fn links_list(app: AppHandle) -> Vec<Link> {
 #[tauri::command]
 pub async fn link_save(app: AppHandle, link: Link) -> Result<(), String> {
     let store = app.state::<Store>();
-    let list = {
+    {
         let mut st = store.lock();
         match st.links.iter_mut().find(|l| l.id == link.id) {
             Some(slot) => *slot = link,
             None => st.links.push(link),
         }
-        st.links.clone()
-    };
-    state::save_links(&app, &list)
+    }
+    state::persist(&app, || store.lock().links.clone(), state::save_links)
 }
 
 /// 删除一个快捷链接。
 #[tauri::command]
 pub async fn link_remove(app: AppHandle, id: String) -> Result<(), String> {
     let store = app.state::<Store>();
-    let list = {
+    {
         let mut st = store.lock();
         st.links.retain(|l| l.id != id);
-        st.links.clone()
-    };
-    state::save_links(&app, &list)
+    }
+    state::persist(&app, || store.lock().links.clone(), state::save_links)
 }
 
 /// 启动一个快捷链接。
@@ -334,6 +370,108 @@ pub async fn link_icon(path: String) -> Option<IconData> {
     linkicon::extract(&path)
 }
 
+/// 判断一批路径各自是什么（拖拽添加链接时用）。
+///
+/// 前端拿不到"这是不是目录"，所以这里读一次文件系统属性。
+/// 认不出来的路径按普通文件处理——拖进来的东西总得能加进去，
+/// 不该因为判不出类型就拒绝。
+#[tauri::command]
+pub async fn classify_paths(paths: Vec<String>) -> Vec<LinkKind> {
+    paths.iter().map(|p| launcher::classify(p)).collect()
+}
+
+// ===============================================================
+// 文件夹
+//
+// 三个功能页签（链接 / 文本片段 / 计时器）共用一套文件夹，
+// 靠 `feature` 字段区分归属。备忘不做文件夹：它的组织维度是日期。
+// ===============================================================
+
+/// 列出全部文件夹（按 order 再按创建时间排序）。
+///
+/// 不做按 `feature` 过滤：总共也就几十个文件夹，一次全取回来，
+/// 前端切换页签时不用重新请求，也省掉一个"过滤参数"。
+#[tauri::command]
+pub async fn folders_list(app: AppHandle) -> Vec<Folder> {
+    let store = app.state::<Store>();
+    let mut list = store.lock().folders.clone();
+    list.sort_by_key(|f| (f.order, f.created_at));
+    list
+}
+
+/// 新增或更新一个文件夹。
+#[tauri::command]
+pub async fn folder_save(app: AppHandle, folder: Folder) -> Result<(), String> {
+    let store = app.state::<Store>();
+    {
+        let mut st = store.lock();
+        match st.folders.iter_mut().find(|f| f.id == folder.id) {
+            Some(slot) => *slot = folder,
+            None => st.folders.push(folder),
+        }
+    }
+    state::persist(&app, || store.lock().folders.clone(), state::save_folders)
+}
+
+/// 删除一个文件夹。
+///
+/// # 只动 `folders.json`
+///
+/// 子文件夹会被挂到**被删文件夹的父级**，避免出现"父级没了、孩子谁也够不着"
+/// 的孤儿（那种文件夹在界面上永远打不开）。
+///
+/// 文件夹里的**条目**刻意不在这里处理：条目分散在三份数据里
+/// （链接和计时器在 Rust 侧，文本片段还在前端的通用 JSON 里），
+/// 统一在这里改意味着这个命令要同时碰四份数据、任何一步失败都会留下不一致。
+///
+/// 所以约定：**由前端在调用本命令之前，先把该文件夹下的条目改挂到 `parentId`。**
+/// 前端本来就知道自己的条目在哪、用哪条命令保存，比这里猜要可靠。
+#[tauri::command]
+pub async fn folder_remove(app: AppHandle, id: String) -> Result<(), String> {
+    let store = app.state::<Store>();
+    {
+        let mut st = store.lock();
+
+        // 先取出父级，再改孩子，最后删自己——顺序不能反，
+        // 删掉之后就拿不到它的 parent_id 了。
+        let parent = st
+            .folders
+            .iter()
+            .find(|f| f.id == id)
+            .and_then(|f| f.parent_id.clone());
+
+        for f in st.folders.iter_mut() {
+            if f.parent_id.as_deref() == Some(id.as_str()) {
+                f.parent_id = parent.clone();
+            }
+        }
+
+        st.folders.retain(|f| f.id != id);
+    }
+    state::persist(&app, || store.lock().folders.clone(), state::save_folders)
+}
+
+// ===============================================================
+// 备份
+// ===============================================================
+
+/// 把全部数据导出成一个备份文件。
+///
+/// 目标路径由前端的保存对话框给出。路径不可写时返回可读的中文原因，
+/// 前端会直接显示出来——"导出失败"不说是为什么，用户没法处理。
+#[tauri::command]
+pub async fn export_all(app: AppHandle, path: String) -> Result<(), String> {
+    backup::export(&app, std::path::Path::new(&path))
+}
+
+/// 从备份文件恢复全部数据。**会覆盖当前的全部数据。**
+///
+/// 前端必须先让用户确认过再调这个命令——它没有撤销。
+#[tauri::command]
+pub async fn import_all(app: AppHandle, path: String) -> Result<(), String> {
+    backup::import(&app, std::path::Path::new(&path))
+}
+
 // ===============================================================
 // 设置
 // ===============================================================
@@ -353,13 +491,12 @@ pub async fn settings_get(app: AppHandle) -> Settings {
 #[tauri::command]
 pub async fn settings_save(app: AppHandle, mut settings: Settings) -> Result<(), String> {
     settings.clamp();
-    let saved = {
-        let store = app.state::<Store>();
+    let store = app.state::<Store>();
+    {
         let mut st = store.lock();
-        st.settings = settings.clone();
-        settings
-    };
-    state::save_settings(&app, &saved)
+        st.settings = settings;
+    }
+    state::persist_settings(&app, &store)
 }
 
 /// 查询开机自启是否已开启。
@@ -377,13 +514,12 @@ pub async fn autostart_get() -> bool {
 pub async fn autostart_set(app: AppHandle, enabled: bool) -> Result<(), String> {
     autostart::set_enabled(enabled)?;
     // 注册表写成功后再同步内存与文件，避免两边不一致
-    let saved = {
-        let store = app.state::<Store>();
+    let store = app.state::<Store>();
+    {
         let mut st = store.lock();
         st.settings.autostart = enabled;
-        st.settings.clone()
-    };
-    state::save_settings(&app, &saved)
+    }
+    state::persist_settings(&app, &store)
 }
 
 /// 取当前 exe 路径。设置页用它提示"开机自启会启动这个文件"。
@@ -420,16 +556,15 @@ pub async fn hotkey_apply(
     hotkey::apply(if enabled { Some(combo.as_str()) } else { None })?;
 
     // 注册成功后再落盘，避免"存了一个用不了的组合键"
-    let saved = {
-        let store = app.state::<Store>();
+    let store = app.state::<Store>();
+    {
         let mut st = store.lock();
         st.settings.hotkey_enabled = enabled;
         if enabled {
             st.settings.hotkey = combo;
         }
-        st.settings.clone()
-    };
-    state::save_settings(&app, &saved)
+    }
+    state::persist_settings(&app, &store)
 }
 
 /// 校验一个热键文本是否合法，不实际注册。

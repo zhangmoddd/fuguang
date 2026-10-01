@@ -54,7 +54,7 @@ import {
   type LinkKind,
 } from "../../lib/api";
 import { FolderBar, FolderEditor, FolderPicker, FolderTiles, useFolders } from "../../lib/folders-ui";
-import { firstPath } from "../../lib/dialog";
+import { allPaths } from "../../lib/dialog";
 import { useDragSort } from "../../lib/drag-drop";
 import { useZoom } from "../../lib/zoom";
 import type { FeatureModule } from "../registry";
@@ -527,12 +527,6 @@ export function LinksPanel() {
     [links, folders.currentId],
   );
 
-  /** 加一条。 */
-  const addOne = useCallback(
-    (target: string, kind: LinkKind) => addMany([{ target, kind }]),
-    [addMany],
-  );
-
   // ---- 拖拽添加 ----
 
   /**
@@ -627,26 +621,26 @@ export function LinksPanel() {
 
   const addProgram = () =>
     runPicker(async () => {
-      const picked = firstPath(
+      const picked = allPaths(
         await open({
-          multiple: false,
+          multiple: true,
           directory: false,
           filters: [{ name: "程序", extensions: ["exe", "lnk", "bat", "cmd"] }],
         }),
       );
-      if (picked) await addOne(picked, "program");
+      if (picked.length > 0) await addMany(picked.map((p) => ({ target: p, kind: "program" })));
     });
 
   const addFolder = () =>
     runPicker(async () => {
-      const picked = firstPath(await open({ directory: true }));
-      if (picked) await addOne(picked, "folder");
+      const picked = allPaths(await open({ directory: true, multiple: true }));
+      if (picked.length > 0) await addMany(picked.map((p) => ({ target: p, kind: "folder" })));
     });
 
   const addFile = () =>
     runPicker(async () => {
-      const picked = firstPath(await open({ multiple: false }));
-      if (picked) await addOne(picked, "file");
+      const picked = allPaths(await open({ multiple: true }));
+      if (picked.length > 0) await addMany(picked.map((p) => ({ target: p, kind: "file" })));
     });
 
   const submitUrl = async () => {
@@ -774,16 +768,24 @@ export function LinksPanel() {
         <button
           className="btn"
           onClick={() => void addProgram()}
-          title="选择一个程序（.exe / .lnk / .bat / .cmd）"
+          title="选择程序，可按住 Ctrl / Shift 一次选多个（.exe / .lnk / .bat / .cmd）"
         >
           <AppWindow size={12} />
           程序
         </button>
-        <button className="btn" onClick={() => void addFolder()} title="选择一个文件夹">
+        <button
+          className="btn"
+          onClick={() => void addFolder()}
+          title="选择文件夹，可按住 Ctrl / Shift 一次选多个"
+        >
           <Folder size={12} />
           文件夹
         </button>
-        <button className="btn" onClick={() => void addFile()} title="选择任意文件（文档、图片…）">
+        <button
+          className="btn"
+          onClick={() => void addFile()}
+          title="选择任意文件（文档、图片…），可按住 Ctrl / Shift 一次选多个"
+        >
           <FileText size={12} />
           文件
         </button>
@@ -907,7 +909,7 @@ export function LinksPanel() {
             <Link2 size={26} />
             <p>还没有任何链接。</p>
             <p>
-              点上面的按钮挑一个程序、文件夹或文件
+              点上面的按钮挑程序、文件夹或文件（都可以一次选多个）
               {dragAvailable ? "，也可以直接把它们拖进这个面板。" : "。"}
             </p>
           </div>

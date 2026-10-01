@@ -16,3 +16,21 @@ export function firstPath(result: unknown): string | null {
   }
   return null;
 }
+
+/**
+ * 从文件选择框的返回值里取出**全部**路径（选择框允许多选时是一串）。
+ *
+ * 为什么不复用 `firstPath` 再取 `[0]`：多选是选择框自己给的能力，
+ * 用户框了十个文件就期待十个都进来。只取第一个会把另外九个**静默丢掉**，
+ * 而界面上只会提示「已添加 1 个链接」—— 用户得自己数才发现少了。
+ *
+ * 数组里混进非字符串元素时**跳过那一个**而不是整体作废：
+ * 那个元素本来也用不了，丢掉它比丢掉用户选的另外九个要好。
+ */
+export function allPaths(result: unknown): string[] {
+  if (typeof result === "string") return result ? [result] : [];
+  if (Array.isArray(result)) {
+    return result.filter((p): p is string => typeof p === "string" && p.length > 0);
+  }
+  return [];
+}

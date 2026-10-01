@@ -74,12 +74,26 @@ export function PanelWindow() {
         return;
       }
 
-      // 正在输入框里打字时不要拦截数字键
+      /**
+       * 正在输入框里打字时不要拦截数字键。
+       *
+       * ⚠️ 判据是"**框里已经有内容**"，不能只看"焦点在输入框里"。
+       *
+       * 文本片段页一挂载就自动聚焦搜索框（那是刻意的：这个页签 90% 的用法是
+       * 「搜索 → 点一下」），所以只看标签名的话，**面板一打开焦点就在搜索框里、
+       * 数字键 1~9 全部失效** —— 用户按 `2` 想切到计时页，结果搜索框里多了个 "2"。
+       * 而一旦框里有内容，数字就是搜索词的一部分（用户可能真的在搜 "2026"），
+       * 那时候绝不能让数字键去切页签。
+       *
+       * 空框 + 数字键 = 想切页签，这条规则同时满足两种情况。
+       */
       const target = e.target as HTMLElement | null;
-      const typing =
+      const inTextField =
         target?.tagName === "INPUT" ||
         target?.tagName === "TEXTAREA" ||
-        target?.isContentEditable;
+        target?.isContentEditable === true;
+      const typed = (target as HTMLInputElement | null)?.value ?? "";
+      const typing = inTextField && typed.length > 0;
 
       if (e.key === "Escape") {
         void api.hidePanel();

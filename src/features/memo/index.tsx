@@ -51,6 +51,7 @@ import {
   splitLocal,
   todayKey,
 } from "../../lib/datetime";
+import { useEscapeToClose } from "../../lib/escape";
 import { advanceRepeats } from "../../lib/repeat-advance";
 import { useZoom } from "../../lib/zoom";
 import type { FeatureModule } from "../registry";
@@ -443,6 +444,9 @@ function MemoEditor({
   onCancel: () => void;
 }) {
   const [form, setForm] = useState<Memo>(draft);
+
+  // 填到一半按 Esc 应该是「退出编辑」，不是「把整个面板收起来」
+  useEscapeToClose(onCancel);
   const [tagInput, setTagInput] = useState(draft.tags.join(", "));
 
   // 提醒拆成「日期 + 时间」两个输入框，所以这里保留字符串形态的草稿。

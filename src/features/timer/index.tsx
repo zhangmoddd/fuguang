@@ -50,6 +50,7 @@ import {
   type TimerDraft,
 } from "../../lib/timer-edit";
 import { useDragSort } from "../../lib/drag-drop";
+import { useEscapeToClose } from "../../lib/escape";
 import {
   FolderBar,
   FolderEditor,
@@ -1017,6 +1018,9 @@ function TimerCreator({
   );
   /** 闹钟是否每天重复。默认只响一次：默认每天响会让人被自己没设过的闹钟吵醒。 */
   const [alarmDaily, setAlarmDaily] = useState(editing?.alarmDaily ?? false);
+
+  // 填到一半按 Esc 应该是「关掉表单」，不是「把整个面板收起来」
+  useEscapeToClose(onCancel);
   const nameRef = useRef<HTMLInputElement>(null);
 
   // 打开表单就聚焦名字：填名字是唯一的必填项

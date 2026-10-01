@@ -569,8 +569,21 @@ textarea {
 }
 
 .field--grow {
-  flex: 1;
+  flex: 0 0 auto;
+  /* 默认高度**必须是个确定值**，不能靠 `flex-grow` 撑满。两个理由：
+     1. 撑满靠的是 `flex-grow`，而它会盖掉用户拖出来的高度 ——
+        往小了拖会被撑回去，"可以自行控制大小"就落空了；
+     2. 更要紧：父级高度是 flex 分配出来的时候，子元素的 `height: 100%`
+        解析不出来，浏览器会退回**内容高度**并溢出容器。那正是
+        「正文框压住备注框、连缩放把手都点不到」那个 bug 的根因。
+     给一个确定值之后，用户拖出来的行内 `height` 直接盖掉它，两边都成立。
+     280px 是按 640px 高的面板定的：够看十来行，又不至于把下面几个输入框顶出去。 */
+  height: 280px;
   min-height: 90px;
+  /* 让用户可以拖着改高度（右下角那两条小斜杠） */
+  resize: vertical;
+  /* `resize` 只在 overflow 不是 visible 时才画把手 */
+  overflow: hidden;
 }
 
 .field__label {
@@ -603,18 +616,14 @@ textarea {
 }
 
 .field__input--area {
-  /* 多行输入框可以让用户自己拖着调高度（右下角那两条小斜杠）。
-     ⚠️ 这里有两个坑，两个都踩过：
-     1. `flex: 1` 等价于 `flex-basis: 0%`，而 flex-basis **会盖掉 `height`** ——
-        浏览器拖拽改大小写的正是 `height`，所以写成 `flex: 1` 时拖了毫无反应。
-        改成 `flex: 0 0 auto`，高度就由 `height` 说了算。
-     2. 只给 `height: auto` 的话，默认高度是 textarea 的 `rows=2`（约两行），
-        比原来矮一大截。所以显式给 `height: 100%` 撑满外层，
-        用户拖过之后行内 height 会盖掉它，没拖过时和以前一模一样。 */
-  flex: 0 0 auto;
-  height: 100%;
-  min-height: 80px;
-  resize: vertical;
+  /* 多行输入框。高度由外层 `.field--grow` 说了算（那上面有缩放把手），
+     这里只负责**填满**它，自己不参与 resize —— 两个元素都能拖会打架：
+     拖外层时内层不动、拖内层时外层不动，用户根本分不清哪个是哪个。
+     `min-height: 0` 是必须的：不给的话 flex 项的自动最小尺寸会把输入框
+     顶出外层，又变成"压住下面的输入框"。 */
+  flex: 1;
+  min-height: 0;
+  resize: none;
   line-height: 1.55;
 }
 

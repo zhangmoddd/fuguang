@@ -300,6 +300,13 @@ export interface FolderTilesProps {
    * 所以走注入，而不是让 folders-ui 反过来依赖 drag-drop。
    */
   dragProps?: (id: string) => { onPointerDown: (e: ReactPointerEvent) => void };
+  /**
+   * 正在被拖的那个文件夹：把它渲染成一个**空位**而不是卡片。
+   *
+   * 手机桌面拖图标就是这个样子：被拖的那个"提起来"跟着手走（浮层由调用方画），
+   * 原处留一个虚框，其余卡片让开。传 `null` 表示没在拖文件夹。
+   */
+  gapId?: string | null;
 }
 
 /**
@@ -321,62 +328,73 @@ export function FolderTiles({
   variant = "list",
   dropTargetId = null,
   dragProps,
+  gapId = null,
 }: FolderTilesProps) {
   return (
     <>
-      {folders.map((f) => (
-        <div
-          // ⚠️ `data-drop-folder` 必须与 lib/drag-drop.ts 的 DROP_FOLDER_ATTR 一致：
-          // 那边靠这个属性收集候选投放矩形。改一处要改两处。
-          data-drop-folder={f.id}
-          className={`foldertile foldertile--${variant}${
-            dropTargetId === f.id ? " foldertile--over" : ""
-          }`}
-          key={f.id}
-          {...(dragProps?.(f.id) ?? {})}
-        >
-          <button
-            type="button"
-            // 拖拽抓手：卡片本体这个按钮允许发起文件夹排序拖拽。
-            // 卡片内部那两个操作按钮**故意不加**这个属性 —— 它们必须老老实实是按钮，
-            // 否则手抖几像素就会把"点删除"变成"拖卡片"。
-            // 属性名与 lib/drag-drop.ts 里的判断必须一致。
-            data-drag-handle
-            className="foldertile__open"
-            onClick={() => onEnter(f.id)}
-            title={f.note ? `${f.name}\n${f.note}` : f.name}
+      {folders.map((f) =>
+        // 正在被拖的那个：留一个虚框（`drag-gap` 的样式在 lib/drag-drop.css 里）。
+        // 它不再是投放目标，也不该被点中 —— 用户手里正拎着它。
+        f.id === gapId ? (
+          <div
+            className={`foldertile foldertile--${variant} drag-gap`}
+            key={f.id}
+            aria-hidden
+          />
+        ) : (
+          <div
+            // ⚠️ `data-drop-folder` 必须与 lib/drag-drop.ts 的 DROP_FOLDER_ATTR 一致：
+            // 那边靠这个属性收集候选投放矩形。改一处要改两处。
+            data-drop-folder={f.id}
+            className={`foldertile foldertile--${variant}${
+              dropTargetId === f.id ? " foldertile--over" : ""
+            }`}
+            key={f.id}
+            {...(dragProps?.(f.id) ?? {})}
           >
-            <FolderIcon size={variant === "grid" ? 24 : 15} className="foldertile__icon" />
-            <span className="foldertile__text">
-              <span className="foldertile__name">{f.name}</span>
-              {/* 网格里放不下备注（格子只有 86px 宽），只在列表里显示 */}
-              {variant === "list" && f.note && (
-                <span className="foldertile__note">{f.note}</span>
-              )}
-            </span>
-            <span className="foldertile__count">{counts[f.id] ?? 0}</span>
-          </button>
+            <button
+              type="button"
+              // 拖拽抓手：卡片本体这个按钮允许发起文件夹排序拖拽。
+              // 卡片内部那两个操作按钮**故意不加**这个属性 —— 它们必须老老实实是按钮，
+              // 否则手抖几像素就会把"点删除"变成"拖卡片"。
+              // 属性名与 lib/drag-drop.ts 里的判断必须一致。
+              data-drag-handle
+              className="foldertile__open"
+              onClick={() => onEnter(f.id)}
+              title={f.note ? `${f.name}\n${f.note}` : f.name}
+            >
+              <FolderIcon size={variant === "grid" ? 24 : 15} className="foldertile__icon" />
+              <span className="foldertile__text">
+                <span className="foldertile__name">{f.name}</span>
+                {/* 网格里放不下备注（格子只有 86px 宽），只在列表里显示 */}
+                {variant === "list" && f.note && (
+                  <span className="foldertile__note">{f.note}</span>
+                )}
+              </span>
+              <span className="foldertile__count">{counts[f.id] ?? 0}</span>
+            </button>
 
-          <div className="foldertile__actions">
-            <button
-              type="button"
-              className="iconbtn"
-              onClick={() => onEdit(f)}
-              title="改名 / 写备注"
-            >
-              <Pencil size={12} />
-            </button>
-            <button
-              type="button"
-              className="iconbtn iconbtn--danger"
-              onClick={() => void onRemove(f)}
-              title="删除文件夹"
-            >
-              <Trash2 size={12} />
-            </button>
+            <div className="foldertile__actions">
+              <button
+                type="button"
+                className="iconbtn"
+                onClick={() => onEdit(f)}
+                title="改名 / 写备注"
+              >
+                <Pencil size={12} />
+              </button>
+              <button
+                type="button"
+                className="iconbtn iconbtn--danger"
+                onClick={() => void onRemove(f)}
+                title="删除文件夹"
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
           </div>
-        </div>
-      ))}
+        ),
+      )}
     </>
   );
 }

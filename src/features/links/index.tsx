@@ -56,7 +56,7 @@ import {
 } from "../../lib/api";
 import { FolderBar, FolderEditor, FolderPicker, FolderTiles, useFolders } from "../../lib/folders-ui";
 import { allPaths } from "../../lib/dialog";
-import { useDragSort } from "../../lib/drag-drop";
+import { previewOrder, useDragSort } from "../../lib/drag-drop";
 import { placeMenu } from "../../lib/menu-position";
 import { useZoom } from "../../lib/zoom";
 import type { FeatureModule } from "../registry";
@@ -262,6 +262,23 @@ function kindOfPath(path: string): LinkKind {
 /** 与 Rust 侧 `links_list` 保持一致的排序：order 小的在前，同 order 按创建时间。 */
 function sortLinks(list: LinkItem[]): LinkItem[] {
   return [...list].sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
+}
+
+/**
+ * 按 id 顺序重排一批条目。
+ *
+ * `orderById` 和 `previewOrder`（在 `lib/drag-drop.ts`）是一对：
+ * 前者只负责"按给定 id 顺序取出来"，后者只负责"算出新顺序"。
+ * 分开是因为 `previewOrder` 是纯字符串运算、可以单测，
+ * 而这里要跟具体的数据类型打交道。
+ *
+ * id 对不上的（数据刚变过、被删了）直接跳过，不会渲染出一个空壳。
+ */
+function orderById<T extends { id: string }>(items: T[], ids: string[]): T[] {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  return ids
+    .map((id) => byId.get(id))
+    .filter((item): item is T => item !== undefined);
 }
 
 /** 一次添加请求。拖拽可以一次进来好几个文件，所以按批处理。 */
@@ -793,6 +810,48 @@ export function LinksPanel() {
    */
   const menuLink = menu ? links.find((l) => l.id === menu.id) ?? null : null;
 
+  /**
+   * 让位之后的渲染顺序。
+   *
+   * 被拖的那个**也在数组里** —— 渲染时把它画成一个空位（虚框），
+   * 其余格子让开，这就是手机桌面拖图标的样子。
+   * 用 `drag.itemOver` 而不是 `drag.over`：指针落到格子缝隙或最后一行下面的
+   * 空白上时 `over` 会变 null，那会让空位"啪"地闪回开头（见 itemOver 的说明）。
+   */
+  const orderedFolders = useMemo(
+    () =>
+      orderById(
+        folders.children,
+        previewOrder(
+          folders.children.map((f) => f.id),
+          drag.draggingId ?? "",
+          drag.itemOver,
+        ),
+      ),
+    [folders.children, drag.draggingId, drag.itemOver],
+  );
+
+  const orderedLinks = useMemo(
+    () =>
+      orderById(
+        visible,
+        previewOrder(
+          visible.map((l) => l.id),
+          drag.draggingId ?? "",
+          drag.itemOver,
+        ),
+      ),
+    [visible, drag.draggingId, drag.itemOver],
+  );
+
+  /** 跟手浮层里的那一条：链接或文件夹，取决于正在拖的是什么。 */
+  const ghostLink = drag.draggingId
+    ? visible.find((l) => l.id === drag.draggingId) ?? null
+    : null;
+  const ghostFolder = drag.draggingId
+    ? folders.children.find((f) => f.id === drag.draggingId) ?? null
+    : null;
+
   return (
     <div
       className="links"
@@ -930,7 +989,7 @@ export function LinksPanel() {
         {/* 子文件夹排在链接前面，和资源管理器一致。
             FolderTiles 返回的是一排卡片、不带外层容器，所以能直接当网格子项用 */}
         <FolderTiles
-          folders={folders.children}
+          folders={orderedFolders}
           counts={folderCounts}
           dropTargetId={drag.over?.kind === "folder" ? drag.over.id : null}
           dragProps={(id) => drag.handleProps(id, "folder")}
@@ -938,6 +997,7 @@ export function LinksPanel() {
           onEdit={(f) => setFolderEditor({ open: true, target: f })}
           onRemove={(f) => void folders.remove(f)}
           variant="grid"
+          gapId={drag.draggingId}
         />
 
         {loading && <div className="links__hint">正在读取数据…</div>}
@@ -966,7 +1026,13 @@ export function LinksPanel() {
             </div>
           )}
 
-        {visible.map((link) => {
+        {orderedLinks.map((link) => {
+          // 正在被拖的那个：留一个虚框，其余格子让开。
+          // 它不再是投放目标，也不该被点中 —— 用户手里正拎着它。
+          if (link.id === drag.draggingId) {
+            return <div className="links__gap drag-gap" key={link.id} aria-hidden />;
+          }
+
           /**
            * 就地编辑（重命名 / 启动参数）：**整行宽**。
            *
@@ -1015,8 +1081,6 @@ export function LinksPanel() {
               className={[
                 "links__tile",
                 busyId === link.id ? "links__tile--busy" : "",
-                drag.draggingId === link.id ? "drag-source" : "",
-                drag.overClass(link.id),
               ]
                 .filter(Boolean)
                 .join(" ")}
@@ -1065,6 +1129,33 @@ export function LinksPanel() {
 
       {dragAvailable && !loading && links.length > 0 && (
         <div className="links__footer">把文件或文件夹拖进面板也能添加</div>
+      )}
+
+      {/* 跟手的浮层：被拖的那一格"提起来"跟着指针走。
+          尺寸用按下那一刻量好的（`sourceSize`），因为原处已经被换成空位了。
+          它不吃指针事件（见 .drag-ghost 的说明），所以落点判定不受影响。 */}
+      {drag.draggingId && drag.pointer && drag.sourceSize && (
+        <div
+          className="links__ghost drag-ghost"
+          style={{
+            left: drag.pointer.x,
+            top: drag.pointer.y,
+            width: drag.sourceSize.width,
+            height: drag.sourceSize.height,
+          }}
+        >
+          {ghostLink ? (
+            <>
+              <LinkGlyph link={ghostLink} />
+              <span className="links__name">{ghostLink.name}</span>
+            </>
+          ) : ghostFolder ? (
+            <>
+              <Folder size={24} strokeWidth={1.6} className="links__glyph links__glyph--builtin" />
+              <span className="links__name">{ghostFolder.name}</span>
+            </>
+          ) : null}
+        </div>
       )}
 
       {movingId && (

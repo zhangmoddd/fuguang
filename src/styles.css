@@ -201,6 +201,14 @@ textarea {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
   overflow: hidden;
+  /* ⚠️ 这一行有个不明显的副作用：`backdrop-filter`（和 `filter`、`transform`、
+     `perspective`、`contain: paint` 一样）会让这个元素成为**后代里
+     `position: fixed` 的包含块**。也就是说面板里那些"相对窗口定位"的浮层
+     （跟手的拖拽浮层 `.drag-ghost`、格子菜单 `.linkmenu`）其实是相对
+     `.panel` 的 padding box 定位的 —— 而 `.panel` 有 1px 边框，
+     所以用 `getBoundingClientRect()`（视口坐标）算出来的位置会整体差 1px。
+     实测确认过，视觉上看不出来，但**别**因为"差了 1px"去改坐标计算：
+     那是这一行带来的，不是算错了。 */
   backdrop-filter: blur(18px);
 }
 

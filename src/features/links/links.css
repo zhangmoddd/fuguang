@@ -170,6 +170,22 @@
   border-color: var(--border-strong);
 }
 
+/* 空位：被拖的那一格"提起来"之后留在落点上的虚框（虚框样式在 drag-drop.css）。
+   高度只给下限、和格子用同一个基数：这一层只剩一条链接时，整行就只有它，
+   不给下限的话行会塌成一条线，松手时落点也跟着变。 */
+.links__gap {
+  min-height: calc(92px * var(--tile-scale, 1));
+}
+
+/* 跟手的浮层要长得和原来那一格一样，所以复用格子的排版变量 */
+.links__ghost {
+  gap: calc(7px * var(--tile-scale, 1));
+  padding: calc(10px * var(--tile-scale, 1)) calc(6px * var(--tile-scale, 1));
+  background: var(--bg-solid);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+}
+
 /* 正在启动：压暗表示「已经在处理了」，抑制连点 */
 .links__tile--busy {
   opacity: 0.55;

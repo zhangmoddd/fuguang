@@ -120,6 +120,43 @@ export function resolveDrop(
 /** 拖动前必须移动这么多像素才算"在拖"，否则算点击。 */
 const DRAG_THRESHOLD = 6;
 
+/**
+ * 「让位」之后的顺序：把被拖的那个从原位拿掉、插到落点位置。
+ *
+ * # 为什么不再画那条"插到左边还是右边"的亮线
+ *
+ * 用户的原话：「鼠标往左移动就会在左边亮线，在右边移动就会在右边亮线」——
+ * 那条线只说了"会插到这一格的左边/右边"，但**格子会怎么动**要用户自己在
+ * 脑子里推。手机桌面拖图标不是这样的：其他图标先让开，空位自然就出来了。
+ *
+ * # 这个算法不会来回抖
+ *
+ * `rest`（原顺序去掉被拖的那个）是**固定的**，指针沿着拖动轴扫过去时
+ * 插入位次只会依次 +1，所以空位是单调移动的 —— 这一点很重要：
+ * 拖拽期间缓存的是**按下那一刻**的格子矩形（每帧重测会强制同步布局），
+ * 如果顺序本身还会震荡，画面就会闪。
+ *
+ * @param ids       这一段当前的顺序。文件夹和条目是两段，各传各的
+ * @param draggedId 正在拖的那个
+ * @param over      指针下方的落点
+ * @returns 新顺序，**被拖的那个也在里面** —— 调用方把它渲染成一个空位。
+ *          落点不是这一段的条目时（拖到文件夹上、拖回自己原来的位置、
+ *          或者拖出了所有格子）原样返回。
+ */
+export function previewOrder(ids: string[], draggedId: string, over: DropSpot | null): string[] {
+  if (over?.kind !== "item") return ids;
+
+  const rest = ids.filter((id) => id !== draggedId);
+  // 落点不在这一段里：包括"落点就是被拖的那个自己"（拖回原位，本来就该不动）
+  // 和"拖的是文件夹、落点是链接"（两段互不影响）
+  const at = rest.indexOf(over.id);
+  if (at < 0) return ids;
+
+  const next = [...rest];
+  next.splice(over.before ? at : at + 1, 0, draggedId);
+  return next;
+}
+
 export interface DragSortOptions {
   /** 排序轴：纵向列表用 `vertical`，网格用 `horizontal`。 */
   axis: DropAxis;
@@ -161,10 +198,26 @@ export interface DragItemProps {
 export interface DragSortApi {
   /** 正在拖的东西 id；`null` 表示没在拖。 */
   draggingId: string | null;
-  /** 指针下方的落点，用来高亮。 */
+  /** 指针下方的落点，用来高亮"放进去"的文件夹。 */
   over: DropSpot | null;
-  /** 指针位置（视口坐标）。 */
+  /**
+   * 拖拽期间**最近一次命中的条目落点**（粘住，不随指针移出格子而清空）。
+   *
+   * 为什么要"粘住"：让位之后格子会重排，指针很容易落到格子之间的缝、
+   * 或者最后一行的下面那片空白上。那时 `over` 变成 `null`，
+   * 按它算出来的顺序会**突然跳回原位** —— 用户看到的是空位"啪"地闪回开头。
+   * 用最近一次有效落点算顺序，空位就稳稳停在最后扫过的位置上。
+   */
+  itemOver: DropSpot | null;
+  /** 指针位置（视口坐标）。画跟手的浮层用。 */
   pointer: { x: number; y: number } | null;
+  /**
+   * 被拖那个元素的**尺寸**（按下那一刻量的）。
+   *
+   * 浮层要长得和原来那一格一模一样，而这个尺寸只能在按下时量：
+   * 拖拽一开始调用方就把原来那一格换成空位了，元素已经不在。
+   */
+  sourceSize: { width: number; height: number } | null;
   /**
    * 挂到**可拖动、同时也是排序投放目标**的条目上。
    *
@@ -183,12 +236,6 @@ export interface DragSortApi {
   handleProps: (id: string, kind?: "item" | "folder") => {
     onPointerDown: (e: ReactPointerEvent) => void;
   };
-  /**
-   * 目标条目上要加的类名（插入位置的提示线）；不是目标就返回空串。
-   *
-   * 横向和纵向的线画在不同边上，所以这里按 `axis` 给出不同的类名。
-   */
-  overClass: (id: string) => string;
   /**
    * 拖动结束后要**吞掉**的那一次 click。
    *
@@ -210,7 +257,9 @@ export function useDragSort({
 }: DragSortOptions): DragSortApi {
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [over, setOver] = useState<DropSpot | null>(null);
+  const [itemOver, setItemOver] = useState<DropSpot | null>(null);
   const [pointer, setPointer] = useState<{ x: number; y: number } | null>(null);
+  const [sourceSize, setSourceSize] = useState<{ width: number; height: number } | null>(null);
 
   /**
    * 拖拽进行中的可变状态。
@@ -227,6 +276,8 @@ export function useDragSort({
     active: boolean;
     /** 拖拽开始时缓存的目标矩形，见 `resolveDrop` 的说明。 */
     candidates: DropCandidate[];
+    /** 被拖元素的尺寸，按下那一刻量的（用来画跟手的浮层）。 */
+    size: { width: number; height: number };
     /** 最近一次指针位置。滚动时要按它重新判落点。 */
     lastX: number;
     lastY: number;
@@ -255,7 +306,9 @@ export function useDragSort({
     overRef.current = null;
     setDraggingId(null);
     setOver(null);
+    setItemOver(null);
     setPointer(null);
+    setSourceSize(null);
   }, []);
 
   useEffect(() => {
@@ -299,6 +352,9 @@ export function useDragSort({
       if (!same) {
         overRef.current = hit;
         setOver(hit);
+        // 粘住最近一次命中的**条目**落点，供"让位"顺序使用（见 itemOver 的说明）。
+        // 只在命中的是条目时更新：拖到文件夹上是"放进去"，不该动排序。
+        if (hit?.kind === "item") setItemOver(hit);
       }
     };
 
@@ -334,9 +390,21 @@ export function useDragSort({
 
         s.active = true;
         setDraggingId(s.id);
-        // 拖拽期间布局本身不会变，矩形缓存一次就够——
-        // 每帧对所有卡片调 getBoundingClientRect 会强制同步布局，很浪费。
-        // 但**滚动会让它失效**，所以同时挂上滚动监听（见 onScroll）。
+        // 浮层的尺寸用按下那一刻量好的：调用方一进入拖拽状态就会把原来那一格
+        // 换成空位，元素不在了，这时再量只能量到空位
+        setSourceSize(s.size);
+        /**
+         * 矩形只在这里缓存一次，**之后不跟着"让位"重测**。
+         *
+         * 每帧对所有卡片调 `getBoundingClientRect` 会强制同步布局，很浪费；
+         * 更要紧的是：让位之后格子会重排，重测 → 落点变了 → 又重排，
+         * 很容易变成来回闪的循环。
+         *
+         * 不重测是可以接受的，因为 `previewOrder` 是**单调**的：
+         * 指针沿拖动轴扫过去，空位只会依次往前挪，不会跳来跳去。
+         * 代价是"换位的中点"落在格子**按下时**的位置上，而不是重排之后的位置 ——
+         * 实测格子等宽时两者几乎重合，感觉不出来。
+         */
         s.candidates = collect(s.kind);
         document.addEventListener("scroll", onScroll, true);
       }
@@ -398,6 +466,8 @@ export function useDragSort({
       const onDragHandle = el?.closest?.(`[${DRAG_HANDLE_ATTR}]`) != null;
       if (!canStartDrag(onControl, onDragHandle)) return;
 
+      // 尺寸在这里量：等真正进入拖拽状态时，这个元素已经被换成空位了
+      const rect = (e.currentTarget as HTMLElement | null)?.getBoundingClientRect();
       session.current = {
         id,
         kind,
@@ -405,6 +475,7 @@ export function useDragSort({
         startY: e.clientY,
         active: false,
         candidates: [],
+        size: { width: rect?.width ?? 0, height: rect?.height ?? 0 },
         lastX: e.clientX,
         lastY: e.clientY,
       };
@@ -427,15 +498,6 @@ export function useDragSort({
     [onPointerDownFor],
   );
 
-  const overClass = useCallback(
-    (id: string) => {
-      if (over?.kind !== "item" || over.id !== id) return "";
-      const edge = axis === "vertical" ? "" : "-x";
-      return over.before ? `drag-over-before${edge}` : `drag-over-after${edge}`;
-    },
-    [over, axis],
-  );
-
   const consumeClick = useCallback(() => {
     if (!swallowClick.current) return false;
     swallowClick.current = false;
@@ -450,5 +512,14 @@ export function useDragSort({
     return () => document.body.classList.remove("dragging");
   }, [draggingId]);
 
-  return { draggingId, over, pointer, itemProps, handleProps, overClass, consumeClick };
+  return {
+    draggingId,
+    over,
+    itemOver,
+    pointer,
+    sourceSize,
+    itemProps,
+    handleProps,
+    consumeClick,
+  };
 }

@@ -595,9 +595,18 @@ textarea {
 }
 
 .field__input--area {
-  flex: 1;
+  /* 多行输入框可以让用户自己拖着调高度（右下角那两条小斜杠）。
+     ⚠️ 这里有两个坑，两个都踩过：
+     1. `flex: 1` 等价于 `flex-basis: 0%`，而 flex-basis **会盖掉 `height`** ——
+        浏览器拖拽改大小写的正是 `height`，所以写成 `flex: 1` 时拖了毫无反应。
+        改成 `flex: 0 0 auto`，高度就由 `height` 说了算。
+     2. 只给 `height: auto` 的话，默认高度是 textarea 的 `rows=2`（约两行），
+        比原来矮一大截。所以显式给 `height: 100%` 撑满外层，
+        用户拖过之后行内 height 会盖掉它，没拖过时和以前一模一样。 */
+  flex: 0 0 auto;
+  height: 100%;
   min-height: 80px;
-  resize: none;
+  resize: vertical;
   line-height: 1.55;
 }
 

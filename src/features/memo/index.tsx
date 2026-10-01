@@ -239,7 +239,13 @@ export function MemoPanel() {
       setEditing(null);
       setFeedback("已保存");
     } catch (err) {
+      // ⚠️ 这里**必须**同时给一条用户看得见的提示。
+      //
+      // 原来只 `setError`，而错误条渲染在列表那棵树里，编辑器分支是整棵换掉的 ——
+      // 用户看到的是"点了保存毫无反应，表单还开着"，一个字都没有。
+      // 提示走 `feedback`（编辑器里也渲染），`error` 留给列表。
       setError(String(err));
+      setFeedback(`保存失败：${String(err)}`);
     }
   };
 
@@ -250,16 +256,39 @@ export function MemoPanel() {
       setFeedback("已删除");
     } catch (err) {
       setError(String(err));
+      setFeedback(`删除失败：${String(err)}`);
     }
   };
 
+  /**
+   * 提示条 + 读写异常条。
+   *
+   * 抽出来是因为**编辑器分支也要渲染它们**：这两条原来只在列表那棵树里，
+   * 而 `if (editing) return <MemoEditor/>` 会整棵换掉 —— 保存失败时
+   * 用户一个字都看不到。
+   */
+  const notices = (
+    <>
+      {feedback && (
+        <div className="memo__feedback">
+          <Check size={13} />
+          {feedback}
+        </div>
+      )}
+      {error && <div className="memo__error">数据读写异常：{error}</div>}
+    </>
+  );
+
   if (editing) {
     return (
-      <MemoEditor
-        draft={editing}
-        onCancel={() => setEditing(null)}
-        onSave={(m) => void save(m)}
-      />
+      <div className="memo">
+        {notices}
+        <MemoEditor
+          draft={editing}
+          onCancel={() => setEditing(null)}
+          onSave={(m) => void save(m)}
+        />
+      </div>
     );
   }
 
@@ -326,14 +355,7 @@ export function MemoPanel() {
         </button>
       </div>
 
-      {feedback && (
-        <div className="memo__feedback">
-          <Check size={13} />
-          {feedback}
-        </div>
-      )}
-
-      {error && <div className="memo__error">数据读写异常：{error}</div>}
+      {notices}
 
       <div className="memo__list">
         {loading && <div className="memo__empty">正在读取数据…</div>}

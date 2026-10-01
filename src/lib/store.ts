@@ -36,17 +36,39 @@ export function usePersistentState<T>(file: string, initial: T) {
   /** 连续写失败次数：给重试做退避，并设个上限（磁盘真写不了时不能一直撞）。 */
   const failures = useRef(0);
   const timer = useRef<number | null>(null);
+  /**
+   * 正在飞的那次写盘。
+   *
+   * `flush()` 要能**如实回答"存上了没有"**（片段编辑器靠它决定提示"已保存"
+   * 还是"保存失败"），而"已经有写盘在飞"时 `begin()` 会返回 null ——
+   * 那种情况下必须等这次飞行落地再回答，否则会撒一个"已保存"的谎。
+   */
+  const pending = useRef<Promise<boolean> | null>(null);
 
-  /** 立即把当前值写入磁盘。 */
-  const flush = useCallback(async () => {
+  /**
+   * 立即把当前值写入磁盘。
+   *
+   * @returns **是否确实写成功了**。没有待写内容算成功；写失败算失败。
+   *   调用方（例如"保存"按钮）必须等这个结果再告诉用户"已保存" ——
+   *   原来它返回 void，于是界面只能无条件说成功。
+   */
+  const flush = useCallback(async (): Promise<boolean> => {
+    // 已经有一次在飞：先等它落地。落地后如果还有新改动，下面会再写一次。
+    const flying = pending.current;
+    if (flying) {
+      await flying;
+      if (!coord.current.dirty) return true;
+    }
+
     const writing = coord.current.begin();
     if (writing === null) {
-      // 没有待写内容，或者**已经有写盘在飞**。
+      // 走到这里只有一种可能：`dirty` 为假（在飞的情况上面已经等过了）。
+      // 也就是说磁盘上已经是最新的，算成功。
       //
-      // 这里**不能**顺手把定时器清掉：清了之后，万一在飞的那次写失败
+      // 注意这里**不能**顺手把定时器清掉：清了之后，万一在飞的那次写失败
       // （它只调 fail()、不 commit），就再没有任何东西安排下一次写盘了 ——
       // 用户若就此不再改动并退出，最后一次编辑会永久丢失。
-      return;
+      return !coord.current.dirty;
     }
 
     if (timer.current !== null) {
@@ -54,36 +76,48 @@ export function usePersistentState<T>(file: string, initial: T) {
       timer.current = null;
     }
 
-    try {
-      await api.writeData(file, latest.current);
-      setError(null);
-      failures.current = 0;
-      // 写盘期间用户又改了：必须立刻再写一次。
-      // 旧实现这里是无条件 `dirty = false`，那一次改动就永远落不了盘 ——
-      // 而且 beforeunload / 窗口隐藏的兜底落盘走的也是这个函数，同样会早退。
-      if (coord.current.commit(writing)) {
-        timer.current = window.setTimeout(() => {
-          void flush();
-        }, 0);
-      }
-    } catch (err) {
-      // 写失败：解除"在飞"标记但不动版本号，于是 dirty 保持为真
-      coord.current.fail();
-      setError(String(err));
-
-      // 而且必须**自己再排一次**：此刻 dirty 为真、却没有任何定时器在等
-      // （`begin()` 早退那条路径已经把定时器清掉了）。只靠"下次 update 会排"
-      // 是不够的 —— 用户可能就此不再改动，直接从托盘退出。
-      // 加上限 + 递增间隔：磁盘真的写不了时不能每 400ms 撞一次。
-      if (failures.current < 3) {
-        failures.current += 1;
-        timer.current = window.setTimeout(
-          () => {
+    const task = (async (): Promise<boolean> => {
+      try {
+        await api.writeData(file, latest.current);
+        setError(null);
+        failures.current = 0;
+        // 写盘期间用户又改了：必须立刻再写一次。
+        // 旧实现这里是无条件 `dirty = false`，那一次改动就永远落不了盘 ——
+        // 而且 beforeunload / 窗口隐藏的兜底落盘走的也是这个函数，同样会早退。
+        if (coord.current.commit(writing)) {
+          timer.current = window.setTimeout(() => {
             void flush();
-          },
-          WRITE_DEBOUNCE_MS * failures.current,
-        );
+          }, 0);
+        }
+        return true;
+      } catch (err) {
+        // 写失败：解除"在飞"标记但不动版本号，于是 dirty 保持为真
+        coord.current.fail();
+        setError(String(err));
+
+        // 而且必须**自己再排一次**：此刻 dirty 为真、却没有任何定时器在等
+        // （`begin()` 早退那条路径已经把定时器清掉了）。只靠"下次 update 会排"
+        // 是不够的 —— 用户可能就此不再改动，直接从托盘退出。
+        // 加上限 + 递增间隔：磁盘真的写不了时不能每 400ms 撞一次。
+        if (failures.current < 3) {
+          failures.current += 1;
+          timer.current = window.setTimeout(
+            () => {
+              void flush();
+            },
+            WRITE_DEBOUNCE_MS * failures.current,
+          );
+        }
+        return false;
       }
+    })();
+
+    pending.current = task;
+    try {
+      return await task;
+    } finally {
+      // 只有队尾还是自己时才清，否则会把后来者的记录删掉
+      if (pending.current === task) pending.current = null;
     }
   }, [file]);
 

@@ -95,7 +95,7 @@ function mask(text: string): string {
 }
 
 export function SnippetsPanel() {
-  const { value: snippets, update, loading, error } = usePersistentState<Snippet[]>(
+  const { value: snippets, update, loading, error, flush } = usePersistentState<Snippet[]>(
     DATA_FILE,
     [],
   );
@@ -243,7 +243,21 @@ export function SnippetsPanel() {
     );
   };
 
-  const save = (draft: Snippet) => {
+  /**
+   * 保存一条片段。
+   *
+   * # 为什么必须 `await flush()` 之后再提示
+   *
+   * `update()` 只是把新值放进内存并**排一次 400ms 的防抖写盘**，它不等结果。
+   * 原来这里紧接着就 `showFeedback("已保存")` —— 磁盘满、数据目录只读、
+   * 文件被杀软独占时，用户看到的是绿色对勾，**重启之后这条根本不存在**。
+   * 这是全项目唯一一处"确信存上了、其实没存"的路径，而它恰好发生在
+   * 用户最需要被告知的时刻。
+   *
+   * 失败时**不关编辑器**：关掉就等于告诉用户"存好了"，而改动其实只在内存里。
+   * 留着编辑器 + 一条警示提示，用户可以再点一次保存。
+   */
+  const save = async (draft: Snippet) => {
     const cleaned: Snippet = {
       ...draft,
       title: draft.title.trim() || summarize(draft.content, 24) || "未命名",
@@ -253,13 +267,23 @@ export function SnippetsPanel() {
       const exists = prev.some((s) => s.id === cleaned.id);
       return exists ? prev.map((s) => (s.id === cleaned.id ? cleaned : s)) : [cleaned, ...prev];
     });
-    setEditing(null);
-    showFeedback("已保存");
+
+    if (await flush()) {
+      setEditing(null);
+      showFeedback("已保存");
+      return;
+    }
+    showFeedback("保存失败：改动只在内存里，请检查数据目录能不能写", "warn");
   };
 
-  const remove = (id: string) => {
+  /** 删除一条。同样要等落盘结果再说话 —— 不可逆的操作尤其不能谎报成功。 */
+  const remove = async (id: string) => {
     update((prev) => prev.filter((s) => s.id !== id));
-    showFeedback("已删除");
+    const ok = await flush();
+    showFeedback(
+      ok ? "已删除" : "删除失败：改动只在内存里，重启后它还会回来",
+      ok ? "ok" : "warn",
+    );
   };
 
   const toggleFlag = (id: string, key: "starred" | "sensitive") => {
@@ -278,7 +302,12 @@ export function SnippetsPanel() {
     setMovingId(null);
     if ((s.folderId ?? null) === folderId) return;
     update((prev) => prev.map((x) => (x.id === s.id ? { ...x, folderId } : x)));
-    showFeedback(`已移动「${s.title}」`);
+    void flush().then((ok) =>
+      showFeedback(
+        ok ? `已移动「${s.title}」` : "移动失败：改动只在内存里，重启后它会回到原处",
+        ok ? "ok" : "warn",
+      ),
+    );
   };
 
   /**
@@ -311,13 +340,43 @@ export function SnippetsPanel() {
     });
   };
 
+  /**
+   * 提示条 + 读写异常条。
+   *
+   * 抽出来是因为**编辑器分支也要渲染它们**：原来这两条只在列表那棵树里，
+   * 而 `if (editing) return <SnippetEditor/>` 会整棵换掉 —— 于是"保存失败"
+   * 的那句话被写进了一个当帧根本不渲染的 state，用户一个字都看不到。
+   */
+  const notices = (
+    <>
+      {feedback && (
+        <div
+          className={`snip__feedback${
+            feedback.kind === "warn" ? " snip__feedback--warn" : ""
+          }`}
+        >
+          {feedback.kind === "warn" ? (
+            <TriangleAlert size={13} />
+          ) : (
+            <Check size={13} />
+          )}
+          {feedback.text}
+        </div>
+      )}
+      {error && <div className="snip__error">数据读写异常：{error}</div>}
+    </>
+  );
+
   if (editing) {
     return (
-      <SnippetEditor
-        draft={editing}
-        onCancel={() => setEditing(null)}
-        onSave={save}
-      />
+      <div className="snip">
+        {notices}
+        <SnippetEditor
+          draft={editing}
+          onCancel={() => setEditing(null)}
+          onSave={save}
+        />
+      </div>
     );
   }
 
@@ -357,22 +416,7 @@ export function SnippetsPanel() {
         </button>
       </div>
 
-      {feedback && (
-        <div
-          className={`snip__feedback${
-            feedback.kind === "warn" ? " snip__feedback--warn" : ""
-          }`}
-        >
-          {feedback.kind === "warn" ? (
-            <TriangleAlert size={13} />
-          ) : (
-            <Check size={13} />
-          )}
-          {feedback.text}
-        </div>
-      )}
-
-      {error && <div className="snip__error">数据读写异常：{error}</div>}
+      {notices}
 
       {/* 当前路径。放在列表上方：先看到「我在哪」，再看这一层有什么 */}
       <div className="folderzone">
@@ -491,7 +535,7 @@ export function SnippetsPanel() {
                 <button className="iconbtn" onClick={() => setEditing(s)} title="编辑">
                   <Pencil size={13} />
                 </button>
-                <button className="iconbtn iconbtn--danger" onClick={() => remove(s.id)} title="删除">
+                <button className="iconbtn iconbtn--danger" onClick={() => void remove(s.id)} title="删除">
                   <Trash2 size={13} />
                 </button>
 
@@ -525,7 +569,7 @@ function SnippetEditor({
   onCancel,
 }: {
   draft: Snippet;
-  onSave: (s: Snippet) => void;
+  onSave: (s: Snippet) => void | Promise<void>;
   onCancel: () => void;
 }) {
   const [form, setForm] = useState<Snippet>(draft);

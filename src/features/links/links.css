@@ -98,6 +98,17 @@
      默认 1（不缩放）。文件夹卡片的高度也用同一个变量，
      这样两者永远一样大。 */
   grid-template-columns: repeat(auto-fill, minmax(calc(86px * var(--tile-scale, 1)), 1fr));
+
+  /* ⚠️ 这一行不能删，它是「名字第二行不被裁掉」的另一半。
+     格子的高度只给了下限（见 .links__tile 的说明），可是**光有下限不够**：
+     网格内容比容器高的时候（也就是格子墙开始滚动时），
+     Chrome 会把 auto 行压到格子的 `min-height` 那个下限上 ——
+     于是行高从「内容需要的高度」掉回 92px × 档位，第二行又被裁掉。
+     实测 20 个链接（5 行，必滚）在 7 档字号 × 10 档缩放的矩阵里
+     有 212 处半行裁切，且默认档位就中招。
+     `min-content` 把行的下限钉在「内容需要的高度」，容器装不下就老老实实滚动。 */
+  grid-auto-rows: min-content;
+
   gap: 6px;
   align-content: start;
 }
@@ -144,7 +155,9 @@
      真事故：「清内存-双击这个」在默认档位下只显示「清内存-双击这」，
      把缩放拉到最大才完整（那时格子高 147px，装得下）。
      min-height 之后行高由内容决定：同一行的格子被 grid 拉成一样高，
-     行与行之间允许差几像素，而文字在任何「字号 × 档位」组合下都不会被裁。 */
+     行与行之间允许差几像素，而文字在任何「字号 × 档位」组合下都不会被裁。
+     ⚠️ 这一条要配合 .links__grid 的 `grid-auto-rows: min-content` 才成立 ——
+     只改这里的话，网格一开始滚动，行又会被压回这个 min-height。 */
   min-height: calc(92px * var(--tile-scale, 1));
   background: var(--bg-raised);
   border: 1px solid var(--border);

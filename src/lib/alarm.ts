@@ -97,6 +97,17 @@ export interface AdvanceAlarmsResult {
  * 只响一次的闹钟刻意**不动**：它就该停在「已完成」，
  * 保持 `fired` 为真反而让调度线程永远不会为它再响。
  *
+ * # 为什么写回去走 `timerAdvanceAlarm` 而不是 `timerSave`
+ *
+ * 上面那个 `filter` 拿到的是**快照**，而 `timerSave` 是整条覆盖写。
+ * 从"读到快照"到"写回去"中间隔着一次 IPC 往返，用户完全可能在这期间
+ * 点了「停止」（写 `endsAt: null, fired: false`）—— 覆盖写会把这一下
+ * **静默吞掉**：界面已经变回「未开始」，盘上却还排着明天响，第二天照样吵醒他。
+ *
+ * 所以权威判断放在 Rust 侧的同一把锁里（`Timer::advance_alarm_to`），
+ * 前端只负责算"下一次是几点"。下面的 `filter` 只是为了少打几次 IPC，
+ * 不是权威 —— 它拦不住任何竞态。
+ *
  * @param list    当前的全量计时器
  * @param onError 可选的错误回调；后台调用方不传，改看返回的 `failed`
  */
@@ -122,16 +133,15 @@ export async function advanceAlarms(
   for (const alarm of due) {
     advancing.add(alarm.id);
     try {
-      const next: Timer = {
-        ...alarm,
-        // 重新算而不是"在上一次的基础上 +1 天"：算出来的一定落在未来，
-        // 所以休眠很久、系统时钟被回拨过都不会推出一个过去时刻
-        endsAt: nextAlarmAt(alarm.alarmMinutes),
-        remainingMs: null,
-        fired: false,
-      };
-      await api.timerSave(next);
-      saved.push(next);
+      // 重新算而不是"在上一次的基础上 +1 天"：算出来的一定落在未来，
+      // 所以休眠很久、系统时钟被回拨过都不会推出一个过去时刻
+      const endsAt = nextAlarmAt(alarm.alarmMinutes);
+      // Rust 侧会再检查一次"这条现在还该不该推进"。用户中途点过
+      // 「停止」「再响一次」「删除」的话它返回 false，这次推进就当没发生 ——
+      // 用户的操作永远优先。
+      const advanced = await api.timerAdvanceAlarm(alarm.id, endsAt);
+      if (!advanced) continue;
+      saved.push({ ...alarm, endsAt, remainingMs: null, fired: false });
     } catch (err) {
       failed += 1;
       onError?.(String(err));
@@ -160,7 +170,8 @@ export async function advanceAlarms(
  *
  * 必须重试，理由和 `advanceRepeatsOnce` 完全一样：Rust 侧的 `fired` **已经落盘**，
  * 这次推进要是没写成功，`fired` 就一直是 true —— 调度线程不会再为它产生新事件，
- * 也就没有"下一次"可言，这个闹钟永久静默，只有重启才可能恢复。
+ * 也就没有"下一次"可言，这个闹钟静默，只有重启才可能恢复。
+ * （另外 `main.tsx` 还有一条一分钟一次的兜底扫描，见那里的说明。）
  *
  * ⚠️ 重试的是 `advanceAlarms` **返回的 `failed`**，不是它抛出的异常：
  * 它内部把每条写盘失败都 `catch` 掉了并正常返回，只靠外层 `try/catch`

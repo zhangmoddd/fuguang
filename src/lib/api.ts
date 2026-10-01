@@ -285,6 +285,19 @@ export const api = {
   timersList: () => invoke<Timer[]>("timers_list"),
   timerSave: (timer: Timer) => invoke<void>("timer_save", { timer }),
   timerRemove: (id: string) => invoke<void>("timer_remove", { id }),
+  /**
+   * 把一个「每天重复」的闹钟推进到下一次响铃时刻（下一次时刻由调用方算好）。
+   *
+   * 为什么不用 `timerSave` 写回去：那是"读出来 → 改一改 → 整条覆盖写"，
+   * 中间隔着一次 IPC 往返。用户在这两步之间点下「停止」，就会被静默吞掉
+   * （界面显示「未开始」，盘上还排着明天响）。判断和写入必须在 Rust 侧
+   * 同一把锁里完成，所以单独一条命令 —— 详见 `lib/alarm.ts`。
+   *
+   * @returns 是否真的推进了。`false` 表示这条闹钟当时不处于可推进的状态
+   *          （用户已经停掉/改过/删掉它），调用方不该广播、也不该改本地状态。
+   */
+  timerAdvanceAlarm: (id: string, nextEndsAt: number) =>
+    invoke<boolean>("timer_advance_alarm", { id, nextEndsAt }),
 
   // ---- 备忘录 ----
   memosList: () => invoke<Memo[]>("memos_list"),

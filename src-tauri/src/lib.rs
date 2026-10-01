@@ -71,6 +71,7 @@ pub fn run() {
             commands::timers_list,
             commands::timer_save,
             commands::timer_remove,
+            commands::timer_advance_alarm,
             // 备忘录
             commands::memos_list,
             commands::memo_save,

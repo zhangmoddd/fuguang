@@ -228,6 +228,42 @@ pub async fn timer_remove(app: AppHandle, id: String) -> Result<(), String> {
     state::persist(&app, || store.lock().timers.clone(), state::save_timers)
 }
 
+/// 把一个「每天重复」的闹钟推进到下一次响铃时刻。
+///
+/// # 为什么不能由前端读出来改一改、再 `timer_save` 写回去
+///
+/// 那是跨越 IPC 的「比较并交换」：前端读到的是 `fired: true, endsAt: null`，
+/// 而在它把结果写回来之前，用户可能已经点了「停止」或「再响一次」。
+/// `timer_save` 是**整条覆盖写**，于是用户那一下会被静默吞掉 ——
+/// 界面上已经变回「未开始」，盘上却还排着明天响，第二天照样吵醒他。
+///
+/// 所以判断和写入必须落在同一把锁里（见 [`Timer::advance_alarm_to`]）。
+/// 下一次响铃时刻仍然由前端算：Rust 没有日历能力，也不打算引
+/// （见 [`crate::models`] 顶部的分工）。
+///
+/// 返回 `true` 表示真的推进了，调用方据此决定要不要广播给其他窗口。
+#[tauri::command]
+pub async fn timer_advance_alarm(
+    app: AppHandle,
+    id: String,
+    next_ends_at: i64,
+) -> Result<bool, String> {
+    let store = app.state::<Store>();
+    let advanced = {
+        let mut st = store.lock();
+        match st.timers.iter_mut().find(|t| t.id == id) {
+            Some(t) => t.advance_alarm_to(next_ends_at),
+            // 用户已经把它删了：什么都不做，更不能把它复活
+            None => false,
+        }
+    };
+
+    if advanced {
+        state::persist(&app, || store.lock().timers.clone(), state::save_timers)?;
+    }
+    Ok(advanced)
+}
+
 // ===============================================================
 // 备忘录
 // ===============================================================

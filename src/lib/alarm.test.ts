@@ -17,14 +17,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Timer } from "./api";
 
 // `vi.mock` 会被提升到文件顶部，所以 mock 必须用 `vi.hoisted` 定义
-const { timerSave, timersList, emitTimersChanged } = vi.hoisted(() => ({
-  timerSave: vi.fn(),
+const { timerAdvanceAlarm, timersList, emitTimersChanged } = vi.hoisted(() => ({
+  timerAdvanceAlarm: vi.fn(),
   timersList: vi.fn(),
   emitTimersChanged: vi.fn(),
 }));
 
 vi.mock("./api", () => ({
-  api: { timerSave, timersList },
+  api: { timerAdvanceAlarm, timersList },
   emitTimersChanged,
 }));
 
@@ -228,10 +228,10 @@ describe.skipIf(!DST)("闹钟跨夏令时（当前时区有夏令时，断言真
 
 describe("advanceAlarms", () => {
   beforeEach(() => {
-    timerSave.mockReset();
+    timerAdvanceAlarm.mockReset();
     timersList.mockReset();
     emitTimersChanged.mockReset();
-    timerSave.mockResolvedValue(undefined);
+    timerAdvanceAlarm.mockResolvedValue(true);
     emitTimersChanged.mockResolvedValue(undefined);
   });
 
@@ -241,32 +241,49 @@ describe("advanceAlarms", () => {
     expect(result.failed).toBe(0);
     expect(result.saved).toHaveLength(1);
 
-    const sent = timerSave.mock.calls[0][0] as Timer;
-    expect(sent.fired).toBe(false);
-    expect(sent.endsAt).not.toBeNull();
-    expect(sent.endsAt as number).toBeGreaterThan(Date.now());
+    // 走的是 Rust 侧的条件更新命令，不是 timerSave 的整条覆盖写
+    expect(timerAdvanceAlarm).toHaveBeenCalledTimes(1);
+    const [id, endsAt] = timerAdvanceAlarm.mock.calls[0] as [string, number];
+    expect(id).toBe("a1");
+    expect(endsAt).toBeGreaterThan(Date.now());
     // 钟点必须还是用户设的那个
-    expect(splitLocal(sent.endsAt as number).time).toBe("07:30");
-    expect(sent.alarmMinutes).toBe(450);
+    expect(splitLocal(endsAt).time).toBe("07:30");
+
+    // 本地状态也要跟上，否则调用方拿到的 saved 和盘上不一致
+    expect(result.saved[0].fired).toBe(false);
+    expect(result.saved[0].endsAt).toBe(endsAt);
+    expect(result.saved[0].remainingMs).toBeNull();
+    expect(result.saved[0].alarmMinutes).toBe(450);
+  });
+
+  it("Rust 说不用推进（用户已经停掉/删掉）时不算成功、也不广播", async () => {
+    // 这是「用户的停止不会被吞掉」的前端一侧：权威判断在 Rust，
+    // 它返回 false 时我们必须当这次推进没发生
+    timerAdvanceAlarm.mockResolvedValue(false);
+
+    const result = await advanceAlarms([alarm()]);
+
+    expect(result).toEqual({ saved: [], failed: 0 });
+    expect(emitTimersChanged).not.toHaveBeenCalled();
   });
 
   it("只响一次的闹钟刻意不动", async () => {
     // 它就该停在「已完成」。保持 fired 为真，调度线程才不会为它再响
     const result = await advanceAlarms([alarm({ alarmDaily: false })]);
     expect(result).toEqual({ saved: [], failed: 0 });
-    expect(timerSave).not.toHaveBeenCalled();
+    expect(timerAdvanceAlarm).not.toHaveBeenCalled();
   });
 
   it("还没响过的闹钟不动", async () => {
     const result = await advanceAlarms([alarm({ fired: false })]);
     expect(result).toEqual({ saved: [], failed: 0 });
-    expect(timerSave).not.toHaveBeenCalled();
+    expect(timerAdvanceAlarm).not.toHaveBeenCalled();
   });
 
   it("endsAt 还没清空的（这一轮还没结束）不动", async () => {
     const result = await advanceAlarms([alarm({ endsAt: Date.now() + 60_000 })]);
     expect(result).toEqual({ saved: [], failed: 0 });
-    expect(timerSave).not.toHaveBeenCalled();
+    expect(timerAdvanceAlarm).not.toHaveBeenCalled();
   });
 
   it("别的类型一概不动", async () => {
@@ -277,12 +294,12 @@ describe("advanceAlarms", () => {
     ];
     const result = await advanceAlarms(others);
     expect(result).toEqual({ saved: [], failed: 0 });
-    expect(timerSave).not.toHaveBeenCalled();
+    expect(timerAdvanceAlarm).not.toHaveBeenCalled();
   });
 
   it("写盘失败必须计数，不能只交给 onError", async () => {
     // 后台调用方不传 onError，它只能靠 `failed` 知道要重试
-    timerSave.mockRejectedValue(new Error("磁盘忙"));
+    timerAdvanceAlarm.mockRejectedValue(new Error("磁盘忙"));
     const onError = vi.fn();
 
     const result = await advanceAlarms([alarm()], onError);
@@ -293,7 +310,9 @@ describe("advanceAlarms", () => {
   });
 
   it("一条失败不影响其余几条的推进", async () => {
-    timerSave.mockRejectedValueOnce(new Error("磁盘忙")).mockResolvedValue(undefined);
+    timerAdvanceAlarm
+      .mockRejectedValueOnce(new Error("磁盘忙"))
+      .mockResolvedValue(true);
 
     const result = await advanceAlarms([alarm({ id: "a" }), alarm({ id: "b" })]);
 
@@ -326,7 +345,7 @@ describe("advanceAlarms", () => {
 
 describe("advanceAlarmsOnce（后台调用方）", () => {
   beforeEach(() => {
-    timerSave.mockReset();
+    timerAdvanceAlarm.mockReset();
     timersList.mockReset();
     emitTimersChanged.mockReset();
     emitTimersChanged.mockResolvedValue(undefined);
@@ -334,23 +353,25 @@ describe("advanceAlarmsOnce（后台调用方）", () => {
 
   it("没有失败时只跑一次", async () => {
     timersList.mockResolvedValue([alarm()]);
-    timerSave.mockResolvedValue(undefined);
+    timerAdvanceAlarm.mockResolvedValue(true);
 
     await advanceAlarmsOnce();
 
     expect(timersList).toHaveBeenCalledTimes(1);
-    expect(timerSave).toHaveBeenCalledTimes(1);
+    expect(timerAdvanceAlarm).toHaveBeenCalledTimes(1);
   });
 
   it("写盘失败会真的重试", async () => {
     timersList.mockResolvedValue([alarm()]);
-    timerSave.mockRejectedValueOnce(new Error("磁盘忙")).mockResolvedValue(undefined);
+    timerAdvanceAlarm
+      .mockRejectedValueOnce(new Error("磁盘忙"))
+      .mockResolvedValue(true);
 
     await advanceAlarmsOnce();
 
     // 第一次失败 → 退避 500ms 后重试 → 成功
     expect(timersList).toHaveBeenCalledTimes(2);
-    expect(timerSave).toHaveBeenCalledTimes(2);
+    expect(timerAdvanceAlarm).toHaveBeenCalledTimes(2);
   });
 
   it("读盘失败也会重试，且不抛出去", async () => {
@@ -363,7 +384,7 @@ describe("advanceAlarmsOnce（后台调用方）", () => {
 
   it("一直失败也不会无限重试", async () => {
     timersList.mockResolvedValue([alarm()]);
-    timerSave.mockRejectedValue(new Error("磁盘一直忙"));
+    timerAdvanceAlarm.mockRejectedValue(new Error("磁盘一直忙"));
 
     await advanceAlarmsOnce();
 

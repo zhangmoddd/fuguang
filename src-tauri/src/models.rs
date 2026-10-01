@@ -108,10 +108,9 @@ pub struct Timer {
     /// （`7:30` / `07:30` / `0730`），而分钟数是唯一的整数表示，
     /// 排序和比较都是现成的。
     ///
-    /// 取值范围刻意不在 Rust 侧夹取：调度线程根本不用它，
-    /// 消费方（前端 `lib/alarm.ts`）会先取模再格式化，一个手改出来的
-    /// `99999` 只会显示成某个合法钟点，不会让任何东西坏掉。
-    #[serde(default)]
+    /// 反序列化走 [`lenient_minutes`] 而不是直接 `u32`，**理由见那个函数** ——
+    /// 简单说：手改成一个越界数值不该让整份 `timers.json` 被判为损坏。
+    #[serde(default, deserialize_with = "lenient_minutes")]
     pub alarm_minutes: u32,
 
     /// 闹钟是否每天重复。
@@ -138,6 +137,76 @@ fn default_focus_minutes() -> u32 {
 }
 fn default_break_minutes() -> u32 {
     5
+}
+
+/// 宽容地读一个「钟点分钟数」：**任何 JSON 值都能收成一个合法钟点，绝不失败**。
+///
+/// # 为什么不能直接写 `u32`
+///
+/// `timers.json` 是纯文本、用户可以手改（README 里就是这么承诺的）。
+/// 而 `serde` 对 `u32` 遇到 `-1`、`1.5`、`99999999999` 都会**解析失败**，
+/// 而解析失败会被 [`crate::storage::read_json_at`] 当成「文件损坏」——
+/// **整份计时器被改名隔离**，不只是这一条坏掉，用户会以为数据全丢了。
+///
+/// 这个字段的用途只是「取模之后当钟点显示 / 算下一次响铃」，任何数值都能归到
+/// 一个合法钟点，所以宽容没有任何代价：
+///
+/// - 数字 → 向下取整后对 1440 取模（负数也能落进 0~1439）
+/// - 其它形状（字符串、null、对象、`NaN`）→ 0 点
+///
+/// # 为什么只对这个字段宽容
+///
+/// 别处的字段（`focus_minutes`、枚举值 `kind`）刻意保持严格：那些值一旦被
+/// 悄悄改掉，调度线程会做出**错误的行为**（0 分钟的番茄钟会变成弹窗风暴），
+/// 明确报错并隔离反而是对的。钟点不一样 —— 它只是"几点响"，
+/// 归一到最近的一个合法钟点永远比丢掉全部数据好。
+fn lenient_minutes<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let raw = value.as_f64().unwrap_or(0.0);
+    if !raw.is_finite() {
+        return Ok(0);
+    }
+    // `rem_euclid` 而不是 `%`：后者对负数会返回负值，落不进 0~1439
+    Ok(raw.floor().rem_euclid(1440.0) as u32)
+}
+
+impl Timer {
+    /// 这条闹钟是不是「已经响过、还没排下一次」。
+    ///
+    /// 只有这一种状态才该被推进。用户中途点过「停止」（`fired` 变回 false）
+    /// 或「再响一次」（`ends_at` 已经有值），以及只响一次的闹钟，
+    /// 都不该被动。
+    pub fn alarm_needs_advance(&self) -> bool {
+        self.kind == TimerKind::Alarm
+            && self.alarm_daily
+            && self.fired
+            && self.ends_at.is_none()
+    }
+
+    /// 把这条闹钟排到下一次响铃。返回 `false` 表示它当时不处于可推进的状态，
+    /// 一个字段都没改。
+    ///
+    /// # 为什么要做成「条件更新」而不是让调用方自己判断
+    ///
+    /// 判断和写入必须在**同一把锁里**。前端的做法是「读出来 → 算下一次 →
+    /// 写回去」，中间隔着一次 IPC 往返；用户完全可能在这两步之间点下「停止」，
+    /// 而 `timer_save` 是整条覆盖写 —— 用户那一下就被静默吞掉了
+    /// （界面显示「未开始」，盘上还排着明天响）。这个方法让"检查 + 改"
+    /// 成为一个原子步骤，用户的操作永远优先。
+    pub fn advance_alarm_to(&mut self, next_ends_at: i64) -> bool {
+        if !self.alarm_needs_advance() {
+            return false;
+        }
+        self.ends_at = Some(next_ends_at);
+        // 闹钟没有"剩余时长"这个概念。留一个 0 在这里，前端会把
+        // 「已完成」误判成「已暂停」并给出「继续」按钮。
+        self.remaining_ms = None;
+        self.fired = false;
+        true
+    }
 }
 
 /// 提醒的重复规则。
@@ -497,8 +566,143 @@ mod tests {
     }
 
     #[test]
-    fn 闹钟的钟点与重复设置能往返序列化() {
-        let t = Timer {
+    fn 闹钟钟点被手改成越界值也不会让整份数据读不出来() {
+        // 场景：用户手改 timers.json，或者被别的工具改坏。
+        // `u32` 遇到这些值会解析失败，而解析失败会被 storage 当成
+        // 「文件损坏」把**整份计时器**改名隔离 —— 代价太大，
+        // 而这个字段只是"几点响"，任何数值都能归到一个合法钟点。
+        for (bad, want) in [
+            ("-1", 1439),
+            ("1.5", 1),
+            ("99999999999", (99999999999u64 % 1440) as u32),
+            ("\"450\"", 0),
+            ("null", 0),
+            ("{}", 0),
+            ("1440", 0),
+        ] {
+            let json = format!(
+                r#"{{"id":"a","name":"n","kind":"alarm","alarmMinutes":{bad},"createdAt":1}}"#
+            );
+            let t: Timer = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("alarmMinutes={bad} 不该让整条解析失败：{e}"));
+            assert_eq!(t.alarm_minutes, want, "alarmMinutes={bad} 的归一结果不对");
+            assert!(t.alarm_minutes < 1440, "归一之后必须是合法钟点");
+        }
+    }
+
+    #[test]
+    fn 合法钟点原样保留() {
+        for m in [0u32, 1, 450, 720, 1439] {
+            let json =
+                format!(r#"{{"id":"a","name":"n","kind":"alarm","alarmMinutes":{m},"createdAt":1}}"#);
+            let t: Timer = serde_json::from_str(&json).expect("合法值必须能解析");
+            assert_eq!(t.alarm_minutes, m);
+        }
+    }
+
+    /// 造一条「每天重复、刚响过、还没排下一次」的闹钟。
+    fn due_alarm() -> Timer {
+        Timer {
+            id: "a1".into(),
+            name: "起床".into(),
+            kind: TimerKind::Alarm,
+            ends_at: None,
+            remaining_ms: None,
+            duration_ms: None,
+            phase: None,
+            focus_minutes: 25,
+            break_minutes: 5,
+            rounds: 0,
+            elapsed_ms: 0,
+            running_since: None,
+            laps: Vec::new(),
+            alarm_minutes: 450,
+            alarm_daily: true,
+            fired: true,
+            folder_id: None,
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn 刚响过的每天闹钟需要推进() {
+        assert!(due_alarm().alarm_needs_advance());
+    }
+
+    #[test]
+    fn 用户点过停止的闹钟不需要推进() {
+        // 「停止」把 fired 清成 false。这时候再去推进，等于把用户的操作吞掉
+        let mut t = due_alarm();
+        t.fired = false;
+        assert!(!t.alarm_needs_advance());
+        assert!(!t.advance_alarm_to(9_999), "不该改动任何字段");
+        assert_eq!(t.ends_at, None);
+        assert!(!t.fired);
+    }
+
+    #[test]
+    fn 用户点过再响一次的闹钟不需要推进() {
+        // 「再响一次」已经把 ends_at 排好了。再推一次会把它挪到别的时刻
+        let mut t = due_alarm();
+        t.ends_at = Some(1_800_000_000_000);
+        t.fired = false;
+        assert!(!t.alarm_needs_advance());
+        assert!(!t.advance_alarm_to(9_999));
+        assert_eq!(t.ends_at, Some(1_800_000_000_000), "原时刻不能被改掉");
+    }
+
+    #[test]
+    fn 只响一次的闹钟不需要推进() {
+        let mut t = due_alarm();
+        t.alarm_daily = false;
+        assert!(!t.alarm_needs_advance());
+        assert!(!t.advance_alarm_to(9_999));
+        assert!(t.fired, "只响一次的必须停在「已完成」");
+    }
+
+    #[test]
+    fn 别的计时器类型不需要推进() {
+        for kind in [
+            TimerKind::Countdown,
+            TimerKind::Pomodoro,
+            TimerKind::Stopwatch,
+        ] {
+            let mut t = due_alarm();
+            t.kind = kind;
+            assert!(!t.alarm_needs_advance(), "{kind:?} 不该被推进");
+            assert!(!t.advance_alarm_to(9_999));
+        }
+    }
+
+    #[test]
+    fn 推进成功后排好下一次并清掉已响标记() {
+        let mut t = due_alarm();
+        t.remaining_ms = Some(0); // 就算数据里残留了，也该被清掉
+
+        assert!(t.advance_alarm_to(1_800_000_000_000));
+
+        assert_eq!(t.ends_at, Some(1_800_000_000_000));
+        assert!(!t.fired, "清掉 fired，下一轮到点才会再响");
+        assert_eq!(
+            t.remaining_ms, None,
+            "留一个 0 会让前端把「已完成」误判成「已暂停」"
+        );
+        // 用户设的钟点与重复规则不能被推进逻辑改掉
+        assert_eq!(t.alarm_minutes, 450);
+        assert!(t.alarm_daily);
+    }
+
+    #[test]
+    fn 推进是幂等的第二次不生效() {
+        // 两个窗口同时推进时，后到的那个必须什么都不做
+        let mut t = due_alarm();
+        assert!(t.advance_alarm_to(1_800_000_000_000));
+        assert!(!t.advance_alarm_to(1_900_000_000_000));
+        assert_eq!(t.ends_at, Some(1_800_000_000_000), "第二次不该覆盖第一次");
+    }
+
+    #[test]
+    fn 闹钟的钟点与重复设置能往返序列化() {        let t = Timer {
             id: "a1".into(),
             name: "起床".into(),
             kind: TimerKind::Alarm,

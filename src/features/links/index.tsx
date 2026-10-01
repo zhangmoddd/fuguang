@@ -64,6 +64,15 @@ import "./links.css";
 /** 认作「程序」的扩展名。与「添加程序」文件选择框里的过滤器保持一致。 */
 const PROGRAM_EXTENSIONS = new Set(["exe", "lnk", "bat", "cmd"]);
 
+/**
+ * 提示条里最多列几条失败原因。
+ *
+ * 多选之后一次可以失败几十上百条（数据目录不可写、磁盘满），
+ * 全部拼进同一个提示条会把它撑到几千像素高，而它是 `flex-shrink: 0`，
+ * 被挤没的是下面那面格子墙。剩下的只报数量。
+ */
+const MAX_LISTED_FAILURES = 3;
+
 /** kind → 内置图标。提取不到真实图标（或本来就是网址）时用它兜底。 */
 const KIND_ICON: Record<LinkKind, LucideIcon> = {
   program: AppWindow,
@@ -516,7 +525,14 @@ export function LinksPanel() {
       }
 
       if (failures.length > 0) {
-        setNotice({ kind: "error", text: `有 ${failures.length} 条没存上：${failures.join("；")}` });
+        // 只列前几条。多选之后一次可以失败几十上百条，全拼进提示条会把它撑成
+        // 几千像素高 —— 而提示条是 `flex-shrink: 0`，被挤没的正是下面那面格子墙。
+        const shown = failures.slice(0, MAX_LISTED_FAILURES);
+        const more = failures.length - shown.length;
+        setNotice({
+          kind: "error",
+          text: `有 ${failures.length} 条没存上：${shown.join("；")}${more > 0 ? `；…… 还有 ${more} 条` : ""}`,
+        });
       } else {
         setNotice({
           kind: "ok",

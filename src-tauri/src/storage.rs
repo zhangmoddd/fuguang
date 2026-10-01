@@ -327,6 +327,38 @@ mod tests {
     }
 
     #[test]
+    fn 手改越界的闹钟钟点不会让整份计时器被隔离() {
+        // 端到端版：`models` 那边证明了单个 Timer 能解析，
+        // 这里证明解析成功之后 storage 的 quarantine 分支真的不会走到 ——
+        // 走到的代价是**整份 timers.json 被改名**，用户会以为数据全丢了。
+        let dir = temp_dir("bad-alarm-minutes");
+        let path = dir.join("timers.json");
+        fs::write(
+            &path,
+            r#"[
+                {"id":"a","name":"起床","kind":"alarm","alarmMinutes":-1,"createdAt":1},
+                {"id":"b","name":"煮蛋","kind":"countdown","durationMs":60000,"createdAt":2}
+            ]"#,
+        )
+        .expect("写测试数据");
+
+        let loaded: Vec<crate::models::Timer> = read_json_at(&path, Vec::new());
+
+        assert_eq!(loaded.len(), 2, "两条都必须读出来，不能只留一条或一条不剩");
+        assert_eq!(loaded[0].alarm_minutes, 1439, "越界值应归一到合法钟点");
+
+        let backups: Vec<String> = fs::read_dir(&dir)
+            .expect("读目录")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("corrupt"))
+            .collect();
+        assert!(backups.is_empty(), "不该产生损坏备份：{backups:?}");
+        assert!(path.exists(), "原文件必须还在原处");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn 内容损坏时备份坏文件并回退默认值() {
         let dir = temp_dir("corrupt");
         let path = dir.join("items.json");

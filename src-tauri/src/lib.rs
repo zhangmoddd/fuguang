@@ -93,6 +93,7 @@ pub fn run() {
             // 设置
             commands::settings_get,
             commands::settings_save,
+            commands::settings_patch,
             commands::autostart_get,
             commands::autostart_set,
             commands::current_exe,

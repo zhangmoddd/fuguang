@@ -343,6 +343,19 @@ export const api = {
 
   // ---- 设置 ----
   settingsGet: () => invoke<Settings>("settings_get"),
+  /**
+   * 只改设置的某几项，其余保持**内存里的最新值**。
+   *
+   * 用它而不是"读出来 → 改一改 → `settingsSave` 整份写回去"：
+   * 设置有三个写者（设置页、各页签的 Ctrl+滚轮缩放、另一个窗口），
+   * 而"读-改-写"中间隔着一次 IPC，两个写者交错时后写的会把先写的整份盖掉 ——
+   * 表现是「我改的字号自己变回去了」，而且只在几百毫秒内连改两项时出现。
+   * 合并必须在 Rust 侧同一把锁里做（见 `commands::settings_patch`）。
+   *
+   * @returns 合并并夹取之后的完整设置，直接拿去更新界面
+   */
+  settingsPatch: (changes: Partial<Settings>) =>
+    invoke<Settings>("settings_patch", { changes }),
   settingsSave: (settings: Settings) => invoke<void>("settings_save", { settings }),
   autostartGet: () => invoke<boolean>("autostart_get"),
   autostartSet: (enabled: boolean) => invoke<void>("autostart_set", { enabled }),

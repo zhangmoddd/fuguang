@@ -512,6 +512,9 @@ pub async fn settings_get(app: AppHandle) -> Settings {
 ///
 /// 存之前必须夹取取值范围：前端理论上可以传任何数字过来，
 /// 一个越界的字号会让界面彻底没法用。
+///
+/// ⚠️ 这是**整份覆盖写**。前端"读出来 → 改一改 → 写回去"的路径要用
+/// [`settings_patch`]，不要用这个 —— 理由见那里。
 #[tauri::command]
 pub async fn settings_save(app: AppHandle, mut settings: Settings) -> Result<(), String> {
     settings.clamp();
@@ -521,6 +524,45 @@ pub async fn settings_save(app: AppHandle, mut settings: Settings) -> Result<(),
         st.settings = settings;
     }
     state::persist_settings(&app, &store)
+}
+
+/// 只改设置的某几项，其余保持**内存里的最新值**。
+///
+/// # 为什么不能让前端"读出来 → 改一改 → 整份写回去"
+///
+/// 设置是整份覆盖写的，而它有**三个写者**：设置页、各页签的 Ctrl+滚轮缩放、
+/// 以及另一个窗口（小球/面板各持一份副本）。前端"读-改-写"中间隔着一次 IPC
+/// 往返，两个写者交错时后写的会把先写的整份盖掉 ——
+/// 用户看到的是**「我改的字号自己变回去了」**，而且只在几百毫秒内连改两项时
+/// 出现，极难复现、极难归因。
+///
+/// 所以合并必须落在**同一把锁里**，和 `snippet_bump_use` 是同一个理由。
+///
+/// # 为什么用 JSON 合并而不是给每个字段写一遍
+///
+/// 逐个字段写一遍意味着以后每加一个设置项都要来这里改一次，
+/// 忘了改的表现是"那一项怎么都存不上"。用 JSON 合并之后，
+/// "哪些字段能改"由 `Settings` 自己决定（`serde` 的默认值管缺字段、
+/// 未知键被忽略），新增字段不用动这里。
+///
+/// 返回合并并夹取之后的完整设置，调用方直接拿去更新界面 ——
+/// 不然前端手里那份还是旧的，下一次改别的项又会以旧值为基准。
+#[tauri::command]
+pub async fn settings_patch(
+    app: AppHandle,
+    changes: serde_json::Value,
+) -> Result<Settings, String> {
+    let store = app.state::<Store>();
+    let next = {
+        let mut st = store.lock();
+        // 合并逻辑抽在 `models::merge_settings` 里，有单测
+        let merged = crate::models::merge_settings(&st.settings, &changes)?;
+        st.settings = merged.clone();
+        merged
+    };
+
+    state::persist_settings(&app, &store)?;
+    Ok(next)
 }
 
 /// 查询开机自启是否已开启。

@@ -112,9 +112,9 @@ export function PanelWindow() {
     // 翻回去只会让图标撒第二次谎（图标说"未置顶"、窗口却压在最上层）。
     // 落盘失败只影响"下次启动还记不记得"，界面保持与窗口的真实状态一致。
     try {
-      const fresh = await api.settingsGet();
-      const saved = { ...fresh, panelAlwaysOnTop: next };
-      await api.settingsSave(saved);
+      // 走 `settingsPatch`（Rust 侧只合并这一项），不要"读出来改一改整份写回去"：
+      // 设置有三个写者，整份覆盖写会把别人刚改的字号/配色冲掉。
+      const saved = await api.settingsPatch({ panelAlwaysOnTop: next });
       await emitSettingsChanged(saved);
     } catch {
       /* 存不下来只影响下次启动，界面按真实状态显示 */

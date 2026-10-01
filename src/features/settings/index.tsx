@@ -114,25 +114,28 @@ export function SettingsPanel() {
     return () => window.clearTimeout(t);
   }, [savedHint]);
 
-  /**
-   * 保存设置并广播给其他窗口。
-   *
-   * 广播这一步不能省：小球、主面板、提醒弹窗是**三个独立窗口**，
-   * 各自有自己的 DOM。在主面板里改 CSS 变量，小球那个窗口完全不知道——
-   * 实测就是这个原因导致"换了配色但球不变色"。
-   */
-  const saveSettings = async (next: Settings) => {
-    await api.settingsSave(next);
-    await emitSettingsChanged(next);
-  };
 
-  /** 保存一项设置。 */
+  /**
+   * 保存一项设置。
+   *
+   * # 为什么走 `settingsPatch` 而不是"改一改整份写回去"
+   *
+   * 原来是这样拼的：`{ ...settings, ...changes }` —— `settings` 是**渲染时**
+   * 那份闭包。设置有三个写者（本页、各页签的 Ctrl+滚轮缩放、另一个窗口），
+   * 而"读-改-写"中间隔着一次 IPC。用户在几百毫秒内连改两项时，第二次拼出来的
+   * `next` 里第一项还是旧值，于是**刚改的那项被写回去了** ——
+   * 表现就是「我改的字号自己变回去了」，极难复现也极难归因。
+   *
+   * 合并交给 Rust 在同一把锁里做（和 `snippet_bump_use` 同一个理由），
+   * 返回值是合并之后的完整设置，直接拿它更新界面 ——
+   * 不然手里那份还是旧的，下一次改别的项又会以旧值为基准。
+   */
   const patch = async (changes: Partial<Settings>) => {
     if (!settings) return;
-    const next = { ...settings, ...changes };
-    setSettings(next);
     try {
-      await saveSettings(next);
+      const next = await api.settingsPatch(changes);
+      setSettings(next);
+      await emitSettingsChanged(next);
       setSavedHint("已保存");
     } catch (err) {
       setError(String(err));
@@ -261,16 +264,13 @@ export function SettingsPanel() {
    *
    * 先本地套用再保存：改字号是"所见即所得"的操作，
    * 等一次 IPC 往返再变会有明显延迟感。
+   *
+   * 保存走 `patch`（Rust 侧合并），不要自己拼 `{...settings, ...}` ——
+   * 那会把别的写者刚存的改动整份盖掉，见 `patch` 的说明。
    */
   const setFontSize = async (px: number) => {
     applyFontSize(px);
-    if (settings) setSettings({ ...settings, fontSizePx: px });
-    try {
-      await saveSettings({ ...settings!, fontSizePx: px });
-      setError(null);
-    } catch (err) {
-      setError(String(err));
-    }
+    await patch({ fontSizePx: px });
   };
 
   /**
@@ -281,13 +281,7 @@ export function SettingsPanel() {
    */
   const setBallTheme = async (id: string) => {
     applyBallTheme(id);
-    if (settings) setSettings({ ...settings, ballTheme: id });
-    try {
-      await saveSettings({ ...settings!, ballTheme: id });
-      setError(null);
-    } catch (err) {
-      setError(String(err));
-    }
+    await patch({ ballTheme: id });
   };
 
   /** 录制热键时的键盘处理。 */

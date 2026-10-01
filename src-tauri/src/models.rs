@@ -479,6 +479,38 @@ impl Settings {
     }
 }
 
+/// 把 `changes` 里出现的键合并进 `current`，其余保持不动，最后夹取一遍。
+///
+/// # 为什么用 JSON 合并而不是给每个字段写一遍
+///
+/// 逐个字段写一遍意味着以后每加一个设置项都要来这里改一次，
+/// 忘了改的表现是"那一项怎么都存不上"。用 JSON 合并之后，
+/// "哪些字段能改"由 `Settings` 自己决定（`serde` 的默认值管缺字段、
+/// 未知键被忽略），新增字段不用动这里。
+///
+/// 抽成纯函数是为了能单测：`settings_patch` 命令要 `AppHandle`，
+/// 单测里造不出来，而"合并"恰恰是那段逻辑里唯一会出错的地方。
+pub fn merge_settings(
+    current: &Settings,
+    changes: &serde_json::Value,
+) -> Result<Settings, String> {
+    let mut base =
+        serde_json::to_value(current).map_err(|e| format!("序列化当前设置失败：{e}"))?;
+
+    // `changes` 不是对象（数组、字符串、null…）时什么都不合并、原样返回 ——
+    // 调用方传错形状不该把用户的设置清空。
+    if let (Some(base), Some(patch)) = (base.as_object_mut(), changes.as_object()) {
+        for (key, value) in patch {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+
+    let mut merged: Settings =
+        serde_json::from_value(base).map_err(|e| format!("设置格式不对：{e}"))?;
+    merged.clamp();
+    Ok(merged)
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -952,9 +984,101 @@ mod tests {
         }
     }
 
+    // ---------- 设置的部分更新（settings_patch） ----------
+
     #[test]
-    fn 老版本设置文件缺少热键字段时用默认值() {
-        // 场景：用户在热键功能上线之前就已经在用了，settings.json 里没有这两个字段
+    fn 只改一个键时其余键原样保留() {
+        // 这是这个函数存在的**全部理由**：前端连改两项时，第二次不能把
+        // 第一次的结果冲掉（"我改的字号自己变回去了"）。
+        let current = Settings {
+            font_size_px: 17,
+            ball_theme: "dark".into(),
+            ..Settings::default()
+        };
+        let merged =
+            merge_settings(&current, &serde_json::json!({ "alertSound": false })).expect("合并");
+
+        assert!(!merged.alert_sound, "改的这一项要生效");
+        assert_eq!(merged.font_size_px, 17, "没改的字号必须留着");
+        assert_eq!(merged.ball_theme, "dark", "没改的配色必须留着");
+    }
+
+    #[test]
+    fn 合并时越界值照样被夹取() {
+        // `settings_save` 会夹取，`settings_patch` 走的字段不一样，也不能漏
+        let current = Settings::default();
+        let merged = merge_settings(
+            &current,
+            &serde_json::json!({ "fontSizePx": 200, "pasteRestoreDelayMs": 999_999 }),
+        )
+        .expect("合并");
+
+        assert_eq!(merged.font_size_px, FONT_SIZE_MAX);
+        assert_eq!(merged.paste_restore_delay_ms, 2_000);
+    }
+
+    #[test]
+    fn 合并时认不出来的键被忽略而不是报错() {
+        // 前端先加上一个字段、后端还不认识时，不该让整次保存失败
+        let current = Settings::default();
+        let merged = merge_settings(
+            &current,
+            &serde_json::json!({ "someFutureField": { "nested": true }, "alertSound": false }),
+        )
+        .expect("未知键不该让合并失败");
+
+        assert!(!merged.alert_sound, "认识的键仍要生效");
+    }
+
+    #[test]
+    fn changes_不是对象时原样返回而不是清空设置() {
+        // 调用方传错形状（数组 / 字符串 / null）时，最坏结果只能是"什么都没改"
+        let current = Settings {
+            font_size_px: 17,
+            ..Settings::default()
+        };
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!("oops"),
+            serde_json::Value::Null,
+            serde_json::json!(42),
+        ] {
+            let merged = merge_settings(&current, &bad).expect("不该失败");
+            assert_eq!(merged.font_size_px, 17, "传错形状不该改设置：{bad}");
+        }
+    }
+
+    #[test]
+    fn 合并时值的类型不对会明确报错而不是静默丢弃() {
+        // `fontSizePx` 传成字符串：与其悄悄忽略，不如让前端知道它写错了
+        let current = Settings::default();
+        let result = merge_settings(&current, &serde_json::json!({ "fontSizePx": "17" }));
+        assert!(result.is_err(), "类型不对必须报错");
+        assert!(result.unwrap_err().contains("设置格式不对"));
+    }
+
+    #[test]
+    fn 合并可以同时改多个键() {
+        let current = Settings::default();
+        let merged = merge_settings(
+            &current,
+            &serde_json::json!({
+                "fontSizePx": 15,
+                "ballTheme": "teal",
+                "panelAlwaysOnTop": false,
+                "zoom": { "links": 130 }
+            }),
+        )
+        .expect("合并");
+
+        assert_eq!(merged.font_size_px, 15);
+        assert_eq!(merged.ball_theme, "teal");
+        assert!(!merged.panel_always_on_top);
+        assert_eq!(merged.zoom.get("links"), Some(&130));
+    }
+
+    #[test]
+    fn 老版本设置文件缺少热键字段时用默认值() {        // 场景：用户在热键功能上线之前就已经在用了，settings.json 里没有这两个字段
         let json = r#"{
             "autostart": true,
             "pasteRestoreDelayMs": 200,

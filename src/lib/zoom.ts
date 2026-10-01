@@ -22,7 +22,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { api, emitSettingsChanged, type Settings } from "./api";
+import { api, emitSettingsChanged } from "./api";
 
 /** 与 Rust 侧 `models::ZOOM_MIN` / `ZOOM_MAX` 保持一致。 */
 export const ZOOM_MIN = 70;
@@ -106,12 +106,16 @@ export function useZoom(featureId: string): ZoomControl {
   /**
    * 把待写的档位落盘。
    *
-   * 两个关键细节：
+   * 三个关键细节：
    *
-   * 1. **保存前重新读一次设置**。`settings_save` 是整份覆盖写的，
-   *    如果拿启动时读到的那个副本去写，会把用户刚在设置页改的字号、
-   *    热键、配色一起冲掉。
-   * 2. **防抖**。滚轮一次滑动连发十几个事件，每个都写一次文件太浪费。
+   * 1. **只把 `zoom` 这一项交给 `settingsPatch`**，不要整份写。
+   *    `settings_save` 是整份覆盖写的，而设置有三个写者（本页、设置页、
+   *    另一个窗口）—— 拿一份可能过期的副本整份写回去，会把用户刚在设置页
+   *    改的字号、热键、配色一起冲掉。合并交给 Rust 在同一把锁里做。
+   * 2. **`zoom` 自己是个 map，要合并必须先读一次**。这一步的窗口很小
+   *    （同一个用户不可能同时滚两个页签），而且即使撞了也只丢一次缩放档位，
+   *    不会波及别的设置项 —— 这就是"只提交这一个键"的价值。
+   * 3. **防抖**。滚轮一次滑动连发十几个事件，每个都写一次文件太浪费。
    */
   const flush = useCallback(async () => {
     const value = pending.current;
@@ -121,11 +125,9 @@ export function useZoom(featureId: string): ZoomControl {
 
     try {
       const fresh = await api.settingsGet();
-      const next: Settings = {
-        ...fresh,
+      const next = await api.settingsPatch({
         zoom: { ...fresh.zoom, [featureId]: value },
-      };
-      await api.settingsSave(next);
+      });
       await emitSettingsChanged(next);
     } catch {
       /* 存不下来只影响"下次打开还记不记得"，不该打断当前操作 */

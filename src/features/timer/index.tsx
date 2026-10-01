@@ -32,6 +32,7 @@ import {
   Flag,
   FolderInput,
   Pause,
+  Pencil,
   Play,
   Plus,
   RotateCcw,
@@ -39,10 +40,15 @@ import {
   Trash2,
 } from "lucide-react";
 
-import { api, newId, onStateChanged } from "../../lib/api";
+import { api, onStateChanged } from "../../lib/api";
 import type { Folder as FolderItem, PomodoroPhase, Timer, TimerKind } from "../../lib/api";
 import { formatClock, nextAlarmAt, parseClock } from "../../lib/alarm";
 import { formatDuration, formatMoment, formatStopwatch } from "../../lib/datetime";
+import {
+  applyTimerEdit,
+  createTimer as createTimerFrom,
+  type TimerDraft,
+} from "../../lib/timer-edit";
 import { useDragSort } from "../../lib/drag-drop";
 import {
   FolderBar,
@@ -247,7 +253,16 @@ export function TimerPanel() {
   const [timers, setTimers] = useState<Timer[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  /** 新建表单是否打开。 */
   const [creating, setCreating] = useState(false);
+  /**
+   * 正在编辑的那条计时器。
+   *
+   * 和"新建"共用一个表单组件，靠这个字段区分：`null` = 新建。
+   * 用户反馈「闹钟什么的都没法修改」—— 原来建好之后只能删了重建，
+   * 连改个名字都没有入口。
+   */
+  const [editingId, setEditingId] = useState<string | null>(null);
   /** 文件夹弹层。`target` 为 `null` 表示新建，否则是改名/改备注。 */
   const [folderEditor, setFolderEditor] = useState<{
     open: boolean;
@@ -598,12 +613,27 @@ export function TimerPanel() {
     saveTimer({ ...t, elapsedMs: 0, runningSince: null, laps: [] });
   };
 
-  /** 新建完成：收起表单并落盘。时长等信息已经在表单里写进 Timer 了。 */
-  const createTimer = (timer: Timer) => {
+  /** 新建完成：收起表单并落盘。归属由面板决定（表单不知道用户在哪个文件夹里）。 */
+  const createTimer = (draft: TimerDraft) => {
     setCreating(false);
-    // 归属由面板决定：表单不知道用户当前在哪个文件夹里
-    saveTimer({ ...timer, folderId: folders.currentId });
+    saveTimer({ ...createTimerFrom(draft, Date.now()), folderId: folders.currentId });
   };
+
+  /**
+   * 编辑完成：把表单结果应用到那条已有的计时器上。
+   *
+   * 规则（"改了设置之后原来跑到哪一步了怎么办"）全在 `applyTimerEdit` 里，
+   * 有单测：只改名字不能打断正在跑的倒计时，改了时长要回到未开始，
+   * 改闹钟钟点要按新钟点重排，等等。
+   */
+  const commitEdit = (draft: TimerDraft) => {
+    const original = timers.find((t) => t.id === editingId);
+    setEditingId(null);
+    if (!original) return;
+    saveTimer(applyTimerEdit(original, draft, Date.now()));
+  };
+
+  const editingTimer = editingId ? timers.find((t) => t.id === editingId) ?? null : null;
 
   return (
     <div
@@ -617,13 +647,34 @@ export function TimerPanel() {
         <span className="tmr__count">
           {folders.currentId ? `本文件夹 ${visible.length} 条` : `共 ${timers.length} 条`}
         </span>
-        <button className="btn btn--primary" onClick={() => setCreating((v) => !v)}>
+        <button
+          className="btn btn--primary"
+          onClick={() => {
+            // 新建和编辑共用一个表单，别让两个同时开着
+            setEditingId(null);
+            setCreating((v) => !v);
+          }}
+        >
           <Plus size={13} />
           新建
         </button>
       </div>
 
-      {creating && <TimerCreator onCancel={() => setCreating(false)} onCreate={createTimer} />}
+      {creating && (
+        <TimerCreator editing={null} onCancel={() => setCreating(false)} onSubmit={createTimer} />
+      )}
+
+      {/* 编辑表单挂在列表上方、滚动区外面：它在页面里是最要紧的东西，
+          跟着列表滚上去会让用户找不到自己刚打开的表单 */}
+      {editingTimer && (
+        <TimerCreator
+          // key 用 id：换一条编辑时强制重建表单，否则输入框里还是上一条的值
+          key={editingTimer.id}
+          editing={editingTimer}
+          onCancel={() => setEditingId(null)}
+          onSubmit={commitEdit}
+        />
+      )}
 
       {error && <div className="tmr__error">{error}</div>}
 
@@ -877,6 +928,17 @@ export function TimerPanel() {
 
                 <button
                   className="iconbtn"
+                  onClick={() => {
+                    setCreating(false);
+                    setEditingId(t.id);
+                  }}
+                  title="编辑名字、时长 / 钟点 / 节奏"
+                >
+                  <Pencil size={13} />
+                </button>
+
+                <button
+                  className="iconbtn"
                   onClick={() => setMovingId(t.id)}
                   title="移动到文件夹"
                 >
@@ -928,24 +990,33 @@ export function TimerPanel() {
  * 不靠任何内存记忆。
  */
 function TimerCreator({
-  onCreate,
+  editing,
+  onSubmit,
   onCancel,
 }: {
-  onCreate: (timer: Timer) => void;
+  /** 正在编辑的那条；`null` 表示新建。 */
+  editing: Timer | null;
+  /** 表单填好了。新建和编辑都走这一个出口，落地规则在 `lib/timer-edit.ts`。 */
+  onSubmit: (draft: TimerDraft) => void;
   onCancel: () => void;
 }) {
-  const [kind, setKind] = useState<TimerKind>("countdown");
-  const [name, setName] = useState("");
+  // 编辑时把已有的设定填回输入框：打开表单看到的必须是"现在是什么样"，
+  // 否则用户一保存就把没显示出来的值覆盖掉了。
+  const [kind, setKind] = useState<TimerKind>(editing?.kind ?? "countdown");
+  const [name, setName] = useState(editing?.name ?? "");
   // 时长用字符串存：输入框允许中途为空（清空重输），数字类型做不到这一点
-  const [hours, setHours] = useState("0");
-  const [minutes, setMinutes] = useState("5");
-  const [seconds, setSeconds] = useState("0");
-  const [focus, setFocus] = useState("25");
-  const [rest, setRest] = useState("5");
+  const initialMs = editing?.durationMs ?? 5 * 60_000;
+  const [hours, setHours] = useState(String(Math.floor(initialMs / 3_600_000)));
+  const [minutes, setMinutes] = useState(String(Math.floor((initialMs % 3_600_000) / 60_000)));
+  const [seconds, setSeconds] = useState(String(Math.floor((initialMs % 60_000) / 1000)));
+  const [focus, setFocus] = useState(String(editing?.focusMinutes ?? 25));
+  const [rest, setRest] = useState(String(editing?.breakMinutes ?? 5));
   /** 闹钟的钟点，`HH:MM`（`<input type="time">` 给的就是这个形状）。 */
-  const [alarmTime, setAlarmTime] = useState("07:30");
+  const [alarmTime, setAlarmTime] = useState(
+    formatClock(editing?.alarmMinutes ?? 7 * 60 + 30),
+  );
   /** 闹钟是否每天重复。默认只响一次：默认每天响会让人被自己没设过的闹钟吵醒。 */
-  const [alarmDaily, setAlarmDaily] = useState(false);
+  const [alarmDaily, setAlarmDaily] = useState(editing?.alarmDaily ?? false);
   const nameRef = useRef<HTMLInputElement>(null);
 
   // 打开表单就聚焦名字：填名字是唯一的必填项
@@ -992,61 +1063,40 @@ function TimerCreator({
   };
 
   const submit = () => {
-    const createdAt = Date.now();
-    const isAlarm = kind === "alarm";
-    const timer: Timer = {
-      id: newId(),
+    onSubmit({
       name:
         name.trim() ||
         defaultName(kind, countdownMs, focusMinutes, restMinutes, alarmMinutes),
       kind,
-      // 倒计时和闹钟都是"建好即开始"：用户填了时长 / 挑好了钟点就是想让它开始等，
-      // 再要求点一次「开始」是多余的一步（想停下点「重置」/「停止」即可）。
-      // 番茄钟和秒表新建出来是「未开始」，等用户点「开始」。
-      endsAt:
-        kind === "countdown"
-          ? createdAt + countdownMs
-          : isAlarm
-            ? nextAlarmAt(alarmMinutes, createdAt)
-            : null,
-      remainingMs: null,
-      // 倒计时的设定时长要单独存：重置、重新开始都要靠它拿回用户填的时长，
-      // 而 remainingMs 到点后会被 Rust 清成 0，不能当设定值用
-      durationMs: kind === "countdown" ? countdownMs : null,
-      phase: kind === "pomodoro" ? "focus" : null,
-      // 番茄钟之外的两种模式用不到这两个字段，给默认值即可
-      focusMinutes: kind === "pomodoro" ? focusMinutes : 25,
-      breakMinutes: kind === "pomodoro" ? restMinutes : 5,
-      rounds: 0,
-      elapsedMs: 0,
-      runningSince: null,
-      laps: [],
-      // 闹钟的钟点同样要单独存：停止、重新响都要靠它拿回用户设的时间
-      alarmMinutes: isAlarm ? alarmMinutes : 0,
-      alarmDaily: isAlarm ? alarmDaily : false,
-      fired: false,
-      // 归属由面板决定（只有它知道用户当前在哪个文件夹里）
-      folderId: null,
-      createdAt,
-    };
-    onCreate(timer);
+      durationMs: countdownMs,
+      focusMinutes,
+      breakMinutes: restMinutes,
+      alarmMinutes,
+      alarmDaily,
+    });
   };
 
   return (
     <div className="tmr__creator">
-      <div className="tmr__creator-head">新建计时器</div>
-
-      <div className="tmr__kinds">
-        {(["countdown", "pomodoro", "stopwatch", "alarm"] as TimerKind[]).map((k) => (
-          <button
-            key={k}
-            className={`btn tmr__kindbtn${k === kind ? " tmr__kindbtn--on" : ""}`}
-            onClick={() => setKind(k)}
-          >
-            {KIND_LABEL[k]}
-          </button>
-        ))}
+      <div className="tmr__creator-head">
+        {editing ? `编辑计时器 · ${KIND_LABEL[kind]}` : "新建计时器"}
       </div>
+
+      {/* 模式选择只在新建时给。编辑时不让换类型：换类型等于换一条计时器
+          （字段语义全不一样：倒计时看时长、闹钟看钟点），真要做应该是删掉重建。 */}
+      {!editing && (
+        <div className="tmr__kinds">
+          {(["countdown", "pomodoro", "stopwatch", "alarm"] as TimerKind[]).map((k) => (
+            <button
+              key={k}
+              className={`btn tmr__kindbtn${k === kind ? " tmr__kindbtn--on" : ""}`}
+              onClick={() => setKind(k)}
+            >
+              {KIND_LABEL[k]}
+            </button>
+          ))}
+        </div>
+      )}
 
       <label className="field">
         <span className="field__label">
@@ -1175,9 +1225,13 @@ function TimerCreator({
           disabled={!valid}
           title={invalidHint}
         >
-          {/* 倒计时和闹钟都是"建好即开始"，按钮上写清楚，
-              免得用户以为还要再点一次开始 */}
-          {kind === "countdown" || kind === "alarm" ? "创建并开始" : "创建"}
+          {/* 倒计时和闹钟是"建好即开始"，按钮上写清楚，
+              免得用户以为还要再点一次开始。编辑时只是保存设置。 */}
+          {editing
+            ? "保存"
+            : kind === "countdown" || kind === "alarm"
+              ? "创建并开始"
+              : "创建"}
         </button>
       </div>
     </div>

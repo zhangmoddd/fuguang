@@ -119,10 +119,13 @@ export function AlertWindow() {
    *  省掉几百 KB 体积，也不用处理资源路径、用户不会看到额外的 mp3 文件。
    *  排布本身在 `lib/ringtone.ts` 里，是可单测的纯逻辑。
    *
-   *  # 为什么响 30 秒而不是两声「叮」
+   *  # 为什么响 30 秒
    *
-   *  原来是两声 0.2 秒的「叮」，一共 0.4 秒 —— 当闹钟用根本叫不醒人。
-   *  现在是一段真正的铃声：六声急促的交替音、停 0.8 秒、再来一遍，
+   *  最早是两声 0.2 秒的「叮」，一共 0.4 秒 —— 当闹钟用根本叫不醒人。
+   *  第二版做成六声急促的交替音，用户听完的评价是「不好听」——
+   *  纯正弦没有泛音（又薄又尖），两声之间几乎不留空隙（连成一片嗡嗡声），
+   *  而且来回只有两个音（没有旋律走向）。
+   *  现在的音色和旋律见 `lib/ringtone.ts`：钟/马林巴的泛音配方 + 上行大调琶音。
    *  一直响到用户点「知道了」为止（上限 30 秒）。
    *
    *  上限不能省：提醒窗是**置顶**的，用户可能正在开会、或者干脆不在电脑前，
@@ -172,19 +175,30 @@ export function AlertWindow() {
 
         // 整段铃声一次排完。用户点「知道了」→ 窗口销毁 → `ctx.close()`
         // 会把还没响的那些一起掐掉，不需要额外记定时器。
+        //
+        // 一个音符 = 一个基频 + 两个泛音，各起一个振荡器：
+        // 这样每个泛音能有**自己的衰减曲线**（高次泛音衰减更快），
+        // 而 `PeriodicWave` 只能给所有泛音同一条包络 —— 那正是"电子音"的味道。
         const start = audio.currentTime + 0.03;
-        for (const bell of ringSchedule(RING_SECONDS, LOUD_UNTIL_SECONDS)) {
-          const osc = audio.createOscillator();
-          const gain = audio.createGain();
-          osc.type = "sine";
-          osc.frequency.value = bell.freq;
-          const at = start + bell.at;
-          gain.gain.setValueAtTime(0.0001, at);
-          gain.gain.exponentialRampToValueAtTime(bell.peak, at + bell.attack);
-          gain.gain.exponentialRampToValueAtTime(0.0001, at + bell.attack + bell.decay);
-          osc.connect(gain).connect(audio.destination);
-          osc.start(at);
-          osc.stop(at + bell.attack + bell.decay + 0.02);
+        for (const note of ringSchedule(RING_SECONDS, LOUD_UNTIL_SECONDS)) {
+          const at = start + note.at;
+          for (const part of note.partials) {
+            const amp = note.peak * part.gain;
+            const osc = audio.createOscillator();
+            const gain = audio.createGain();
+            osc.type = "sine";
+            osc.frequency.value = note.freq * part.ratio;
+            // `exponentialRamp` 到不了 0，所以两端都用 0.0001 这个极小值
+            gain.gain.setValueAtTime(0.0001, at);
+            gain.gain.exponentialRampToValueAtTime(amp, at + note.attack);
+            gain.gain.exponentialRampToValueAtTime(
+              0.0001,
+              at + note.attack + part.decay,
+            );
+            osc.connect(gain).connect(audio.destination);
+            osc.start(at);
+            osc.stop(at + note.attack + part.decay + 0.02);
+          }
         }
       } catch {
         // 音频不可用不影响提醒本身，静默忽略

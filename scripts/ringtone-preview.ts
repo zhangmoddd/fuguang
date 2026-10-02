@@ -30,7 +30,8 @@ const out = arg("out", "ringtone-preview.wav");
 const seconds = Number(arg("seconds", "12"));
 
 // 用和软件里**完全一样**的参数：前 8 秒满音量，之后降下来
-const notes = ringSchedule(seconds, 8);
+// 第二个参数是**起点**不是音量分档（音量档位在 ringtone.ts 里按时间算）
+const notes = ringSchedule(seconds);
 const pcm = renderPcm(notes, 44100, seconds);
 
 writeFileSync(out, encodeWav(pcm, 44100));

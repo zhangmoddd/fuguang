@@ -392,8 +392,15 @@ export const api = {
    * 窗口复用 + 监听器还没就绪时会丢内容，而调度线程已经把 `fired_for`
    * 落盘了，那条提醒就永远不补弹。
    */
-  alertCurrent: () =>
-    invoke<{ title: string; body: string } | null>("alert_current"),
+  alertCurrent: () => invoke<AlertContent | null>("alert_current"),
+
+  /**
+   * 把**当前这条提醒**延后几分钟再弹一次（手机闹钟的「稍后提醒」）。
+   *
+   * 它改的是"提醒"，不是"数据"：闹钟的钟点、备忘的提醒时刻一个都不动。
+   * 用户点「稍后」说的是"这条再等我五分钟"，不是"把我的闹钟改成五分钟后"。
+   */
+  snoozeAlert: (minutes: number) => invoke<void>("snooze_alert", { minutes }),
 
   /**
    * 把某条片段的使用次数 +1（「常用优先」排序靠它）。
@@ -408,6 +415,18 @@ export const api = {
 // 事件订阅
 // ===============================================================
 
+/**
+ * 一条提醒的内容。
+ *
+ * `isAlarm` 决定提醒窗**响多久**：闹钟按手机的逻辑"响到你处理为止"
+ * （10 分钟自动静音），倒计时 / 番茄钟 / 备忘录只是一声提醒。
+ */
+export interface AlertContent {
+  title: string;
+  body: string;
+  isAlarm: boolean;
+}
+
 /** 后端状态发生变化（计时器到点、提醒触发等），前端应重新拉取数据。 */
 export function onStateChanged(
   cb: (what: string[]) => void,
@@ -417,9 +436,9 @@ export function onStateChanged(
 
 /** 提醒弹窗收到新内容。 */
 export function onAlertContent(
-  cb: (payload: { title: string; body: string }) => void,
+  cb: (payload: AlertContent) => void,
 ): Promise<UnlistenFn> {
-  return listen<{ title: string; body: string }>("alert:content", (e) => cb(e.payload));
+  return listen<AlertContent>("alert:content", (e) => cb(e.payload));
 }
 
 /**

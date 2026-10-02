@@ -13,26 +13,48 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Bell, Check } from "lucide-react";
+import { AlarmClock, Bell, Check } from "lucide-react";
 
 import { api, onAlertContent } from "../lib/api";
 import { ringSchedule } from "../lib/ringtone";
 
-/** 铃声最长响多少秒。到点自动停，避免用户不在时一直响（见播放那段的说明）。 */
-const RING_SECONDS = 30;
-/** 前多少秒用满音量，之后降到三分之一当"持续提醒"。 */
-const LOUD_UNTIL_SECONDS = 8;
+/**
+ * 铃声最长响多少秒。
+ *
+ * # 手机闹钟是怎么做的
+ *
+ * 闹钟**响到你处理它为止**，不会响几声就自己停。而"一直不处理"时它自己静音：
+ * iOS 约 15 分钟、Android（Google 时钟）默认「静音时间」10 分钟。
+ * 这里取 **10 分钟**（对齐 Android 的默认值）。
+ *
+ * 倒计时 / 番茄钟 / 备忘录**不是闹钟**，它们只是一声提醒：响 30 秒就够，
+ * 响十分钟反而烦人。靠 Rust 传过来的 `isAlarm` 区分
+ * （调度线程把闹钟的 `source` 单独标成 `alarm`）。
+ */
+const ALARM_RING_SECONDS = 600;
+const REMINDER_RING_SECONDS = 30;
+
+/**
+ * 每次只排这么多秒的音频，排完用定时器续下一段。
+ *
+ * 为什么不一次排完 10 分钟：那是 1700 多个音符、**五千多个**振荡器节点，
+ * 光是建出来就会卡一下；而绝大多数提醒几秒内就被处理掉了。
+ */
+const CHUNK_SECONDS = 20;
+/** 隔多久续下一段。留 5 秒余量，避免定时器抖动造成断音。 */
+const PUMP_MS = (CHUNK_SECONDS - 5) * 1000;
 
 /** 从 hash 里解析 query 参数。 */
-function readParams(): { title: string; body: string } {
+function readParams(): { title: string; body: string; isAlarm: boolean } {
   const hash = window.location.hash;
   const qIndex = hash.indexOf("?");
-  if (qIndex === -1) return { title: "浮光提醒", body: "" };
+  if (qIndex === -1) return { title: "浮光提醒", body: "", isAlarm: false };
 
   const params = new URLSearchParams(hash.slice(qIndex + 1));
   return {
     title: params.get("title") ?? "浮光提醒",
     body: params.get("body") ?? "",
+    isAlarm: params.get("alarm") === "1",
   };
 }
 
@@ -61,7 +83,7 @@ export function AlertWindow() {
     let disposed = false;
 
     void onAlertContent((payload) => {
-      setInfo({ title: payload.title, body: payload.body });
+      setInfo({ title: payload.title, body: payload.body, isAlarm: payload.isAlarm });
       setArrival((n) => n + 1);
     }).then((fn) => {
       // 订阅是异步建立的，可能还没建立组件就卸载了。
@@ -102,7 +124,7 @@ export function AlertWindow() {
         ) {
           return;
         }
-        setInfo({ title: cur.title, body: cur.body });
+        setInfo({ title: cur.title, body: cur.body, isAlarm: cur.isAlarm });
         setArrival((n) => n + 1);
       } catch {
         /* 拉不到就算了：URL query 已经兜住了首次创建那一条 */
@@ -145,6 +167,8 @@ export function AlertWindow() {
   useEffect(() => {
     let cancelled = false;
     let ctx: AudioContext | null = null;
+    /** 续排下一段音频的定时器。卸载时必须清掉，否则定时器会在窗口没了之后继续跑。 */
+    let timer: number | null = null;
 
     void (async () => {
       let enabled = true;
@@ -173,33 +197,48 @@ export function AlertWindow() {
         // 唤不醒也没关系：那就和以前一样没声音，不该因此影响提醒本身。
         if (audio.state === "suspended") void audio.resume();
 
-        // 整段铃声一次排完。用户点「知道了」→ 窗口销毁 → `ctx.close()`
-        // 会把还没响的那些一起掐掉，不需要额外记定时器。
-        //
         // 一个音符 = 一个基频 + 两个泛音，各起一个振荡器：
         // 这样每个泛音能有**自己的衰减曲线**（高次泛音衰减更快），
         // 而 `PeriodicWave` 只能给所有泛音同一条包络 —— 那正是"电子音"的味道。
+        //
+        // **分段排**：一次只排 20 秒，排完用定时器续下一段
+        // （见 CHUNK_SECONDS 的说明）。用户点「知道了」/「稍后」→ 窗口销毁
+        // → `ctx.close()` 会把已排期和还没排的一起掐掉。
         const start = audio.currentTime + 0.03;
-        for (const note of ringSchedule(RING_SECONDS, LOUD_UNTIL_SECONDS)) {
-          const at = start + note.at;
-          for (const part of note.partials) {
-            const amp = note.peak * part.gain;
-            const osc = audio.createOscillator();
-            const gain = audio.createGain();
-            osc.type = "sine";
-            osc.frequency.value = note.freq * part.ratio;
-            // `exponentialRamp` 到不了 0，所以两端都用 0.0001 这个极小值
-            gain.gain.setValueAtTime(0.0001, at);
-            gain.gain.exponentialRampToValueAtTime(amp, at + note.attack);
-            gain.gain.exponentialRampToValueAtTime(
-              0.0001,
-              at + note.attack + part.decay,
-            );
-            osc.connect(gain).connect(audio.destination);
-            osc.start(at);
-            osc.stop(at + note.attack + part.decay + 0.02);
+        const ringSeconds = info.isAlarm ? ALARM_RING_SECONDS : REMINDER_RING_SECONDS;
+        let scheduledTo = 0;
+
+        const pump = () => {
+          if (cancelled || scheduledTo >= ringSeconds) return;
+
+          const from = scheduledTo;
+          const to = Math.min(ringSeconds, from + CHUNK_SECONDS);
+          for (const note of ringSchedule(to, from)) {
+            const at = start + note.at;
+            for (const part of note.partials) {
+              const amp = note.peak * part.gain;
+              const osc = audio.createOscillator();
+              const gain = audio.createGain();
+              osc.type = "sine";
+              osc.frequency.value = note.freq * part.ratio;
+              // `exponentialRamp` 到不了 0，所以两端都用 0.0001 这个极小值
+              gain.gain.setValueAtTime(0.0001, at);
+              gain.gain.exponentialRampToValueAtTime(amp, at + note.attack);
+              gain.gain.exponentialRampToValueAtTime(
+                0.0001,
+                at + note.attack + part.decay,
+              );
+              osc.connect(gain).connect(audio.destination);
+              osc.start(at);
+              osc.stop(at + note.attack + part.decay + 0.02);
+            }
           }
-        }
+
+          scheduledTo = to;
+          timer = window.setTimeout(pump, PUMP_MS);
+        };
+
+        pump();
       } catch {
         // 音频不可用不影响提醒本身，静默忽略
       }
@@ -207,15 +246,31 @@ export function AlertWindow() {
 
     return () => {
       cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
       // `close()` 会停掉所有已排期但还没响的振荡器 —— 这就是"点知道了就闭嘴"
       void ctx?.close();
     };
     // `arrival` 必须在依赖里：内容完全相同的两条提醒只靠 title/body 是区分不出来的，
     // 依赖不变 → effect 不重跑 → 只弹窗不响铃（详见 arrival 的说明）。
-  }, [info.title, info.body, arrival]);
+  }, [info.title, info.body, info.isAlarm, arrival]);
 
   const close = async () => {
     await getCurrentWindow().close();
+  };
+
+  /**
+   * 稍后提醒：把这条原样排进后端的队列，过几分钟再弹一次。
+   *
+   * 先 `await` 再关窗：反过来的话窗口先没了，命令可能还没发出去，
+   * 用户点了「稍后 5 分钟」却发现它再也没回来。
+   */
+  const snooze = async (minutes: number) => {
+    try {
+      await api.snoozeAlert(minutes);
+    } catch {
+      // 排不上就退化成"知道了"：至少不能让用户卡在一个关不掉的窗口上
+    }
+    await close();
   };
 
   return (
@@ -234,6 +289,15 @@ export function AlertWindow() {
       </div>
 
       <div className="alert__actions">
+        {/* 手机闹钟响的时候有两个选择：关掉，或者「稍后提醒」。
+            这里把两个都给出来 —— 只有「知道了」的话，用户想"再等五分钟"
+            就只能先去把闹钟停掉、再重新设一个。
+            5 分钟是刻意短的：桌面场景里"等一下再提醒我"通常就是几分钟的事，
+            而手机上的 9/10 分钟是为了让人有机会醒过来。 */}
+        <button className="alert__snooze" onClick={() => void snooze(5)}>
+          <AlarmClock size={14} />
+          稍后 5 分钟
+        </button>
         <button className="alert__ok" onClick={() => void close()}>
           <Check size={14} />
           知道了

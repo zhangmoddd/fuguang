@@ -22,6 +22,7 @@
 //! IO 部分（读状态、落盘、弹窗、发事件）在 `run_*` 里，只负责把纯逻辑的结果
 //! 搬出去，本身没有分支逻辑，出 bug 的空间小得多。
 
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -170,7 +171,10 @@ fn evaluate_timers(timers: &mut [Timer], now: i64, out: &mut Evaluation) {
                 out.timers_changed = true;
 
                 out.alerts.push(PendingAlert {
-                    source: "timer".into(),
+                    // 单独标成 `alarm` 而不是 `timer`：提醒窗要靠它决定
+                    // **响多久**。闹钟按手机的逻辑"响到你处理为止"（10 分钟自动静音），
+                    // 而倒计时/番茄钟/备忘只是一声提醒，响半分钟就该停。
+                    source: "alarm".into(),
                     id: t.id.clone(),
                     title: t.name.clone(),
                     body: "闹钟响了".into(),
@@ -291,7 +295,9 @@ pub fn start(app: AppHandle) {
 ///
 /// `first` 为真表示这是开机后的第一次，措辞用"你错过了"。
 fn run(app: &AppHandle, first: bool) {
-    let (alerts, timers_changed, memos_changed) = {
+    let now = now_ms();
+
+    let (mut alerts, timers_changed, memos_changed) = {
         let store = app.state::<Store>();
         let mut st = store.lock();
 
@@ -302,9 +308,18 @@ fn run(app: &AppHandle, first: bool) {
         // 于是第二次取 `st.memos` 就变成重复可变借用，编译不过。
         let AppState { timers, memos, .. } = &mut *st;
 
-        let result = evaluate(timers, memos, now_ms());
+        let result = evaluate(timers, memos, now);
         (result.alerts, result.timers_changed, result.memos_changed)
     };
+
+    // 稍后提醒是**独立于数据**的一条队列：这一 tick 可能没有任何到点，
+    // 但用户几分钟前排的「稍后提醒」到时间了。
+    //
+    // 并进同一个列表里让 `compose_alert` 统一拼标题正文，而不是另弹一次：
+    // 提醒窗只有一个，两次 `show_alert` 会让后一条把前一条顶掉，
+    // 而 `evaluate` 已经把那些标记成"已弹过"了 —— 那等于丢了一条提醒。
+    alerts.extend(take_due_snoozes(now));
+    alerts.sort_by_key(|a| a.due_at);
 
     if alerts.is_empty() {
         return;
@@ -321,9 +336,110 @@ fn run(app: &AppHandle, first: bool) {
         }
     };
 
+    // 闹钟按手机的逻辑响到你处理为止，其余几种只是一声提醒（见 AlertWindow）
+    let is_alarm = alerts.iter().any(|a| a.source == "alarm");
+
     if let Some((title, body)) = compose_alert(&alerts, multi_title) {
-        let _ = windows::show_alert(app, &title, &body);
+        let _ = windows::show_alert(app, &title, &body, is_alarm);
     }
+}
+
+// ===============================================================
+// 「稍后提醒」
+// ===============================================================
+
+/// 一条排队中的稍后提醒。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snooze {
+    title: String,
+    body: String,
+    /// 该重新弹出来的时刻。
+    at: i64,
+}
+
+/// 稍后提醒的队列。
+///
+/// 抽成独立结构体而不是直接在静态变量上写操作：**这样才能单测**。
+/// 挂在全局静态上的话，几个测试并行跑会互相把对方排的条目取走。
+#[derive(Default)]
+struct SnoozeQueue {
+    items: Vec<Snooze>,
+}
+
+impl SnoozeQueue {
+    /// 排一条。
+    fn push(&mut self, title: &str, body: &str, minutes: u32, now: i64) {
+        self.items.push(Snooze {
+            title: title.to_owned(),
+            body: body.to_owned(),
+            at: now + (minutes as i64) * 60_000,
+        });
+    }
+
+    /// 取走所有到点的，剩下的留着。
+    fn take_due(&mut self, now: i64) -> Vec<Snooze> {
+        let mut due = Vec::new();
+        let mut rest = Vec::new();
+        for s in self.items.drain(..) {
+            if s.at <= now {
+                due.push(s);
+            } else {
+                rest.push(s);
+            }
+        }
+        self.items = rest;
+        due
+    }
+}
+
+/// 排队中的稍后提醒。
+///
+/// # 为什么不去改那条数据本身
+///
+/// 手机闹钟响的时候有两个选择：关掉，或者「稍后提醒」。
+/// 后者说的是**"这条提醒再等我五分钟"**，不是"把我的闹钟改成五分钟后"。
+/// 所以这里是一条独立的队列：闹钟的钟点、备忘的提醒时刻**一个都不动**，
+/// 也就不会把用户设的时间悄悄改掉（那才是真的坑）。
+///
+/// # 为什么只放内存里
+///
+/// 稍后提醒都是几分钟的事。为它单开一份持久化文件 —— 还要一并处理
+/// 备份、恢复、损坏隔离 —— 不划算。代价是软件重启会丢掉排队中的稍后提醒，
+/// 记在 README 的「已知限制」里。
+static SNOOZES: OnceLock<Mutex<SnoozeQueue>> = OnceLock::new();
+
+fn snooze_slot() -> &'static Mutex<SnoozeQueue> {
+    SNOOZES.get_or_init(|| Mutex::new(SnoozeQueue::default()))
+}
+
+/// 排一条稍后提醒。
+///
+/// `minutes` 由调用方夹到合理区间（见 `commands::snooze_alert`）。
+pub fn push_snooze(title: &str, body: &str, minutes: u32, now: i64) {
+    snooze_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(title, body, minutes, now);
+}
+
+/// 取出所有到点的稍后提醒，剩下的留在队列里。
+///
+/// 转成 [`PendingAlert`] 而不是单独弹一次：理由见 `run` 里那段说明。
+pub fn take_due_snoozes(now: i64) -> Vec<PendingAlert> {
+    snooze_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take_due(now)
+        .into_iter()
+        .map(|s| PendingAlert {
+            source: "snooze".into(),
+            // 稍后提醒不对应任何一条数据，没有 id 可给
+            id: String::new(),
+            title: s.title,
+            body: s.body,
+            due_at: s.at,
+        })
+        .collect()
 }
 
 /// 落盘被修改的集合。
@@ -372,6 +488,90 @@ fn notify_frontend(app: &AppHandle, timers: bool, memos: bool) {
 mod tests {
     use super::*;
     use crate::models::Repeat;
+
+    // ---------- 稍后提醒的队列 ----------
+
+    #[test]
+    fn 稍后提醒排进去之后还没到点不会被取走() {
+        let mut q = SnoozeQueue::default();
+        q.push("开会", "10:30 的会", 5, NOW);
+
+        assert!(q.take_due(NOW).is_empty(), "刚排上就取走等于没延后");
+        assert!(q.take_due(NOW + 4 * 60_000).is_empty(), "差一分钟也不该取");
+        // 还留在队列里
+        assert_eq!(q.items.len(), 1);
+    }
+
+    #[test]
+    fn 稍后提醒到点会被取走而且只取一次() {
+        let mut q = SnoozeQueue::default();
+        q.push("开会", "10:30 的会", 5, NOW);
+
+        let due = q.take_due(NOW + 5 * 60_000);
+        assert_eq!(due.len(), 1, "正好到点就该取走");
+        assert_eq!(due[0].title, "开会");
+        assert_eq!(due[0].body, "10:30 的会");
+        assert_eq!(due[0].at, NOW + 5 * 60_000);
+
+        // 再取一次不能又冒出来 —— 否则每 500ms 弹一次，变成刷屏
+        assert!(q.take_due(NOW + 10 * 60_000).is_empty());
+    }
+
+    #[test]
+    fn 稍后提醒只取到点的那些其余留着() {
+        let mut q = SnoozeQueue::default();
+        q.push("早的", "1", 5, NOW);
+        q.push("晚的", "2", 30, NOW);
+
+        let due = q.take_due(NOW + 6 * 60_000);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].title, "早的");
+        // 晚的那条必须还在，等到点再弹
+        assert_eq!(q.items.len(), 1);
+        assert_eq!(q.items[0].title, "晚的");
+    }
+
+    #[test]
+    fn 稍后提醒排出来的是一条独立来源的待弹提醒() {
+        // 它不对应任何一条数据，所以没有 id；来源标成 snooze
+        let mut q = SnoozeQueue::default();
+        q.push("开会", "10:30 的会", 5, NOW);
+        let due = q.take_due(NOW + 5 * 60_000);
+
+        let alert = PendingAlert {
+            source: "snooze".into(),
+            id: String::new(),
+            title: due[0].title.clone(),
+            body: due[0].body.clone(),
+            due_at: due[0].at,
+        };
+        assert_eq!(alert.source, "snooze");
+        assert!(alert.id.is_empty());
+    }
+
+    #[test]
+    fn 闹钟的提醒来源标成_alarm_而不是_timer() {
+        // 提醒窗靠这个字段决定**响多久**：闹钟按手机逻辑响到你处理为止，
+        // 倒计时/番茄钟只是一声提醒。标错了会让倒计时也响十分钟。
+        let mut timers = vec![timer("a", TimerKind::Alarm, Some(NOW))];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(result.alerts[0].source, "alarm");
+    }
+
+    #[test]
+    fn 倒计时的提醒来源仍然是_timer() {
+        let mut timers = vec![timer("t", TimerKind::Countdown, Some(NOW))];
+        let mut memos = Vec::new();
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(result.alerts[0].source, "timer");
+    }
 
     /// 基准时刻。用固定值而不是 `now_ms()`，
     /// 否则测试会随运行时间漂移，边界断言变得不可靠。
@@ -597,7 +797,8 @@ mod tests {
         let result = evaluate(&mut timers, &mut memos, NOW);
 
         assert_eq!(result.alerts.len(), 1);
-        assert_eq!(result.alerts[0].source, "timer");
+        // 闹钟单独标成 `alarm`：提醒窗靠它决定响多久（见同名测试）
+        assert_eq!(result.alerts[0].source, "alarm");
         assert_eq!(result.alerts[0].body, "闹钟响了");
         assert_eq!(result.alerts[0].due_at, NOW);
         assert!(result.timers_changed);

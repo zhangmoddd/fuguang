@@ -791,3 +791,25 @@ textarea {
 .alert__ok:hover {
   background: rgba(29, 78, 216, 0.16);
 }
+
+/* 「稍后 5 分钟」：和「知道了」并排，但**更弱**。
+   它是次要动作（大多数人会直接关掉），抢了主按钮的注意力反而不好点。 */
+.alert__snooze {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-size: var(--fs-md);
+  font-family: inherit;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.alert__snooze:hover {
+  background: var(--bg-raised);
+  color: var(--text);
+}

@@ -94,6 +94,7 @@ pub fn run() {
             commands::settings_get,
             commands::settings_save,
             commands::settings_patch,
+            commands::snooze_alert,
             commands::autostart_get,
             commands::autostart_set,
             commands::current_exe,

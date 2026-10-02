@@ -320,9 +320,13 @@ pub fn toggle_panel(app: &AppHandle) -> tauri::Result<()> {
 
 /// 最近一次提醒的内容。前端挂载时主动拉一次（见 [`last_alert`]）。
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AlertContent {
     pub title: String,
     pub body: String,
+    /// 这是不是**闹钟**。提醒窗靠它决定响多久：
+    /// 闹钟按手机的逻辑"响到你处理为止"，其余几种只是一声提醒。
+    pub is_alarm: bool,
 }
 
 /// 最近一次提醒的内容。
@@ -364,26 +368,28 @@ pub fn last_alert() -> Option<AlertContent> {
 ///
 /// **复用窗口时事件同样可能丢**（监听器还没注册），所以内容还会存进
 /// [`last_alert`]，前端挂载时主动拉一次兜底。
-pub fn show_alert(app: &AppHandle, title: &str, body: &str) -> tauri::Result<()> {
+pub fn show_alert(app: &AppHandle, title: &str, body: &str, is_alarm: bool) -> tauri::Result<()> {
     use tauri::Emitter;
 
     // 先记下来：无论事件能不能送达，前端挂载时都能拉到
     *last_alert_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(AlertContent {
         title: title.to_string(),
         body: body.to_string(),
+        is_alarm,
     });
 
     let url = format!(
-        "index.html#/alert?title={}&body={}",
+        "index.html#/alert?title={}&body={}&alarm={}",
         urlencode(title),
-        urlencode(body)
+        urlencode(body),
+        if is_alarm { 1 } else { 0 }
     );
 
     if let Some(win) = app.get_webview_window(ALERT) {
         // 先推内容再显示，避免用户看到旧内容闪一下
         let _ = win.emit(
             "alert:content",
-            serde_json::json!({ "title": title, "body": body }),
+            serde_json::json!({ "title": title, "body": body, "isAlarm": is_alarm }),
         );
         win.show()?;
         win.set_focus()?;

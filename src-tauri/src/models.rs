@@ -542,7 +542,11 @@ impl Default for Settings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingAlert {
-    /// 来源类型：`timer` 或 `memo`。
+    /// 来源类型：`timer` / `alarm` / `memo` / `snooze`。
+    ///
+    /// `alarm` 单独标出来（而不是并进 `timer`）是因为**响铃行为不同**：
+    /// 闹钟按手机的逻辑"响到你处理为止"，其余几种只是一声提醒。
+    /// `snooze` 是用户点了「稍后提醒」之后排队重弹的那条。
     pub source: String,
     pub id: String,
     pub title: String,

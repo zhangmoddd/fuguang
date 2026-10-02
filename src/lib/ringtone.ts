@@ -87,44 +87,74 @@ const MOTIF_GAP = 0.72;
 export const RING_CYCLE = MOTIF.length * NOTE_GAP + MOTIF_GAP;
 
 /**
- * 满音量与「持续提醒」音量。
+ * 音量随时间降档：`[从第几秒起, 峰值]`。
  *
- * 前几秒用满音量：那时候用户多半就在电脑前，一下就该注意到。
- * 之后降到三分之一：还响，但不至于让人非去关掉它不可
- * —— 闹钟"一直响到你来关"是对的，可 30 秒的高音量会让人直接去静音。
+ * 手机闹钟是**恒定音量一直响到你处理**（iOS 约 15 分钟、
+ * Android（Google 时钟）默认「静音时间」10 分钟）。
+ * 桌面软件照搬有个问题：提醒窗是置顶的，用户可能就在旁边，
+ * 恒定音量响十分钟会让人直接去关掉系统声音 —— 那比不提醒更糟。
+ *
+ * 所以这里做成**先抓住注意力、再退成背景音**：
+ * 前 30 秒满音量（该注意到的时候一定要注意到），之后降到一半，
+ * 3 分钟还没人理就降到很低、但仍在响。
+ * 「一直响到你处理」这条手机逻辑保住了，代价只是后面的音量。
  */
-const PEAK_LOUD = 0.22;
-const PEAK_SOFT = 0.08;
+const VOLUME_STEPS: readonly (readonly [number, number])[] = [
+  [0, 0.22],
+  [30, 0.1],
+  [180, 0.05],
+];
+
+/** 某个时刻该用多大的音量峰值。 */
+export function peakAt(seconds: number): number {
+  let peak = VOLUME_STEPS[0][1];
+  for (const [from, p] of VOLUME_STEPS) {
+    if (seconds >= from) peak = p;
+  }
+  return peak;
+}
 
 /** 起音要短（长了听着"软"、不像敲出来的），但也必须有，否则会有咔哒声。 */
 const ATTACK = 0.008;
 
 /**
- * 排出整段铃声。
+ * 排出 `[fromSeconds, totalSeconds)` 这一段里的音符。
  *
- * 节奏是「四个音的上行琶音 → 静默 0.72 秒 → 再来一遍」，一直排到
- * `totalSeconds` 为止。只排**完整周期**，所以最后一轮不会被截成半截。
+ * 节奏是「四个音的上行琶音 → 静默 0.72 秒 → 再来一遍」。
  *
- * @param totalSeconds     整段铃声最长多少秒（到点自动停）
- * @param loudUntilSeconds 从起点算起，多少秒之内用满音量
+ * # 为什么按"音符窗口"取，而不是按"完整周期"截断
+ *
+ * 一开始是按完整周期截的（"别让最后一轮旋律剩半截"），结果**分段排时会漏音**：
+ * 第 1 段排到第 13 轮为止，第 14 轮的前三个音既不在第 1 段（被截掉）、
+ * 也不在第 2 段（它们早于第 2 段的起点）—— 每 20 秒就出现半秒的空洞。
+ * 这个 bug 是"分段不重不漏"那条测试抓出来的。
+ *
+ * 现在就是老老实实取落在窗口里的音符：不重不漏。
+ * 代价是整段铃声的最后可能剩半截旋律 —— 无所谓，
+ * 它本来就是循环的，用户点掉就停。
+ *
+ * # 为什么要分段
+ *
+ * 响 10 分钟 = 428 轮 × 4 个音 = 1712 个音符，每个音符三个泛音 ——
+ * 一次全排出来是**五千多个**音频节点，光是建出来就会卡一下，
+ * 而绝大多数提醒几秒内就被处理掉了。所以调用方每次只排 20 秒、
+ * 排完用定时器续下一段（见 `AlertWindow`）。
+ *
+ * @param totalSeconds 整段铃声最长多少秒
+ * @param fromSeconds  从第几秒开始排（这一秒之前的音符直接跳过）
  */
-export function ringSchedule(totalSeconds: number, loudUntilSeconds: number): Note[] {
+export function ringSchedule(totalSeconds: number, fromSeconds = 0): Note[] {
   if (!(totalSeconds > 0)) return [];
 
-  const cycles = Math.floor(totalSeconds / RING_CYCLE);
   const notes: Note[] = [];
-
-  for (let c = 0; c < cycles; c += 1) {
+  // 轮数上界由 totalSeconds 定死，循环一定结束
+  for (let c = 0; c * RING_CYCLE < totalSeconds; c += 1) {
     const cycleStart = c * RING_CYCLE;
     MOTIF.forEach((freq, i) => {
       const at = cycleStart + i * NOTE_GAP;
-      notes.push({
-        at,
-        freq,
-        peak: at < loudUntilSeconds ? PEAK_LOUD : PEAK_SOFT,
-        attack: ATTACK,
-        partials: PARTIALS,
-      });
+      if (at >= totalSeconds) return;
+      if (at < fromSeconds) return;
+      notes.push({ at, freq, peak: peakAt(at), attack: ATTACK, partials: PARTIALS });
     });
   }
 

@@ -508,6 +508,32 @@ pub async fn settings_get(app: AppHandle) -> Settings {
     s
 }
 
+/// 把**当前这条提醒**延后几分钟再弹一次（手机闹钟的「稍后提醒」）。
+///
+/// # 为什么改的是"提醒"而不是"数据"
+///
+/// 用户点「稍后提醒」说的是**"这条提醒再等我五分钟"**，
+/// 不是"把我的闹钟改成五分钟后"。所以这里只是把当前弹窗的标题正文
+/// 原样排进 [`scheduler`] 的稍后队列，**闹钟的钟点、备忘的提醒时刻一个都不动**。
+/// 改数据的话，用户下次打开会发现自己设的时间被悄悄改掉了 —— 那才是真的坑。
+///
+/// `minutes` 必须夹：前端理论上可以传任何数字，一个 525600（一年）
+/// 会让这条提醒永远回不来。
+#[tauri::command]
+pub async fn snooze_alert(minutes: u32) -> Result<(), String> {
+    let Some(current) = windows::last_alert() else {
+        return Err("现在没有正在显示的提醒".into());
+    };
+    let minutes = minutes.clamp(1, 60);
+    crate::scheduler::push_snooze(
+        &current.title,
+        &current.body,
+        minutes,
+        crate::models::now_ms(),
+    );
+    Ok(())
+}
+
 /// 保存设置。
 ///
 /// 存之前必须夹取取值范围：前端理论上可以传任何数字过来，

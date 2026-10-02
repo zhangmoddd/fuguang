@@ -119,6 +119,17 @@ pub struct Timer {
     #[serde(default)]
     pub alarm_daily: bool,
 
+    /// 上一次**真的响**的时刻（Unix 毫秒）。没响过是 `None`。
+    ///
+    /// 只用来把「已完成」说清楚 —— 卡片上光写"已响过"，用户不知道是刚才响的
+    /// 还是昨天响的（原话：「明明没有到 11:30 却显示已经响过」）。
+    /// 有了它就能显示「已响过 · 昨天 11:30」。
+    ///
+    /// 刻意不在前端"推算上一次"：推算只能给出"最近的某个钟点"，
+    /// 而软件没开的时候闹钟是不响的 —— 推算出来的时间会是假的。
+    #[serde(default)]
+    pub last_fired_at: Option<i64>,
+
     /// 是否已经提醒过（防止同一轮重复弹窗）。
     #[serde(default)]
     pub fired: bool,
@@ -595,6 +606,8 @@ mod tests {
         // 明确无害的值，而不是让整个文件解析失败
         assert_eq!(t.alarm_minutes, 0);
         assert!(!t.alarm_daily);
+        // 「上次响铃时刻」也是后加字段：老数据里没有 → None（表示"没响过"）
+        assert_eq!(t.last_fired_at, None);
     }
 
     #[test]
@@ -650,6 +663,7 @@ mod tests {
             laps: Vec::new(),
             alarm_minutes: 450,
             alarm_daily: true,
+            last_fired_at: None,
             fired: true,
             folder_id: None,
             created_at: 1,
@@ -751,6 +765,7 @@ mod tests {
             // 7:30 = 从本地零点起 450 分钟
             alarm_minutes: 450,
             alarm_daily: true,
+            last_fired_at: None,
             fired: false,
             folder_id: None,
             created_at: 1,
@@ -1117,6 +1132,7 @@ mod tests {
             laps: Vec::new(),
             alarm_minutes: 0,
             alarm_daily: false,
+            last_fired_at: None,
             fired: false,
             folder_id: Some("f1".into()),
             created_at: 4,
@@ -1207,6 +1223,7 @@ mod tests {
             laps: vec![100, 200],
             alarm_minutes: 0,
             alarm_daily: false,
+            last_fired_at: None,
             fired: false,
             folder_id: None,
             created_at: 1_700_000_000_000,

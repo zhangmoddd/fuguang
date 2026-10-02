@@ -34,6 +34,7 @@ function timer(over: Partial<Timer> = {}): Timer {
     laps: [],
     alarmMinutes: 450,
     alarmDaily: false,
+    lastFiredAt: null,
     fired: false,
     folderId: null,
     createdAt: 1,
@@ -154,25 +155,59 @@ describe("applyTimerEdit", () => {
     expect(next.endsAt as number).toBeGreaterThan(NOW);
   });
 
-  it("停掉的闹钟改了钟点不会自己排上", () => {
-    // 用户明确停过它。悄悄替他排上，第二天会被一个他没开的闹钟吵醒
+  it("已响过的闹钟改了钟点 → 按新钟点重排，并清掉「已响过」", () => {
+    // **用户实测踩到的就是这一条**：昨天建的一次性闹钟响过了（endsAt 已经是
+    // null、fired 是 true），今天把时间改到 11:30，卡片却仍然停在
+    // 「已完成 · 已响过」—— 看起来就是"改了没用"。
+    // 原话：「明明没有到 11:30 却显示已经响过」。
+    const done = timer({
+      kind: "alarm",
+      alarmMinutes: 450,
+      endsAt: null,
+      fired: true,
+      lastFiredAt: new Date(2026, 4, 19, 7, 30).getTime(),
+    });
+    const next = applyTimerEdit(done, draft({ kind: "alarm", alarmMinutes: 11 * 60 + 30 }), NOW);
+
+    expect(next.fired).toBe(false);
+    expect(next.endsAt).not.toBeNull();
+    const d = new Date(next.endsAt as number);
+    expect([d.getHours(), d.getMinutes()]).toEqual([11, 30]);
+    // 基准是 09:00，11:30 还没到 → 就是今天
+    expect(next.endsAt as number).toBeGreaterThan(NOW);
+    expect(next.lastFiredAt).toBe(done.lastFiredAt);
+  });
+
+  it("停掉的闹钟改了钟点也会按新钟点排上", () => {
+    // 用户的规则：**改了设置就按新设置排下一次**，没改就一个字都不动。
+    // 比原来"只有正排着的才重排"简单，也更好解释 —— 想让它不响就点「停止」。
     const stopped = timer({ kind: "alarm", alarmMinutes: 450, endsAt: null, fired: false });
     const next = applyTimerEdit(stopped, draft({ kind: "alarm", alarmMinutes: 8 * 60 }), NOW);
 
     expect(next.alarmMinutes).toBe(480);
-    expect(next.endsAt).toBeNull();
+    expect(next.endsAt).not.toBeNull();
+    expect(next.fired).toBe(false);
   });
 
-  it("已响过的闹钟改了钟点也不会自己排上", () => {
+  it("只改名字时，已响过的闹钟不会被重新排上", () => {
+    // 「没做修改就不动」：用户只是点开看了看、顺手改个名字，
+    // 不该把它重新激活 —— 那会变成"我没让它响它却响了"
     const done = timer({ kind: "alarm", alarmMinutes: 450, endsAt: null, fired: true });
-    const next = applyTimerEdit(done, draft({ kind: "alarm", alarmMinutes: 8 * 60 }), NOW);
+    const next = applyTimerEdit(done, draft({ kind: "alarm", name: "起床" }), NOW);
 
-    expect(next.endsAt).toBeNull();
-    // 「已响过」这个状态要保留，用户自己会点「再响一次」
+    expect(next.name).toBe("起床");
     expect(next.fired).toBe(true);
+    expect(next.endsAt).toBeNull();
   });
 
-  it("只把闹钟从「只响一次」改成「每天」也算改动 → 正排着就重排", () => {
+  it("只改名字时，停掉的闹钟也不会被排上", () => {
+    const stopped = timer({ kind: "alarm", alarmMinutes: 450, endsAt: null, fired: false });
+    const next = applyTimerEdit(stopped, draft({ kind: "alarm", name: "起床" }), NOW);
+
+    expect(next.endsAt).toBeNull();
+  });
+
+  it("只把闹钟从「只响一次」改成「每天」也算改动 → 重排", () => {
     const armed = timer({
       kind: "alarm",
       alarmMinutes: 450,
@@ -183,6 +218,18 @@ describe("applyTimerEdit", () => {
 
     expect(next.alarmDaily).toBe(true);
     expect(next.endsAt).not.toBeNull();
+  });
+
+  it("闹钟设置没变时整条相等（连 lastFiredAt 都不动）", () => {
+    // 打开编辑框、什么都没改、点保存 —— 不许有任何副作用
+    const done = timer({
+      kind: "alarm",
+      alarmMinutes: 450,
+      endsAt: null,
+      fired: true,
+      lastFiredAt: 123,
+    });
+    expect(applyTimerEdit(done, draft({ kind: "alarm" }), NOW)).toEqual(done);
   });
 
   it("秒表只改名字，计时一秒都不能丢", () => {

@@ -70,6 +70,16 @@ export interface Timer {
   alarmMinutes: number;
   /** 闹钟：是否每天重复。`false` 表示只响一次。 */
   alarmDaily: boolean;
+  /**
+   * 闹钟：上一次**真的响**的时刻。没响过是 `null`。
+   *
+   * 只用来把「已完成」说清楚 —— 卡片上光写"已响过"，用户不知道是刚才响的
+   * 还是昨天响的。有它就能显示「已响过 · 昨天 11:30」。
+   *
+   * 刻意不在前端推算：推算只能给出"最近的某个钟点"，
+   * 而软件没开的时候闹钟是不响的，推算出来的时间会是假的。
+   */
+  lastFiredAt: number | null;
   fired: boolean;
   /**
    * 所属文件夹 id，`null` 表示在顶层。

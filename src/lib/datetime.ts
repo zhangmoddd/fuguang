@@ -216,6 +216,20 @@ export function formatMoment(ms: number): string {
   return sameDay ? time : `${d.getMonth() + 1}月${d.getDate()}日 ${time}`;
 }
 
+/**
+ * 带**相对日期**的时刻，例如 `今天 07:30`、`明天 07:30`、`9月20日 周六 07:30`。
+ *
+ * 和 [`formatMoment`] 的区别只在一处：`formatMoment` 对"今天"只给时间
+ * （`07:30`），因为它原来的用途是"结束于 / 响铃于"这类**紧跟着就发生**的事，
+ * 今天是默认假设。而闹钟要说清"到底是今天还是明天响" ——
+ * 用户改完时间最想确认的正是这个（原话：「闹钟应该加一个日期的」）。
+ */
+export function formatMomentHuman(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${formatDateHuman(dateKey(d))} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 /** 距离某个时刻还有多久，例如 `还有 2 小时 15 分`。 */
 export function formatUntil(ms: number): string {
   const diff = ms - Date.now();

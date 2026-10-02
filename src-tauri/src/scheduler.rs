@@ -163,6 +163,10 @@ fn evaluate_timers(timers: &mut [Timer], now: i64, out: &mut Evaluation) {
                 // 留着 null 比塞一个 0 更诚实。
                 t.fired = true;
                 t.ends_at = None;
+                // 记下**真的响了的时刻**：卡片上要显示「已响过 · 昨天 11:30」。
+                // 前端推算不出这个值 —— 软件没开的时候闹钟不响，
+                // 推算只会给出"最近的某个钟点"，那是个假时间。
+                t.last_fired_at = Some(now);
                 out.timers_changed = true;
 
                 out.alerts.push(PendingAlert {
@@ -390,6 +394,7 @@ mod tests {
             laps: Vec::new(),
             alarm_minutes: 0,
             alarm_daily: false,
+            last_fired_at: None,
             fired: false,
             folder_id: None,
             created_at: 0,
@@ -600,6 +605,9 @@ mod tests {
         // 必须清掉 ends_at，否则下一个 tick 又判定"到点"，变成每 500ms 弹一次
         assert_eq!(timers[0].ends_at, None);
         assert!(timers[0].fired);
+        // 记下真的响了的时刻：卡片上要显示「已响过 · 昨天 11:30」。
+        // 不记的话用户看到"已响过"却不知道是什么时候响的。
+        assert_eq!(timers[0].last_fired_at, Some(NOW));
         // 闹钟没有"剩余时长"这个概念，不该被塞一个 0 进去
         assert_eq!(timers[0].remaining_ms, None);
         // 用户设的钟点不能被调度线程改掉：前端要靠它算下一次

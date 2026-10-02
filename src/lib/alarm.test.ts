@@ -63,6 +63,7 @@ function alarm(over: Partial<Timer> = {}): Timer {
     laps: [],
     alarmMinutes: 7 * 60 + 30,
     alarmDaily: true,
+    lastFiredAt: null,
     // Rust 响过之后留下的就是这一组：fired 为真、endsAt 清空
     fired: true,
     folderId: null,

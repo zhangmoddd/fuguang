@@ -73,6 +73,8 @@ export function createTimer(draft: TimerDraft, now: number): Timer {
     // 闹钟的钟点同样要单独存：停止、重新响都要靠它拿回用户设的时间
     alarmMinutes: isAlarm ? draft.alarmMinutes : 0,
     alarmDaily: isAlarm ? draft.alarmDaily : false,
+    // 新建的从来没响过
+    lastFiredAt: null,
     fired: false,
     // 归属由面板决定（只有它知道用户当前在哪个文件夹里）
     folderId: null,
@@ -147,12 +149,27 @@ export function applyTimerEdit(original: Timer, draft: TimerDraft, now: number):
       next.alarmMinutes = draft.alarmMinutes;
       next.alarmDaily = draft.alarmDaily;
 
-      // 只有**正排着下一次**的那条才按新钟点重排。
-      // 「未开始」和「已响过」本来就没排着，改了钟点也只是把设置存下来，
-      // 用户点「开始」/「再响一次」时自然会用上新值 —— 悄悄替他排上，
-      // 会让一个他明确停掉过的闹钟自己响起来。
-      if (changed && original.endsAt !== null) {
+      /**
+       * 改了钟点或重复规则 → **按新设置重新排下一次**，不管它原来是哪种状态。
+       *
+       * 原来的规则是"只有正排着下一次的（`endsAt !== null`）才重排"，
+       * 想避免"替用户把他明确停掉的闹钟排上"。**那个规则是错的**：
+       *
+       * 一个**已经响过**的一次性闹钟，`endsAt` 是 null、`fired` 是 true。
+       * 用户把时间从昨天改到今天 11:30，卡片仍然停在「已完成 · 已响过」——
+       * 看起来就是"改了没用"（用户的原话：「明明没有到 11:30 却显示已经响过」）。
+       *
+       * 想清楚"已完成"该表示什么就明白了：它只该表示"刚刚真的响过"。
+       * 用户一旦动手改设置，他要的显然是"按新时间响"，所以这里连 `fired`
+       * 一起清掉、重新排下一次。
+       *
+       * 没改任何东西时**一个字都不动**（用户只是点开看了看就关掉）——
+       * 这一条是用户自己提的，也是对的。
+       */
+      if (changed) {
         next.endsAt = nextAlarmAt(draft.alarmMinutes, now);
+        next.fired = false;
+        next.remainingMs = null;
       }
       break;
     }

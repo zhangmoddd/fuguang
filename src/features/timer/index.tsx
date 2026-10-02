@@ -43,7 +43,7 @@ import {
 import { api, onStateChanged } from "../../lib/api";
 import type { Folder as FolderItem, PomodoroPhase, Timer, TimerKind } from "../../lib/api";
 import { formatClock, nextAlarmAt, parseClock } from "../../lib/alarm";
-import { formatDuration, formatMoment, formatStopwatch } from "../../lib/datetime";
+import { formatDuration, formatMoment, formatMomentHuman, formatStopwatch } from "../../lib/datetime";
 import {
   applyTimerEdit,
   createTimer as createTimerFrom,
@@ -224,9 +224,18 @@ function metaOf(t: Timer, state: CardState): string {
     const rule = t.alarmDaily ? "每天" : "只响一次";
     const preset = `${rule} ${formatClock(t.alarmMinutes)}`;
     if (state === "running" && t.endsAt !== null) {
-      return `${preset} · 响铃于 ${formatMoment(t.endsAt)}`;
+      // 用带**相对日期**的说法（今天 / 明天 / 9月20日 周六）：
+      // 用户改完时间最想确认的就是"到底哪天响"（原话：「闹钟应该加一个日期的」）
+      return `${preset} · 响铃于 ${formatMomentHuman(t.endsAt)}`;
     }
-    if (state === "done") return `${preset} · 已响过`;
+    if (state === "done") {
+      // 说清**什么时候**响的。光写"已响过"，用户不知道是刚才响的还是昨天响的，
+      // 于是会怀疑"明明没到点怎么就响了"（真踩过这个）
+      const at = t.lastFiredAt;
+      return at === null
+        ? `${preset} · 已响过`
+        : `${preset} · 已响过（${formatMomentHuman(at)}）`;
+    }
     return preset;
   }
   return t.laps.length > 0 ? `共 ${t.laps.length} 次计次` : "";

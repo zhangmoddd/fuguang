@@ -27,6 +27,7 @@ import {
   formatDateHuman,
   formatDuration,
   formatMoment,
+  formatMomentHuman,
   formatStopwatch,
   formatUntil,
   isRealDateKey,
@@ -381,6 +382,33 @@ describe("formatMoment", () => {
   it("其他日期带上月日", () => {
     // 同样用远期日期，避免落进"今天"那一档（原因见 formatDateHuman 的测试）
     expect(formatMoment(combineLocal("2030-06-15", "08:05"))).toBe("6月15日 08:05");
+  });
+});
+
+describe("formatMomentHuman", () => {
+  // 和 formatMoment 只差一处：**今天也要把"今天"说出来**。
+  // 闹钟卡片靠它回答"到底哪天响"（用户原话：「闹钟应该加一个日期的」）。
+  it("今天也带上「今天」两个字", () => {
+    expect(formatMomentHuman(combineLocal(todayKey(), "07:30"))).toBe("今天 07:30");
+  });
+
+  it("明天 / 昨天用相对说法", () => {
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    expect(formatMomentHuman(combineLocal(dateKey(tomorrow), "07:30"))).toBe("明天 07:30");
+
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    expect(formatMomentHuman(combineLocal(dateKey(yesterday), "23:05"))).toBe("昨天 23:05");
+  });
+
+  it("更远的日期给月日 + 星期", () => {
+    // 2030-06-15 是周六
+    expect(formatMomentHuman(combineLocal("2030-06-15", "08:05"))).toBe("6月15日 周六 08:05");
+  });
+
+  it("补零，且用的是本地时区", () => {
+    expect(formatMomentHuman(combineLocal("2030-01-02", "00:00"))).toBe("1月2日 周三 00:00");
   });
 });
 

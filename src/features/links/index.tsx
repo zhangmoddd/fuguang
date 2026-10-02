@@ -25,7 +25,7 @@
  * 4. **图标是装饰品，提取失败一律静默降级**成按 kind 区分的内置图标。
  *    Rust 侧也约定「任何失败都返回 null，绝不 panic」，两边口径一致。
  */
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
   AppWindow,
@@ -102,6 +102,44 @@ const iconCache = new Map<string, string>();
 const iconPending = new Map<string, Promise<string | null>>();
 
 /**
+ * 图标加载完的订阅者。
+ *
+ * # 为什么必须有订阅，不能只在挂载时读一次缓存
+ *
+ * 第一版是"挂载时读缓存 + effect 里 `loadIcon().then(setSrc)`"。它有一个
+ * **用户实测报出来的**漏洞：网格一次挂出几十个格子，提取是异步的，
+ * 而加载完成时那一格**可能已经卸载了** —— `alive` 闸门把这次结果丢掉
+ * （缓存却已经写进去了）。之后这个格子再也不会自己去读缓存，
+ * 它就永远停在通用占位图标上，**直到用户拖动它**
+ * （拖动会让它重新挂载，那时才从缓存里读到真图标）。
+ *
+ * 用户的原话就是：「图标怎么消失了？我移动图标才会恢复正常」。
+ *
+ * 换成"缓存 + 订阅"之后，任何一个图标加载完都会通知**所有还挂着的**格子
+ * 重新读一次。订阅是跟着组件挂载走的，所以"挂在屏幕上但拿不到更新"
+ * 这条路被彻底堵死了 —— 不管丢更新的原因是什么。
+ */
+const iconListeners = new Set<() => void>();
+
+/** 订阅图标缓存的变化（`useSyncExternalStore` 用）。 */
+function subscribeIcon(fn: () => void): () => void {
+  iconListeners.add(fn);
+  return () => {
+    iconListeners.delete(fn);
+  };
+}
+
+/** 读缓存。返回 `null` 表示还没加载出来（用内置图标兜底）。 */
+function readIcon(target: string): string | null {
+  return iconCache.get(target) ?? null;
+}
+
+/** 通知所有挂着的格子重新读缓存。 */
+function notifyIcons(): void {
+  for (const fn of iconListeners) fn();
+}
+
+/**
  * 把 Rust 给的 RGBA 像素画成 PNG data URL。
  *
  * Rust 侧刻意不引 PNG 编码依赖（本项目对发布体积敏感），
@@ -143,7 +181,12 @@ function loadIcon(target: string): Promise<string | null> {
     .linkIcon(target)
     .then((icon) => {
       const url = icon ? encodeIcon(icon) : null;
-      if (url) iconCache.set(target, url);
+      if (url) {
+        iconCache.set(target, url);
+        // 广播：**所有**挂着的格子都重读一次，而不是只通知发起这次请求的那一个。
+        // 发起者可能已经卸载了（见 iconListeners 的说明）。
+        notifyIcons();
+      }
       return url;
     })
     // Rust 侧已经约定失败返回 null，这里再兜一层序列化 / 命令名之类的意外
@@ -158,35 +201,27 @@ function loadIcon(target: string): Promise<string | null> {
 
 /** 格子里的图标：优先用提取到的真实图标，拿不到就用按类型区分的内置图标。 */
 function LinkGlyph({ link }: { link: LinkItem }) {
-  // 初始值直接读缓存：命中时连一帧内置图标都不会闪
-  const [src, setSrc] = useState<string | null>(() => iconCache.get(link.target) ?? null);
+  /**
+   * 直接**订阅缓存**，而不是"挂载时读一次 + effect 里 setState"。
+   *
+   * 后者丢过一次更新就再也补不回来（用户实测：「图标怎么消失了？
+   * 我移动图标才会恢复正常」）—— 详见 `iconListeners` 的说明。
+   */
+  const cached = useSyncExternalStore(subscribeIcon, () => readIcon(link.target));
 
   useEffect(() => {
     // 网址没有可提取的图标（对 http:// 调 SHGetFileInfoW 只会拿到浏览器或默认图标），
     // 直接跳过这次跨进程调用，用 Globe 表达「这是个网址」更贴切。
-    if (link.kind === "url") {
-      setSrc(null);
-      return;
-    }
+    if (link.kind === "url") return;
+    if (iconCache.has(link.target)) return;
 
-    const cached = iconCache.get(link.target);
-    if (cached) {
-      setSrc(cached);
-      return;
-    }
-
-    let alive = true;
-    void loadIcon(link.target).then((url) => {
-      // 组件可能已经卸载、或 target 已经变了，晚到的结果不能再写进状态
-      if (alive && url) setSrc(url);
-    });
-    return () => {
-      alive = false;
-    };
+    // 结果走缓存 + 广播，这里不需要（也不该）自己 setState：
+    // 本组件可能在这条 promise 落地之前就卸载了。
+    void loadIcon(link.target);
   }, [link.target, link.kind]);
 
-  if (src) {
-    return <img className="links__glyph" src={src} alt="" draggable={false} />;
+  if (cached) {
+    return <img className="links__glyph" src={cached} alt="" draggable={false} />;
   }
 
   const Fallback = KIND_ICON[link.kind];

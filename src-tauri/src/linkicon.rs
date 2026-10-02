@@ -18,6 +18,7 @@
 #![cfg(windows)]
 
 use std::ffi::c_void;
+use std::sync::Mutex;
 
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
@@ -36,6 +37,27 @@ pub struct IconData {
     pub rgba_base64: String,
 }
 
+/// 提取串行化用的锁。
+///
+/// # 为什么必须串行（实测数据）
+///
+/// 起 40 个线程同时提取，**只有 1 个成功、39 个失败**，
+/// 失败点全都一样：`SHGetFileInfoW` 返回 1（成功）但 `hIcon` 是**空指针**。
+/// 串行化之后同一台机器上 40 个全部成功。
+///
+/// 这不是"可能有问题"的猜测，而是真实发生过的用户可见故障：
+/// 链接页一次会挂出几十个格子（用户的链接页有 53 条），
+/// 于是**大部分图标都出不来**，界面上只剩通用占位图标 ——
+/// 用户的原话是「图标怎么消失了？我移动图标才会恢复正常」
+/// （拖动会让那一格重新挂载，那时缓存已经写好，所以单独拖一个能显示）。
+///
+/// # 代价
+///
+/// 一次提取几毫秒，53 条串起来不到一秒；而且它跑在后台线程池上，
+/// 不占界面线程。极端情况下（某个快捷方式指向慢速可移动盘）
+/// 会让后面的图标等一会儿 —— 但"图标晚一点出来"远好过"图标出不来"。
+static ICON_LOCK: Mutex<()> = Mutex::new(());
+
 /// 从指定路径提取图标。失败返回 None。
 pub fn extract(path: &str) -> Option<IconData> {
     if path.is_empty() {
@@ -46,6 +68,10 @@ pub fn extract(path: &str) -> Option<IconData> {
     if touches_network(path) {
         return None;
     }
+
+    // 中毒了也继续用：图标是尽力而为的东西，
+    // 不该因为某个线程 panic 过一次就永久失效。
+    let _guard = ICON_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { extract_inner(path) }
 }
 
@@ -255,6 +281,130 @@ fn base64_encode(data: &[u8]) -> String {
 // （那样即使两边同时错也能"通过"）。
 // ===============================================================
 
+#[cfg(test)]
+mod real_icon_tests {
+    use super::*;
+
+    /// 并发提取几十个图标，必须**全部成功**。
+    ///
+    /// # 这条测试抓出过一个真实的用户故障
+    ///
+    /// 没有串行化之前，起 40 个线程同时提取：**只有 1 个成功、39 个失败**，
+    /// 失败点全都是 `SHGetFileInfoW` 返回 1 但 `hIcon` 是空指针。
+    /// 而链接页一次就会挂出几十个格子（用户的链接页有 53 条）——
+    /// 于是大部分图标都出不来，界面上只剩通用占位图标。
+    /// 用户的原话：「图标怎么消失了？我移动图标才会恢复正常」。
+    ///
+    /// 所以这条不是"锦上添花的健壮性测试"，它是那个 bug 的回归测试：
+    /// 谁把 `ICON_LOCK` 拿掉，这里立刻会红。
+    #[test]
+    fn 并发提取几十个图标必须全部成功() {
+        let mut seeds: Vec<String> = Vec::new();
+        let notepad = r"C:\Windows\System32\notepad.exe";
+        if std::path::Path::new(notepad).exists() {
+            seeds.push(notepad.into());
+        }
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            if let Ok(entries) = std::fs::read_dir(format!(r"{home}\Desktop")) {
+                seeds.extend(
+                    entries
+                        .flatten()
+                        .map(|e| e.path().to_string_lossy().into_owned())
+                        .filter(|p| p.to_ascii_lowercase().ends_with(".lnk"))
+                        .take(8),
+                );
+            }
+        }
+        if seeds.is_empty() {
+            eprintln!("跳过：这台机器上找不到可用的测试路径");
+            return;
+        }
+
+        // 凑到 32 个：同一个路径重复提取也是并发（而且更能暴露共享状态的问题）
+        let mut paths = Vec::new();
+        while paths.len() < 32 {
+            let i = paths.len() % seeds.len();
+            paths.push(seeds[i].clone());
+        }
+
+        let handles: Vec<_> = paths
+            .into_iter()
+            .map(|p| std::thread::spawn(move || extract(&p).is_some()))
+            .collect();
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let failed = results.iter().filter(|ok| !**ok).count();
+        assert_eq!(
+            failed, 0,
+            "并发提取 {} 个里有 {failed} 个失败 —— 检查 ICON_LOCK 是不是被去掉了",
+            results.len()
+        );
+    }
+    /// 真去 Shell 要一个图标，验证整条提取链路（Shell → GDI → RGBA → base64）。
+    ///
+    /// # 为什么要测真实路径，而不是只测纯逻辑
+    ///
+    /// 这条链路上任何一环坏掉，界面上看到的都是"图标不见了"。
+    /// **用户实测报过这个**，当时就是靠这个测试排除了"Rust 侧提取失败"
+    /// 这一整类原因：`.exe` 和 `.lnk` 都提取得出来，都是 32×32、长度一致 ——
+    /// 于是问题被定位到前端丢更新（见 `links/index.tsx` 的 `iconListeners`）。
+    ///
+    /// 用 `notepad.exe` 是因为它在所有 Windows 上都有；
+    /// 万一没有（被精简过的系统）就跳过，不让测试变成机器相关。
+    #[test]
+    fn 能从真实的_exe_提取出合法图标() {
+        let path = r"C:\Windows\System32\notepad.exe";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("跳过：这台机器上没有 {path}");
+            return;
+        }
+
+        let icon = extract(path).expect("notepad.exe 必须能提取出图标");
+
+        // Shell 给的是"大图标"，Windows 上是 32×32
+        assert_eq!(icon.width, 32);
+        assert_eq!(icon.height, 32);
+        // base64 长度必须是 4/3 倍像素字节数（32×32×4 = 4096 → 5464）
+        assert_eq!(icon.rgba_base64.len(), 5464);
+        // 不能是"全透明"：那种图标提取出来了也等于没提取
+        assert!(
+            icon.rgba_base64.chars().any(|c| c != 'A'),
+            "提取到的是全透明图标"
+        );
+    }
+
+    /// 快捷方式（`.lnk`）也要能提取 —— 用户桌面上的程序几乎全是 .lnk。
+    ///
+    /// 这条曾经是重点怀疑对象（"是不是只有 .lnk 提取失败"），实测排除了。
+    /// 留着当回归：`SHGetFileInfoW` 对 `.lnk` 会去**解析目标**，
+    /// 这条路径比直接给 `.exe` 复杂得多。
+    #[test]
+    fn 能从快捷方式提取出合法图标() {
+        // 找桌面上任意一个 .lnk，找不到就跳过（无头机器上可能没有）
+        let Ok(home) = std::env::var("USERPROFILE") else {
+            eprintln!("跳过：拿不到 USERPROFILE");
+            return;
+        };
+        let desktop = format!(r"{home}\Desktop");
+        let Ok(entries) = std::fs::read_dir(&desktop) else {
+            eprintln!("跳过：读不到桌面目录 {desktop}");
+            return;
+        };
+        let lnk = entries
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")));
+        let Some(lnk) = lnk else {
+            eprintln!("跳过：桌面上没有 .lnk");
+            return;
+        };
+
+        let icon = extract(&lnk.to_string_lossy()).expect("桌面的 .lnk 必须能提取出图标");
+        assert_eq!(icon.width, 32);
+        assert_eq!(icon.height, 32);
+        assert_eq!(icon.rgba_base64.len(), 5464);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

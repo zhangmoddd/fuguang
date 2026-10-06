@@ -83,6 +83,14 @@ function matches(s: Snippet, query: string): boolean {
   );
 }
 
+/** 把标签输入框里的一行拆成标签数组。逗号（中英文）或空格分隔。 */
+function parseTags(text: string): string[] {
+  return text
+    .split(/[,，\s]+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
 /** 把正文压成一行摘要用于列表展示。 */
 function summarize(text: string, max = 80): string {
   const flat = text.replace(/\s+/g, " ").trim();
@@ -294,20 +302,50 @@ export function SnippetsPanel() {
   };
 
   /**
-   * 保存一条片段。
-   *
-   * # 为什么必须 `await flush()` 之后再提示
-   *
-   * `update()` 只是把新值放进内存并**排一次 400ms 的防抖写盘**，它不等结果。
-   * 原来这里紧接着就 `showFeedback("已保存")` —— 磁盘满、数据目录只读、
-   * 文件被杀软独占时，用户看到的是绿色对勾，**重启之后这条根本不存在**。
-   * 这是全项目唯一一处"确信存上了、其实没存"的路径，而它恰好发生在
-   * 用户最需要被告知的时刻。
-   *
-   * 失败时**不关编辑器**：关掉就等于告诉用户"存好了"，而改动其实只在内存里。
-   * 留着编辑器 + 一条警示提示，用户可以再点一次保存。
+   * 打开编辑器时那条片段原来的样子，供「撤销改动」还原。
+   * `null` 表示没在编辑。
    */
-  const save = async (draft: Snippet) => {
+  const snapshotRef = useRef<Snippet | null>(null);
+  /**
+   * 这条是不是**这次编辑期间才新建**的。
+   *
+   * 撤销时要区分两种情形：新建的整条删掉（否则盘上会留下一条空壳），
+   * 原来就有的还原成 `snapshotRef`。判据在**打开编辑器那一刻**取定，
+   * 之后不再变 —— 所以它不是"数据里现在有没有"，而是"进来之前有没有"。
+   */
+  const isNewRef = useRef(false);
+  /** 本次编辑里数据是否真的被动过。只用来决定要不要报「已保存 / 已撤销」。 */
+  const dirtyRef = useRef(false);
+
+  const openEditor = (s: Snippet) => {
+    snapshotRef.current = s;
+    isNewRef.current = !snippets.some((x) => x.id === s.id);
+    dirtyRef.current = false;
+    setEditing(s);
+  };
+
+  /**
+   * 编辑器里改一下就写一次数据 —— **自动保存**，没有「保存」按钮了。
+   *
+   * # 为什么原来那套「点保存才存」必须去掉
+   *
+   * 原来草稿只活在 `SnippetEditor` 的 `useState` 里，只有点「保存」才 `update()`
+   * 进数据。于是**没点保存就等于没写**，而且丢的时候一句话都不说：
+   * 切页签（`PanelWindow` 只挂载当前页签，切走即卸载整个面板组件）、
+   * 点「取消」、按 Esc、直接退出软件，用户刚敲的字全部消失。
+   * 面板窗口是 `hide` 不是销毁，所以"收起面板"这一条恰好不丢 ——
+   * 于是这个 bug 表现得时灵时不灵，更难归因。
+   *
+   * 现在的规则是：**敲进去的就是存下来的**。每改一下都进数据，
+   * 由 `usePersistentState` 的 400ms 防抖写盘负责落盘（窗口隐藏 / 卸载前
+   * 还会强制落盘）。编辑器只剩「完成」和「撤销改动」两个出口。
+   *
+   * 正文为空时**不写**：和原来「保存」按钮的 `disabled` 是同一条规矩 ——
+   * 不存空正文的片段。所以清空正文再退出，数据里仍是上一次的内容。
+   */
+  const onDraftChange = (draft: Snippet) => {
+    if (!draft.content.trim()) return;
+    dirtyRef.current = true;
     const cleaned: Snippet = {
       ...draft,
       title: draft.title.trim() || summarize(draft.content, 24) || "未命名",
@@ -317,13 +355,42 @@ export function SnippetsPanel() {
       const exists = prev.some((s) => s.id === cleaned.id);
       return exists ? prev.map((s) => (s.id === cleaned.id ? cleaned : s)) : [cleaned, ...prev];
     });
+  };
 
+  /**
+   * 「完成」：数据早就写进去了，这里只负责关掉编辑器。
+   *
+   * 仍然要 `await flush()` 之后再报「已保存」—— `update()` 只是排了一次
+   * 400ms 的防抖写盘，磁盘满 / 数据目录只读时它不会成功，而无条件说
+   * "已保存"就是撒谎（这条原来踩过，见 CHANGELOG 的「保存失败却告诉用户已保存」）。
+   */
+  const finishEdit = async () => {
+    setEditing(null);
+    if (!dirtyRef.current) return;
     if (await flush()) {
-      setEditing(null);
       showFeedback("已保存");
       return;
     }
     showFeedback("保存失败：改动只在内存里，请检查数据目录能不能写", "warn");
+  };
+
+  /**
+   * 「撤销改动」：退回打开编辑器时的样子。
+   *
+   * 只有真的动过数据才需要写 —— 否则会白白排一次写盘，还会把
+   * "没改过" 的东西重新写一遍。
+   */
+  const discardEdit = () => {
+    const snap = snapshotRef.current;
+    if (snap && dirtyRef.current) {
+      update((prev) =>
+        isNewRef.current
+          ? prev.filter((s) => s.id !== snap.id)
+          : prev.map((s) => (s.id === snap.id ? snap : s)),
+      );
+      showFeedback("已撤销改动");
+    }
+    setEditing(null);
   };
 
   /** 删除一条。同样要等落盘结果再说话 —— 不可逆的操作尤其不能谎报成功。 */
@@ -423,8 +490,9 @@ export function SnippetsPanel() {
         {notices}
         <SnippetEditor
           draft={editing}
-          onCancel={() => setEditing(null)}
-          onSave={save}
+          onChange={onDraftChange}
+          onDone={finishEdit}
+          onDiscard={discardEdit}
         />
       </div>
     );
@@ -460,7 +528,7 @@ export function SnippetsPanel() {
           {folders.currentId ? `本文件夹 ${inFolder.length} 条` : `共 ${snippets.length} 条`}
           {query && ` · 命中 ${visible.length} 条`}
         </span>
-        <button className="btn btn--primary" onClick={() => setEditing(emptySnippet(folders.currentId))}>
+        <button className="btn btn--primary" onClick={() => openEditor(emptySnippet(folders.currentId))}>
           <Plus size={13} />
           新建
         </button>
@@ -600,7 +668,7 @@ export function SnippetsPanel() {
                 >
                   <FolderInput size={13} />
                 </button>
-                <button className="iconbtn" onClick={() => setEditing(s)} title="编辑">
+                <button className="iconbtn" onClick={() => openEditor(s)} title="编辑">
                   <Pencil size={13} />
                 </button>
                 <button className="iconbtn iconbtn--danger" onClick={() => void remove(s.id)} title="删除">
@@ -633,17 +701,27 @@ export function SnippetsPanel() {
 /** 新建/编辑界面。 */
 function SnippetEditor({
   draft,
-  onSave,
-  onCancel,
+  onChange,
+  onDone,
+  onDiscard,
 }: {
   draft: Snippet;
-  onSave: (s: Snippet) => void | Promise<void>;
-  onCancel: () => void;
+  /** 每改一下就回调一次 —— 数据是自动保存的，这里没有「提交」这个动作。 */
+  onChange: (s: Snippet) => void;
+  onDone: () => void;
+  onDiscard: () => void;
 }) {
   const [form, setForm] = useState<Snippet>(draft);
 
-  // 填到一半按 Esc 应该是「退出编辑」，不是「把整个面板收起来」
-  useEscapeToClose(onCancel);
+  /**
+   * Esc 只离开编辑器，**不丢改动**（改动在每次击键时就进了数据）。
+   *
+   * 这里原来是 `useEscapeToClose(onCancel)` —— 按 Esc 等于"取消"，
+   * 而"取消"就是丢掉刚写的东西。这正是「写好东西没点保存就不保存」里
+   * 最坑人的一条：想收起面板，顺手按个 Esc，字就没了，还没有提示。
+   * 想退回原样请用「撤销改动」—— 一个明确的、带文字的按钮。
+   */
+  useEscapeToClose(onDone);
   const [tagInput, setTagInput] = useState(draft.tags.join(", "));
   const contentRef = useRef<HTMLTextAreaElement>(null);
 
@@ -651,14 +729,16 @@ function SnippetEditor({
     contentRef.current?.focus();
   }, []);
 
-  const patch = (p: Partial<Snippet>) => setForm((f) => ({ ...f, ...p }));
-
-  const submit = () => {
-    const tags = tagInput
-      .split(/[,，\s]+/)
-      .map((t) => t.trim())
-      .filter(Boolean);
-    onSave({ ...form, tags });
+  /**
+   * 改一个字段。
+   *
+   * 本地 `form` 保证打字跟手（受控输入框不能等一次 IPC 往返），
+   * 同时把整条推给数据。两边是同一份内容，不存在"本地改了但没存"的中间态。
+   */
+  const patch = (p: Partial<Snippet>) => {
+    const next = { ...form, ...p };
+    setForm(next);
+    onChange(next);
   };
 
   return (
@@ -713,7 +793,11 @@ function SnippetEditor({
           className="field__input"
           value={tagInput}
           placeholder="账号, 工作"
-          onChange={(e) => setTagInput(e.target.value)}
+          onChange={(e) => {
+            setTagInput(e.target.value);
+            // 标签也是数据的一部分，改完立刻一起存（原来只在点「保存」时才拆）
+            patch({ tags: parseTags(e.target.value) });
+          }}
         />
       </label>
 
@@ -737,17 +821,17 @@ function SnippetEditor({
       </div>
 
       <div className="editor__actions">
-        <button className="btn" onClick={onCancel}>
-          取消
+        <button className="btn" onClick={onDiscard} title="退回打开编辑器时的内容">
+          撤销改动
         </button>
         <button
           className="btn btn--primary"
-          onClick={submit}
+          onClick={onDone}
           disabled={!form.content.trim()}
           title={form.content.trim() ? "" : "正文不能为空"}
         >
-          <Clipboard size={13} />
-          保存
+          <Check size={13} />
+          完成
         </button>
       </div>
     </div>

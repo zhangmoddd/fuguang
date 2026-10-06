@@ -24,8 +24,15 @@
  * 抽成不依赖任何东西的纯逻辑，就能直接单测（见 `write-coordinator.test.ts`）。
  */
 export class WriteCoordinator {
-  /** 改动版本号：每有一次改动 +1。 */
-  private revision = 0;
+  /**
+   * 改动版本号：每有一次改动 +1。
+   *
+   * 名字不叫 `revision` 是因为下面有一个**同名的只读 getter**：
+   * 同名的实例字段和访问器会让 TypeScript 直接报
+   * `TS2300: Duplicate identifier 'revision'`（**两处**），根本编不过。
+   * 所以必须换名 —— 不是"编译器不报错、运行期静默遮蔽"，那种写法压根写不出来。
+   */
+  private rev = 0;
   /** 已经成功写盘的版本号。 */
   private written = 0;
   /** 是否已经有一次写盘在飞。**同一时刻只允许一次**，见 `begin`。 */
@@ -33,12 +40,24 @@ export class WriteCoordinator {
 
   /** 记一次改动。 */
   markDirty(): void {
-    this.revision += 1;
+    this.rev += 1;
+  }
+
+  /**
+   * 本地改动版本号，**只增不减**。
+   *
+   * 调用方（`store.ts` 的 `reload`）用它判断"读盘期间本地到底有没有新改动"。
+   * 为什么不能只看 `dirty` 布尔：读盘期间若本地那次改动**已经落盘**，`dirty`
+   * 会变回假 —— 于是"期间真的改过"这件事被布尔值掩盖掉了，而读回来的内容
+   * 可能比刚落盘的数据还旧，采纳它会让用户刚敲的字从界面上消失。
+   */
+  get revision(): number {
+    return this.rev;
   }
 
   /** 还有没有未落盘的改动。 */
   get dirty(): boolean {
-    return this.written < this.revision;
+    return this.written < this.rev;
   }
 
   /**

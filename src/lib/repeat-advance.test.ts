@@ -39,6 +39,9 @@ function dueMemo(over: Partial<Memo> = {}): Memo {
     title: "测试备忘",
     body: "",
     tags: [],
+    // 备忘可以挂图片（`Memo.images` 是**必填**的：`memo_save` 是整条覆盖写，
+    // 漏掉这个字段等于把图删了）。这条测试不关心图片，给个空的。
+    images: [],
     remindAt: at,
     repeat: "daily",
     // firedFor === remindAt 就是"Rust 已经为这个时刻弹过窗了"的标志

@@ -29,6 +29,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import {
   AlarmClock,
   Clock,
+  Copy,
   Flag,
   FolderInput,
   Pause,
@@ -43,6 +44,13 @@ import {
 import { api, onStateChanged } from "../../lib/api";
 import type { Folder as FolderItem, PomodoroPhase, Timer, TimerKind } from "../../lib/api";
 import { formatClock, nextAlarmAt, parseClock } from "../../lib/alarm";
+import {
+  isContextMenuOpen,
+  scrollIntoViewSoon,
+  useContextMenu,
+  useFocusHighlight,
+  type ContextMenuItem,
+} from "../../lib/context-menu";
 import { formatDuration, formatMoment, formatMomentHuman, formatStopwatch } from "../../lib/datetime";
 import {
   applyTimerEdit,
@@ -58,10 +66,15 @@ import {
   FolderTiles,
   useFolders,
 } from "../../lib/folders-ui";
+import { focusDomId, folderToEnter, highlightFrom, isHighlighted } from "../../lib/focus-highlight";
+import { usePendingFocus } from "../../lib/navigation";
 import { useZoom } from "../../lib/zoom";
 import type { FeatureModule } from "../registry";
 
 import "./timer.css";
+
+/** 定位高亮用的 DOM id 前缀。见 `lib/focus-highlight.ts` 的 `focusDomId`。 */
+const FOCUS_DOM_PREFIX = "tmr-focus";
 
 /** 重画间隔。取 100ms 而不是 1s：秒表带百分秒，一秒一跳会明显发顿。 */
 const TICK_MS = 100;
@@ -370,6 +383,147 @@ export function TimerPanel() {
 
   const folders = useFolders("timer", { moveItems });
   const zoom = useZoom("timer");
+
+  /** 右键菜单。 */
+  const ctx = useContextMenu();
+  /** 定位高亮：短暂 + 一交互就灭，见 lib/context-menu.tsx 的 useFocusHighlight。 */
+  const focus = useFocusHighlight();
+  const { target: pending, done: focusDone } = usePendingFocus("timer");
+
+  /**
+   * 一条计时器在右键菜单里的动作。
+   *
+   * 刻意**没有**「键入到当前光标」：计时器的"内容"是一个时间
+   * （"还有 4 分 30 秒"），把它打到外部窗口没有意义。
+   * 列出来点了没反应，比不列出来更糟 —— 命令面板的文案也是同一条口径
+   * （见 `lib/navigation.ts` 的 `paletteActions`）。
+   *
+   * 「复制」复制的是**用户起的名字**：那是这条计时器唯一可以拿出去用的
+   * 文本（"番茄钟 25/5"），复制一个时间数字没有意义。
+   */
+  const timerMenu = (t: Timer): ContextMenuItem[] => {
+    const state = stateOf(t);
+    return [
+      {
+        id: "copy-name",
+        label: "复制名字",
+        icon: <Copy size={13} />,
+        hint: "Ctrl+C",
+        onSelect: () => {
+          void api.copyText(t.name).then((ok) => {
+            setError(ok ? null : "复制失败，剪贴板可能被占用");
+          });
+        },
+      },
+      {
+        id: "edit",
+        label: "编辑",
+        icon: <Pencil size={13} />,
+        hint: KIND_LABEL[t.kind],
+        dividerBefore: true,
+        onSelect: () => {
+          setCreating(false);
+          setEditingId(t.id);
+        },
+      },
+      {
+        id: "move",
+        label: "移动到…",
+        icon: <FolderInput size={13} />,
+        onSelect: () => setMovingId(t.id),
+      },
+      // 只有"能动"的那几类才给开始 / 停止 —— 和卡片上的按钮同一套判据，
+      // 免得右键菜单里冒出一个卡片上没有的动作。
+      // 秒表不给：它的"停止"是暂停 + 计次两步，一个菜单项说不清。
+      ...(t.kind === "stopwatch"
+        ? []
+        : [
+            {
+              id: "toggle",
+              label: state === "running" ? "停止 / 重置" : "开始",
+              icon: state === "running" ? <RotateCcw size={13} /> : <Play size={13} />,
+              dividerBefore: true,
+              onSelect: () => (state === "running" ? resetTimer(t) : startTimer(t)),
+            },
+          ]),
+      {
+        id: "delete",
+        label: "删除",
+        icon: <Trash2 size={13} />,
+        danger: true,
+        dividerBefore: true,
+        onSelect: () => void removeTimer(t.id),
+      },
+    ];
+  };
+
+  /**
+   * 右键菜单里的「开始 / 停止」。
+   *
+   * 走和卡片按钮**完全相同**的那几个函数，不另写一套：
+   * 计时器的开始/停止牵涉到 `fired` 要不要清、`endsAt` 怎么算
+   * （见 `startCountdown` / `startAlarm` / `stopAlarm` 各自的说明），
+   * 复制一份必然漂移。这里只做"按 kind 分派"。
+   */
+  const startTimer = (t: Timer) => {
+    if (t.kind === "countdown") startCountdown(t);
+    else if (t.kind === "pomodoro") startPomodoro(t);
+    else if (t.kind === "alarm") startAlarm(t);
+  };
+
+  const resetTimer = (t: Timer) => {
+    if (t.kind === "countdown") resetCountdown(t);
+    else if (t.kind === "pomodoro") stopPomodoro(t);
+    else if (t.kind === "alarm") stopAlarm(t);
+  };
+
+  /**
+   * 收到搜索定位请求：进文件夹 → 滚到可见 → 高亮 →（需要时）打开编辑表单。
+   *
+   * # 为什么 `pending.open` 也要接住（原来没接，导致"承诺 A、做 B"）
+   *
+   * 命令面板对计时器的承诺是「定位并打开」（`lib/navigation.ts` 的
+   * `paletteActions`：`Ctrl+Enter` → 「打开编辑器」）。原来这里刻意不读
+   * `pending.open`，于是按了 `Ctrl+Enter` 之后**什么都没打开** ——
+   * 界面承诺的和实际做的不一致，而用户只看到"按了没反应"。
+   *
+   * 我原来的理由是"编辑表单是新建/编辑共用的大面板，一开就盖住整个列表"。
+   * 但那个理由站不住：表单本来就挂在列表**上方**、是刻意设计成"最要紧的东西"
+   * （见渲染处的注释），打开它正是"打开这一条"该有的样子；而高亮也照旧设了，
+   * 用户关掉表单就能看到列表里是哪一条。所以现在按承诺办事。
+   *
+   * # ⚠️ 为什么必须等 `folders.loading` **和** `loading`
+   *
+   * 从别的页签按回车跳过来时本页是刚挂载的：`timers` 初值 `[]`、
+   * 文件夹列表还在异步路上。不等就消费请求的话，`timers.find(...)` 拿到
+   * `undefined` → **表单打不开**，而且 `focusDone()` 已经把请求消费掉，
+   * 数据回来也不会再跑 —— 症状就是"按了回车没反应"。
+   * 两个守卫都必须在 `done()` 之前，而且都要进依赖（只加守卫不加依赖
+   * 等于换了个方式继续坏）。
+   */
+  useEffect(() => {
+    if (!pending) return;
+    if (folders.loading || loading) return;
+
+    const folder = folderToEnter(pending);
+    if (folder.known) folders.enter(folder.folderId);
+
+    focus.show(highlightFrom(pending));
+    scrollIntoViewSoon(focusDomId(FOCUS_DOM_PREFIX, pending.id));
+
+    if (pending.open) {
+      const found = timers.find((t) => t.id === pending.id);
+      if (found) {
+        // 新建表单和编辑表单别同时开着（渲染处也是这个约定）
+        setCreating(false);
+        setEditingId(found.id);
+      }
+    }
+
+    focusDone();
+    // 理由同片段页：`folders` 每次渲染都是新对象，进依赖会让 effect 每渲染跑一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending, folders.loading, loading]);
 
   /**
    * 当前文件夹里的计时器。
@@ -747,9 +901,12 @@ export function TimerPanel() {
           return (
             <article
               key={t.id}
+              id={focusDomId(FOCUS_DOM_PREFIX, t.id)}
               className={`card tmr__card${state === "running" ? " tmr__card--running" : ""}${
                 drag.draggingId === t.id ? " drag-source" : ""
-              }`}
+              }${isHighlighted(focus.highlight, t.id) ? " tmr__card--focus" : ""}`}
+              // 右键：和这一条有关的动作（复制名字 / 编辑 / 移动到… / 开始 / 删除）
+              onContextMenu={(e) => ctx.open(e, () => timerMenu(t))}
               {...drag.handleProps(t.id)}
             >
               <div className="tmr__head">
@@ -980,6 +1137,9 @@ export function TimerPanel() {
           onClose={() => setMovingId(null)}
         />
       )}
+
+      {/* 右键菜单。`position: fixed` 的独立浮层，只有一份 */}
+      {ctx.menu}
     </div>
   );
 }
@@ -1028,8 +1188,19 @@ function TimerCreator({
   /** 闹钟是否每天重复。默认只响一次：默认每天响会让人被自己没设过的闹钟吵醒。 */
   const [alarmDaily, setAlarmDaily] = useState(editing?.alarmDaily ?? false);
 
-  // 填到一半按 Esc 应该是「关掉表单」，不是「把整个面板收起来」
-  useEscapeToClose(onCancel);
+  /**
+   * 填到一半按 Esc 应该是「关掉表单」，不是「把整个面板收起来」。
+   *
+   * ⚠️ 右键菜单盖在表单上时**不认领** Esc：这个表单挂在列表**上方**，
+   * 而下面的列表行照样能右键 —— 菜单弹在表单上时按 Esc 应该关菜单，
+   * 而不是把这个填了一半的表单关掉（关掉等于把没保存的设置丢了）。
+   * 第二个参数交给 `useEscapeToClose`，它**先判认领、再决定拦不拦传播**，
+   * 不认领时事件原样走到菜单那一层，由菜单自己关掉自己。详见 `lib/escape.ts`。
+   */
+  useEscapeToClose(
+    onCancel,
+    () => !isContextMenuOpen(),
+  );
   const nameRef = useRef<HTMLInputElement>(null);
 
   // 打开表单就聚焦名字：填名字是唯一的必填项

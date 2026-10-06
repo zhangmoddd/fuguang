@@ -136,9 +136,12 @@ describe("mergeById 基本情形", () => {
     expect(merged[0].text).toBe("远端改的");
   });
 
-  it("两边改同一条 → **本地赢**", () => {
-    // 本地那份是用户此刻正在敲的，只活在内存里，盖掉就永久没了；
-    // 远端那份已经落盘、磁盘上还有
+  it("两边改同一条、**都没有 updatedAt** → 本地赢", () => {
+    // ⚠️ 这一条**只**验证"没有时间戳时退回本地赢"这条兜底规则。
+    // 它原来叫「两边改同一条 → 本地赢」，名字说的是 A、实际验的是 B ——
+    // 那时上面「靠 updatedAt 分先后」的规则还没写，后来规则变了它照样绿，
+    // 因为这两条记录根本没有 `updatedAt`。**真正验新规则的是下面那一组**
+    // （describe「两边都改过同一条：靠 updatedAt 分先后」）。
     const base = [row("a", "旧")];
     const local = [row("a", "本地改的")];
     const remote = [row("a", "远端改的")];
@@ -222,6 +225,122 @@ describe("「远端删除」与「本地新增」的歧义", () => {
     const local: (HasId & { text: string })[] = [];
     const remote = [row("a", "远端改的")];
     expect(mergeById(base, local, remote)).toEqual([]);
+  });
+});
+
+describe("两边都改过同一条：靠 updatedAt 分先后", () => {
+  /** 造一条带时间戳的记录（只有片段与备忘有这个字段）。 */
+  function timed(id: string, text: string, updatedAt: number) {
+    return { id, text, updatedAt };
+  }
+
+  it("远端那次编辑更新 → 远端赢（与写盘顺序无关）", () => {
+    // 只按"本地赢"的话，谁留下取决于**谁后写盘**；两边都带 updatedAt 时
+    // 应该由"谁编辑得更晚"决定
+    const base = [timed("a", "旧", 100)];
+    const local = [timed("a", "本地改的", 200)];
+    const remote = [timed("a", "远端改的", 300)];
+    expect(mergeById(base, local, remote)[0].text).toBe("远端改的");
+  });
+
+  it("本地那次编辑更新 → 本地赢", () => {
+    const base = [timed("a", "旧", 100)];
+    const local = [timed("a", "本地改的", 300)];
+    const remote = [timed("a", "远端改的", 200)];
+    expect(mergeById(base, local, remote)[0].text).toBe("本地改的");
+  });
+
+  it("时间戳一样新 → 分不出先后，本地赢", () => {
+    const base = [timed("a", "旧", 100)];
+    const local = [timed("a", "本地改的", 200)];
+    const remote = [timed("a", "远端改的", 200)];
+    expect(mergeById(base, local, remote)[0].text).toBe("本地改的");
+  });
+
+  it("只有一边带 updatedAt → 分不出先后，本地赢", () => {
+    // `mergeById` 是通用的，不能要求所有调用方都提供这个字段
+    const base = [row("a", "旧")];
+    const local = [{ id: "a", text: "本地改的", updatedAt: 300 }];
+    const remote = [row("a", "远端改的")];
+    expect(mergeById(base, local, remote)[0].text).toBe("本地改的");
+  });
+
+  it("updatedAt 不是数字（被手改成字符串/null）→ 分不出先后，本地赢", () => {
+    // 数据文件是纯文本、用户能手改，所以"类型不对"要当成"分不出先后"而不是崩掉
+    type Timed = { id: string; text: string; updatedAt: number | string | null };
+    const base: Timed[] = [{ id: "a", text: "旧", updatedAt: 100 }];
+    const local: Timed[] = [{ id: "a", text: "本地改的", updatedAt: "刚刚" }];
+    const remote: Timed[] = [{ id: "a", text: "远端改的", updatedAt: 300 }];
+    expect(mergeById(base, local, remote)[0].text).toBe("本地改的");
+
+    const nulled: Timed[] = [{ id: "a", text: "本地改的", updatedAt: null }];
+    expect(mergeById(base, nulled, remote)[0].text).toBe("本地改的");
+  });
+
+  it("只有一边改过时，updatedAt 不参与判断（改过的那边赢）", () => {
+    // 本地改过、远端没动：即使本地的时间戳更旧，也留本地改的那份
+    const base = [timed("a", "旧", 100)];
+    const local = [timed("a", "本地改的", 50)];
+    const remote = [timed("a", "旧", 100)];
+    expect(mergeById(base, local, remote)[0].text).toBe("本地改的");
+  });
+
+  it("两边都没改过 → 不因为时间戳不同而改选（内容本来就一样）", () => {
+    const base = [timed("a", "内容", 100)];
+    const local = [timed("a", "内容", 100)];
+    const remote = [timed("a", "内容", 100)];
+    expect(mergeById(base, local, remote)[0].text).toBe("内容");
+  });
+});
+
+describe("挪文件夹 vs 改内容：没刷时间戳的那一侧不会被当成旧版本", () => {
+  /** 造一条笔记。`folderId` 代表"被拖进/拖出了文件夹"。 */
+  function note(id: string, text: string, folderId: string | null, updatedAt: number) {
+    return { id, text, folderId, updatedAt };
+  }
+
+  it("本地刚把条目拖进文件夹 → 远端的正文改动不会把拖拽吃掉", () => {
+    // 真实序列：本地拖了一下（`moveTo` **刻意不刷 updatedAt**，见 features/snippets）
+    // → 另一窗口后来改了同一条正文 → 两边都"改过"。
+    // 没有"两边都真刷过"这个前提的话会取远端那份（`folderId: null`），
+    // 于是条目自己跳回原位、拖拽被写回磁盘，而且没有任何提示 —— 静默丢用户的操作。
+    const base = [note("a", "正文", null, 100)];
+    const local = [note("a", "正文", "f1", 100)]; // 拖进 f1，时间戳没变
+    const remote = [note("a", "改过的正文", null, 300)]; // 另一窗口改了内容
+
+    expect(mergeById(base, local, remote)[0].folderId).toBe("f1");
+  });
+
+  it("镜像：远端只挪了文件夹 → 本地的正文改动不会被远端的旧版本吃掉", () => {
+    // 这个方向上"本地赢"正好也保住了本地的内容编辑
+    const base = [note("a", "正文", null, 100)];
+    const local = [note("a", "本地改的正文", null, 300)]; // 本地改内容
+    const remote = [note("a", "正文", "f1", 100)]; // 远端只挪了文件夹
+
+    expect(mergeById(base, local, remote)[0].text).toBe("本地改的正文");
+  });
+
+  it("两边都只挪了文件夹（时间戳都没变）→ 本地赢", () => {
+    const base = [note("a", "正文", null, 100)];
+    const local = [note("a", "正文", "f1", 100)];
+    const remote = [note("a", "正文", "f2", 100)];
+    expect(mergeById(base, local, remote)[0].folderId).toBe("f1");
+  });
+
+  it("两边都改了内容（时间戳都真刷过）→ 较新者赢 —— **规则本身没被削弱**", () => {
+    // 这一条是 F1 修法的"不许破坏"档：内容对内容仍然是较晚的那次编辑赢
+    const base = [note("a", "旧", null, 100)];
+    const local = [note("a", "本地改的", null, 200)];
+    const remote = [note("a", "远端改的", null, 300)];
+    expect(mergeById(base, local, remote)[0].text).toBe("远端改的");
+  });
+
+  it("时间戳倒退（比 base 还旧）→ 当成分不出先后，本地赢", () => {
+    // 系统时钟被改、或数据被手改过时会走到这里；按一个不可信的先后去覆盖更危险
+    const base = [note("a", "旧", null, 200)];
+    const local = [note("a", "本地改的", null, 300)];
+    const remote = [note("a", "远端改的", null, 100)];
+    expect(mergeById(base, local, remote)[0].text).toBe("本地改的");
   });
 });
 

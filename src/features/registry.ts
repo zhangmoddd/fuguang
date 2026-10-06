@@ -70,7 +70,10 @@ export function findFeature(id: string): FeatureModule | undefined {
 /**
  * 面板默认打开的功能。
  *
- * 选文本片段：它是使用频率最高的一个（每次要输入账号、地址、模板都会用），
+ * 选「笔记」页（`snippets`）：它是使用频率最高的一个（每次要输入账号、地址、模板都会用），
  * 而计时器和备忘录是"设好就不用管"的类型。
+ *
+ * 注意 id 仍然是 `snippets`：页签显示名从「文本」改成了「笔记」，但 id 是数据键
+ * （`Folder.feature`、设置里的缩放表都用它），改名会让已有文件夹全部变成孤儿。
  */
 export const DEFAULT_FEATURE_ID = "snippets";

@@ -1,0 +1,191 @@
+/* ============================================================
+   右键菜单（lib/context-menu.tsx）
+
+   为什么是 `position: fixed` 而不是 absolute：
+   四个页签的内容区都是 `overflow-y: auto` 的滚动容器，absolute 的菜单
+   会被祖先裁掉一半 —— 靠近列表底部的卡片弹出来的菜单只剩上半截，
+   而用户看到的现象是「右键菜单少了几项」，根本不会想到是被裁了。
+   链接页的「⋯」菜单（links.css:373）用的是同一个理由。
+
+   为什么所有类名都带 `ctxmenu__` 前缀：
+   这些规则是**全局**的（CSS 没有作用域），而项目里已经有一个
+   `.card` / `.btn` 级别的通用命名空间。前缀是唯一能保证
+   不会和别处撞车的做法。
+
+   ⚠️ 不写 `.btn` 之类的通用类，全部自己定义：
+   通用类会被 `styles.css` 的顺序问题影响（见 main.tsx 顶部的说明）。
+   ============================================================ */
+
+.ctxmenu {
+  position: fixed;
+  /* 比链接页的「⋯」菜单（z-index: 60）更高：右键菜单要能盖住任何
+     已经打开的弹层，否则"在「⋯」菜单上右键"会出现半截被压住的样子。
+     100 仍远低于小球窗口/原生菜单的层级，不会盖住系统 UI。 */
+  z-index: 100;
+  min-width: 168px;
+  /* 面板只有 420px 宽，菜单再宽就顶到边了；长标签换行显示而不是撑宽 */
+  max-width: 260px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  background: var(--bg-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
+  /* 菜单是浮在内容之上的独立层，必须能吃到指针事件 */
+  pointer-events: auto;
+  /* 键盘焦点落在容器上（不是每一行上），见 context-menu.tsx 的 onMouseDown */
+  outline: none;
+}
+
+/* 一行。用 button 而不是 div：这样「Tab 到菜单」时浏览器原生就有
+   键盘可达性，也自带 disabled 语义。 */
+.ctxmenu__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 8px;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--fs-sm);
+  text-align: left;
+  cursor: default;
+  /* 标签长的时候换行，而不是把菜单撑到 260px 再截断 */
+  white-space: normal;
+  word-break: break-word;
+}
+
+/* 分隔线。用 `box-shadow` 而不是 `border-top`：
+   border 会占掉高度、把行往下挤，鼠标从上一行移到下一行时会闪一下。 */
+.ctxmenu__row--divider {
+  margin-top: 5px;
+  box-shadow: inset 0 1px 0 var(--border);
+}
+
+/* 当前选中项（键盘方向键或鼠标悬停）。
+   必须**同时**有底色和描边：只给底色的话，在浅色主题里
+   `--bg-hover` 只有 7.8% 的黑，用户看不出选中了哪一行。 */
+.ctxmenu__row--on:not(:disabled) {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* 有分隔线的行被选中时，两条 box-shadow 会互相覆盖 —— 合并写 */
+.ctxmenu__row--divider.ctxmenu__row--on:not(:disabled) {
+  box-shadow: inset 0 1px 0 var(--border), inset 0 0 0 1px var(--accent);
+}
+
+.ctxmenu__row:disabled {
+  color: var(--text-faint);
+  /* 不加 `opacity`：那会让禁用项和可用项的**对比度**一起变，
+     在浅色主题里容易掉到读不清。只换文字颜色就够了。 */
+}
+
+.ctxmenu__row--danger:not(:disabled) {
+  color: var(--danger);
+}
+
+.ctxmenu__row--danger.ctxmenu__row--on:not(:disabled) {
+  background: rgba(217, 45, 32, 0.1);
+  box-shadow: inset 0 0 0 1px var(--danger);
+}
+
+.ctxmenu__icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+}
+
+/* 图标一律夹到菜单的尺寸。
+   链接页那一项用的是 `LinkGlyph`（它的默认尺寸是给 86px 的格子定的 26px），
+   不夹的话菜单里会冒出一个比文字高两倍的大图标，把行撑变形。
+   用后代选择器而不是给 LinkGlyph 加 size 属性：那个组件的尺寸是它自己的
+   布局决定的事，菜单不该反过来要求它。 */
+.ctxmenu__icon > svg,
+.ctxmenu__icon > img {
+  width: 13px;
+  height: 13px;
+  object-fit: contain;
+}
+
+.ctxmenu__row--danger .ctxmenu__icon {
+  color: var(--danger);
+}
+
+.ctxmenu__label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 右侧小字说明（「Ctrl+C」这类）。 */
+.ctxmenu__hint {
+  flex: 0 0 auto;
+  font-style: normal;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+/* ============================================================
+   搜索结果定位后的高亮（lib/focus-highlight.ts）
+
+   规则：短暂（2.6 秒）+ 用户一交互就灭，所以它**不能**是
+   `:hover` 那种常驻态，也不能改 `background` —— 那会和卡片自己的
+   悬停态打架，用户分不清"这是高亮还是我鼠标停在这儿"。
+
+   所以只加**一圈描边 + 一层很淡的底色**，并且用 `outline`（不占布局、
+   不影响卡片尺寸），动画只做一次淡入。
+   ============================================================ */
+
+.card--focus,
+.memo__card--focus,
+.links__tile--focus,
+.tmr__card--focus {
+  outline: 2px solid var(--accent);
+  /* 负偏移让描边画在卡片**内侧**：画在外侧会盖住相邻卡片的边框，
+     看起来像两个卡片粘在一起了 */
+  outline-offset: -2px;
+  background-color: var(--accent-soft);
+  animation: focus-highlight-in 220ms ease-out;
+}
+
+@keyframes focus-highlight-in {
+  from {
+    outline-color: transparent;
+    background-color: transparent;
+  }
+  to {
+    outline-color: var(--accent);
+    background-color: var(--accent-soft);
+  }
+}
+
+/* 用户关掉了动画就不要再动：那是"晕动症"设置，不是装饰偏好 */
+@media (prefers-reduced-motion: reduce) {
+  .card--focus,
+  .memo__card--focus,
+  .links__tile--focus,
+  .tmr__card--focus {
+    animation: none;
+  }
+}
+
+/* 备忘页的警告提示条。
+   数值与 `styles.css:435` 的 `.snip__feedback--warn` **保持一致** ——
+   两个页签上同一类提示（"操作没成功 / 有东西没了"）必须是同一个颜色，
+   否则用户会以为是两种不同的严重程度。
+   用琥珀色而不是红色：红色会让人以为操作失败了，于是重做一次 ——
+   而「读不到剪贴板」这种情况重做一百次也一样。
+   片段页那条在 `styles.css`（不在本任务改动范围内），所以这里只补备忘这条。 */
+.memo__feedback--warn {
+  background: rgba(217, 119, 6, 0.12);
+  border-color: rgba(217, 119, 6, 0.35);
+  color: var(--warning);
+  align-items: flex-start;
+  line-height: 1.45;
+}

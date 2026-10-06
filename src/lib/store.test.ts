@@ -16,8 +16,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   decideExternalChange,
+  decideReload,
   discardPendingWrite,
+  flushAll,
   planWrite,
+  registerFlush,
   shouldAdoptMerge,
   type DataChangedPayload,
 } from "./store";
@@ -299,6 +302,181 @@ describe("discardPendingWrite：导入备份时取消挂起的写盘", () => {
 
   it("没有未落盘改动时也算取消成功（无事可做）", () => {
     expect(discardPendingWrite(new WriteCoordinator())).toBe(true);
+  });
+});
+
+describe("WriteCoordinator.revision（reload 的判据）", () => {
+  it("只增不减：每 markDirty 一次 +1，写盘落地也不回退", () => {
+    const coord = new WriteCoordinator();
+    expect(coord.revision).toBe(0);
+
+    coord.markDirty();
+    expect(coord.revision).toBe(1);
+
+    const writing = coord.begin();
+    if (writing === null) throw new Error("begin() 不该返回 null");
+    coord.commit(writing);
+    // 写盘落地只动 `written`，**不动版本号** —— 这正是它比 `dirty` 布尔好用的地方
+    expect(coord.revision).toBe(1);
+    expect(coord.dirty).toBe(false);
+
+    coord.markDirty();
+    expect(coord.revision).toBe(2);
+  });
+
+  it("写失败也不回退", () => {
+    const coord = new WriteCoordinator();
+    coord.markDirty();
+    const writing = coord.begin();
+    if (writing === null) throw new Error("begin() 不该返回 null");
+    coord.fail();
+    expect(coord.revision).toBe(1);
+    expect(coord.dirty).toBe(true);
+  });
+});
+
+describe("decideReload", () => {
+  it("读盘期间什么都没发生 → 采纳", () => {
+    expect(
+      decideReload({ revisionAtRead: 3, revisionNow: 3, writeGenAtRead: 1, writeGenNow: 1 }),
+    ).toBe("adopt");
+  });
+
+  it("读盘期间真的敲了字（版本号变了）→ 不采纳", () => {
+    // 读到的值里没有那几个字，采纳等于把它们删掉
+    expect(
+      decideReload({ revisionAtRead: 3, revisionNow: 4, writeGenAtRead: 1, writeGenNow: 1 }),
+    ).toBe("defer");
+  });
+
+  it("版本号没变、只是我们自己的写盘落地了 → 重读一次", () => {
+    // 读在写之前发出、写却先落地：读到的内容比磁盘还旧，重读才能拿到可信的值
+    expect(
+      decideReload({ revisionAtRead: 3, revisionNow: 3, writeGenAtRead: 1, writeGenNow: 2 }),
+    ).toBe("retry");
+  });
+
+  it("回归：只看 `dirty` 布尔会漏掉「期间改过、而且已经落盘」这种情况", () => {
+    // 这是 F3 那条 finding 的核心。构造：读盘期间用户又敲了字，而且那次改动
+    // 已经落盘 —— 此刻 `dirty` 是**假**的，布尔判据会认为"可以安全采纳"，
+    // 于是采纳一份比磁盘还旧的值：用户刚敲的字从界面上消失，而且因为 `dirty`
+    // 是假的，不会再补写一次（再编辑时还会以那份旧内容为基准，把刚写下去的覆盖掉）。
+    const coord = new WriteCoordinator();
+    coord.markDirty();
+    const revisionAtRead = coord.revision;
+
+    coord.markDirty(); // 读盘期间用户又敲了字
+    const writing = coord.begin();
+    if (writing === null) throw new Error("begin() 不该返回 null");
+    coord.commit(writing); // ……而且已经落盘
+
+    expect(coord.dirty).toBe(false); // 布尔判据在这里会被骗
+    expect(
+      decideReload({
+        revisionAtRead,
+        revisionNow: coord.revision,
+        writeGenAtRead: 0,
+        writeGenNow: 0,
+      }),
+    ).toBe("defer"); // 版本号不会
+  });
+
+  it("敲字与写盘落地同时发生 → 先保证不删掉刚敲的字", () => {
+    expect(
+      decideReload({ revisionAtRead: 3, revisionNow: 4, writeGenAtRead: 1, writeGenNow: 2 }),
+    ).toBe("defer");
+  });
+});
+
+describe("registerFlush / flushAll（关窗口之前催落盘）", () => {
+  it("把已登记的落盘回调都跑一遍", async () => {
+    const calls: string[] = [];
+    const offA = registerFlush(async () => {
+      calls.push("a");
+      return true;
+    });
+    const offB = registerFlush(async () => {
+      calls.push("b");
+      return true;
+    });
+    try {
+      expect(await flushAll()).toBe(true);
+      expect(calls.sort()).toEqual(["a", "b"]);
+    } finally {
+      offA();
+      offB();
+    }
+  });
+
+  it("注销之后不再被调用", async () => {
+    // 面板被 `destroy()` 之后登记表里不该留着指向已卸载组件的回调
+    let called = 0;
+    const off = registerFlush(async () => {
+      called += 1;
+      return true;
+    });
+    off();
+    await flushAll();
+    expect(called).toBe(0);
+  });
+
+  it("单个失败不会拖垮其余的，结果如实返回 false", async () => {
+    const calls: string[] = [];
+    const offA = registerFlush(async () => {
+      calls.push("a");
+      return true;
+    });
+    const offB = registerFlush(async () => {
+      calls.push("b");
+      return false;
+    });
+    const offC = registerFlush(async () => {
+      throw new Error("磁盘炸了");
+    });
+    try {
+      // 一个失败不该让另一个面板的数据也不落盘，但失败必须如实报出来
+      // （调用方靠它决定要不要提醒用户）
+      expect(await flushAll()).toBe(false);
+      expect(calls.sort()).toEqual(["a", "b"]);
+    } finally {
+      offA();
+      offB();
+      offC();
+    }
+  });
+
+  it("没有登记任何东西时算成功", async () => {
+    // 它只是"把已经挂起的写盘催一遍"，不该平白去读盘或写多余的东西
+    expect(await flushAll()).toBe(true);
+  });
+
+  it("超时 → 返回 false，不把调用方永远卡住", async () => {
+    // 真实后果：一次永不返回的写盘会让设置页的导入流程**永远停在 busy** ——
+    // 用户点了「覆盖导入，无法撤销」，导入永远不开始、也没有任何提示。
+    // 所以到点就放行，由调用方把"有东西没落盘"告诉用户（不许静默放行）。
+    const off = registerFlush(() => new Promise<boolean>(() => {})); // 永不 settle
+    try {
+      expect(await flushAll(20)).toBe(false);
+    } finally {
+      off();
+    }
+  });
+
+  it("超时只影响等待，不影响已经完成的那些落盘", async () => {
+    const done: string[] = [];
+    const offFast = registerFlush(async () => {
+      done.push("fast");
+      return true;
+    });
+    const offStuck = registerFlush(() => new Promise<boolean>(() => {}));
+    try {
+      expect(await flushAll(20)).toBe(false);
+      // 快的那一个照样跑完了 —— 超时不是"取消"，只是"不再等"
+      expect(done).toEqual(["fast"]);
+    } finally {
+      offFast();
+      offStuck();
+    }
   });
 });
 

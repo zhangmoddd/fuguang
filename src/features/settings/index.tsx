@@ -28,7 +28,9 @@ import { api, emitSettingsChanged, type Settings } from "../../lib/api";
 import { BALL_THEMES, applyBallTheme } from "../../lib/ball-theme";
 import { todayKey } from "../../lib/datetime";
 import { firstPath } from "../../lib/dialog";
+import { emitDataReplacedAll, flushAll } from "../../lib/store";
 import { FONT_SIZE_PRESETS, applyFontSize } from "../../lib/ui-scale";
+import { applyAlwaysOnTopToAllPanels } from "../../windows/panel-commands";
 import type { FeatureModule } from "../registry";
 
 import "./settings.css";
@@ -196,14 +198,69 @@ export function SettingsPanel() {
       if (!confirmed) return;
 
       setBackupBusy(true);
+
+      /**
+       * ⚠️ 先把**本窗口**挂起的写盘催完，再动 `importAll`。
+       *
+       * `force` 广播只让**别的**窗口让位，发起导入的这个窗口自己不在名单里 ——
+       * 而它手里完全可能有还没落盘的写盘：
+       *
+       * - 用户刚在笔记页打完字，切到设置页 —— 笔记页的 hook 卸载时催了一次落盘，
+       *   那次写可能**还在飞**；
+       * - 或者这个窗口里有别的数据 hook 正排着一次防抖写盘。
+       *
+       * 那些写盘会在导入**之后**落地，把刚恢复的备份整份盖回旧值 ——
+       * 用户点了「覆盖导入，无法撤销」，结果数据没变（或只变了一半），
+       * 而且没有任何提示。所以这里必须等它们落地：先写自己的，再让导入覆盖，
+       * 顺序就确定了。
+       *
+       * 用 `flushAll`（`lib/store.ts`）而不是自己新造一套：它就是"把已经挂起的
+       * 写盘催一遍"，而且卸载中的 hook 也在表里（注销被推迟到落盘之后）。
+       *
+       * ⚠️ `flushAll` 自带超时（3 秒）—— 一次永不返回的写盘不能把这里永远卡住，
+       * 否则用户点了「覆盖导入，无法撤销」之后界面一直 busy、**导入永远不开始、
+       * 也没有任何提示**。超时会返回 `false`，那时**不许静默放行**：
+       * 说明白"有东西没落盘"，让用户自己决定要不要继续。
+       */
+      const saved = await flushAll();
+      if (!saved) {
+        let proceed = true;
+        try {
+          proceed = await ask(
+            "有改动还没能存到磁盘（数据目录可能很慢或写不了）。\n" +
+              "继续导入的话，那些改动会被备份覆盖，之后也补不回来。要继续吗？",
+            { title: "从备份恢复", kind: "warning", okLabel: "仍然导入", cancelLabel: "先不导入" },
+          );
+        } catch {
+          // 确认框都弹不出来时不能把用户永远卡在 busy 上 —— 继续，但下面会给提示
+          proceed = true;
+        }
+        if (!proceed) {
+          setBackupNote("已取消导入：有改动没能存到磁盘，先处理完再试一次。");
+          setBackupBusy(false);
+          return;
+        }
+        setBackupNote("注意：有改动没能存到磁盘，它们会被备份覆盖。");
+      }
+
       await api.importAll(picked);
 
       // 先把新设置广播给小球窗口——它不会跟着面板一起重载，不广播的话
       // 悬浮球会一直停在导入前的配色。
       await emitSettingsChanged(await api.settingsGet());
 
-      // 再让面板整页重载：四个功能模块的内存状态都还是导入前那份，
+      // 再让**所有**窗口重新读数据。
+      //
+      // 原来这里只有下面那句 `window.location.reload()`，而它**只重载当前这个窗口**。
+      // 别的面板窗口（现在可以同时开好几个）内存里还是导入前那份，
+      // 它们下一次任何一次保存就会把刚恢复的备份**整份写回旧值** ——
+      // Rust 侧的写锁拦不住这个：它只串行化写盘，而内容本身就是旧的。
+      // 详见 `lib/store.ts` 的 `emitDataReplacedAll`。
+      await emitDataReplacedAll();
+
+      // 当前窗口仍然整页重载：四个功能模块的内存状态都还是导入前那份，
       // 不重载就会显示已经不存在的数据（点了没反应，最难排查）。
+      // 广播那一步是为了**别的**窗口，这一步是为了自己。
       window.location.reload();
     } catch (err) {
       setBackupNote(`导入失败：${String(err)}`);
@@ -581,7 +638,10 @@ export function SettingsPanel() {
           <Pin size={15} className="settings__icon" />
           <span className="settings__label">
             面板保持置顶
-            <em className="settings__hint">关闭后主面板会被其他窗口盖住</em>
+            <em className="settings__hint">
+              关闭后主面板会被其他窗口盖住。这是全局的：开着两个面板时，
+              一个置顶就是两个都置顶
+            </em>
           </span>
           <input
             type="checkbox"
@@ -589,7 +649,10 @@ export function SettingsPanel() {
             checked={settings.panelAlwaysOnTop}
             onChange={(e) => {
               void patch({ panelAlwaysOnTop: e.target.checked });
-              void api.setAlwaysOnTop("panel", e.target.checked);
+              // 套用到**所有**面板窗口，不能只改一个：只改第一个的话，
+              // 设置说"面板保持置顶"、别的面板却被别的窗口盖住，等于这个开关撒谎。
+              // 原来这里写死的是 `"panel"`（第一个面板的 label）。
+              void applyAlwaysOnTopToAllPanels(e.target.checked);
             }}
           />
         </label>

@@ -18,6 +18,7 @@ import {
   Eye,
   EyeOff,
   FolderInput,
+  Image as ImageIcon,
   Pencil,
   Plus,
   Search,
@@ -28,7 +29,15 @@ import {
   X,
 } from "lucide-react";
 
-import { api, type Folder as FolderItem, type PasteOutcome, type Snippet } from "../../lib/api";
+import { api, type Folder as FolderItem, type MediaRef, type PasteOutcome, type Snippet } from "../../lib/api";
+import {
+  scrollIntoViewSoon,
+  useContextMenu,
+  useFocusHighlight,
+  useTextAreaMenu,
+  type ContextMenuItem,
+  type UseContextMenuResult,
+} from "../../lib/context-menu";
 import {
   FolderBar,
   FolderEditor,
@@ -38,13 +47,47 @@ import {
 } from "../../lib/folders-ui";
 import { useDragSort } from "../../lib/drag-drop";
 import { useEscapeToClose } from "../../lib/escape";
+import {
+  focusDomId,
+  folderToEnter,
+  highlightFrom,
+  isHighlighted,
+} from "../../lib/focus-highlight";
+import { usePendingFocus } from "../../lib/navigation";
+import {
+  hasAnyContent,
+  orphanedByItemRemoval,
+  referencedImageIds,
+  referencedImageIdsExcluding,
+} from "../../lib/media";
+import {
+  MediaSection,
+  batchNotice,
+  useMediaAttachments,
+  useMediaLibrary,
+  type MediaLibraryApi,
+} from "../../lib/media-ui";
 import { newId, usePersistentState } from "../../lib/store";
 import { useZoom } from "../../lib/zoom";
 import type { FeatureModule } from "../registry";
 
 const DATA_FILE = "snippets.json";
 
-/** 空片段工厂。新建时默认落在当前翻到的那个文件夹里。 */
+/**
+ * 定位高亮用的 DOM id 前缀。
+ *
+ * 和其它页签取不同的前缀：同一个条目 id 理论上可能同时出现在两个页面上
+ * （命令面板浮在片段页上面、备忘页也挂着），前缀能保证 `getElementById`
+ * 不会找错人。
+ */
+const FOCUS_DOM_PREFIX = "snip-focus";
+
+/**
+ * 空片段工厂。新建时默认落在当前翻到的那个文件夹里。
+ *
+ * `images: []` 写在这里而不是靠可选字段省掉：新建的片段一定要有明确的
+ * "零张图片"，否则后面 `s.images ?? []` 的兜底会散落到每一处读它的地方。
+ */
 function emptySnippet(folderId: string | null = null): Snippet {
   const now = Date.now();
   return {
@@ -57,6 +100,7 @@ function emptySnippet(folderId: string | null = null): Snippet {
     starred: false,
     uses: 0,
     folderId,
+    images: [],
     createdAt: now,
     updatedAt: now,
   };
@@ -214,6 +258,74 @@ export function SnippetsPanel() {
   const folders = useFolders("snippets", { moveItems });
   const zoom = useZoom("snippets");
 
+  /** 右键菜单。 */
+  const ctx = useContextMenu();
+  /** 定位高亮：短暂 + 一交互就灭，见 lib/context-menu.tsx 的 useFocusHighlight。 */
+  const focus = useFocusHighlight();
+  const { target: pending, done: focusDone } = usePendingFocus("snippets");
+
+  // ---- 图片 ----
+
+  /**
+   * 拖放进来的路径要交给谁。
+   *
+   * 用一个 ref 存"当前的处理者"：编辑器开着时它注册自己（图片进那一条），
+   * 没开着时走下面的兜底（新建一条）。**订阅只有一个**（在 `useMediaLibrary` 里）：
+   * 页面和编辑器各订阅一份的话，一次拖放会导入两遍。
+   */
+  const dropHandlerRef = useRef<(paths: string[]) => void>(() => {});
+  /** 页面级的媒体库：导入机制 + 占用统计 + 拖放订阅。 */
+  const library = useMediaLibrary((paths) => dropHandlerRef.current(paths));
+  /** 编辑器挂载时把自己注册成拖放目标。 */
+  const dropTargetRef = useRef<((paths: string[]) => void) | null>(null);
+  const registerDrop = (handler: ((paths: string[]) => void) | null) => {
+    dropTargetRef.current = handler;
+  };
+
+  /**
+   * 编辑器**没开着**时拖进来：新建一条只装这些图片的笔记，并打开它的编辑器。
+   *
+   * # 为什么不是"提示用户先新建一条"
+   *
+   * 「把图片拖进这个页面」这个手势的意思就是"把这张图存下来"。不新建的话
+   * 用户拖完什么都看不到，只能自己猜到要先点「新建」—— 那是把软件的
+   * 内部结构（图片必须挂在某一条上）转嫁给用户。
+   *
+   * # 为什么必须立刻 `onDraftChange`
+   *
+   * 笔记页是**自动保存**的，而自动保存的触发点是"编辑器里改了一下"
+   * （`onDraftChange`）。拖放创建的这条笔记用户一个字都没敲，
+   * 不在这里写一次的话，他点「完成」就等于什么都没存下来 ——
+   * 图已经落在磁盘上了，数据里却没有引用，成了永远看不见的孤儿文件。
+   */
+  const createSnippetFromDrop = async (paths: readonly string[]) => {
+    const batch = await library.importPaths(paths);
+    const result = batchNotice(batch, {
+      // 新条目还没有图片；已有的引用都算"别处也在用"
+      inItem: [],
+      elsewhere: referencedImageIdsExcluding(snippets, ""),
+    });
+    if (result.text) showFeedback(result.text, result.kind);
+    if (result.added.length === 0) return;
+
+    const draft: Snippet = { ...emptySnippet(folders.currentId), images: result.added };
+    openEditor(draft);
+    onDraftChange(draft);
+  };
+
+  // 每次渲染后刷新"当前拖放处理者"。放进 effect 而不是渲染期直接赋值：
+  // 渲染期改 ref 在 StrictMode 的双渲染下会跑两次（这里无害，但那是
+  // "看起来能用、以后被改坏"的写法）。
+  useEffect(() => {
+    dropHandlerRef.current = (paths) => {
+      if (dropTargetRef.current) {
+        dropTargetRef.current(paths);
+        return;
+      }
+      void createSnippetFromDrop(paths);
+    };
+  });
+
   /**
    * 当前文件夹里的片段。
    *
@@ -270,7 +382,18 @@ export function SnippetsPanel() {
   const paste = async (s: Snippet) => {
     const outcome: PasteOutcome = await api.pasteText(s.content);
     bumpUse(s.id);
+    reportPaste(outcome);
+  };
 
+  /**
+   * 把一次粘贴的结果说给用户听。
+   *
+   * 抽出来是为了让右键菜单的「键入到当前光标」**复用同一套提示**：
+   * 那三档反馈（成功 / 成功了但有东西没了 / 失败降级到剪贴板）是这个
+   * 功能里最容易被写漏的部分 —— 尤其"成功时也可能带回一条必须看到的警告"
+   * 那一条（见下面的说明），重写一遍几乎一定会漏。
+   */
+  const reportPaste = (outcome: PasteOutcome) => {
     if (outcome.ok) {
       const base = outcome.target
         ? `已粘贴到「${truncate(outcome.target, 18)}」`
@@ -291,6 +414,22 @@ export function SnippetsPanel() {
     }
   };
 
+  /**
+   * 「键入到当前光标」：把一段文本打到用户刚才用的外部窗口。
+   *
+   * 和 `paste` 的区别只有一点：**不计使用次数**。
+   * 「常用优先」的排序统计的是"这条片段被用了几次"，而右键菜单里的
+   * 「键入」多半是"我想把这段字打进聊天框"，它确实是使用 —— 但**编辑器里
+   * 选中一段右键**那种用法，选中的只是这条片段的一部分，
+   * 拿它去给整条 +1 会让排序慢慢失真。所以这里不 `bumpUse`。
+   * （列表行右键的「键入到当前光标」走的就是 `paste`，会计数 ——
+   * 那是完整的"用了一次这条片段"。）
+   */
+  const typeInto = async (text: string) => {
+    const outcome: PasteOutcome = await api.pasteText(text);
+    reportPaste(outcome);
+  };
+
   /** 只复制，不粘贴。 */
   const copyOnly = async (s: Snippet) => {
     const ok = await api.copyText(s.content);
@@ -300,6 +439,60 @@ export function SnippetsPanel() {
       ok ? "ok" : "warn",
     );
   };
+
+  /**
+   * 一条片段在右键菜单里的全部动作。
+   *
+   * # 为什么保留列表行上原有的「粘贴」「复制」按钮，同时又给右键菜单
+   *
+   * 用户提过想把这两个按钮收进右键菜单。没有照做，理由是：
+   * **「点一下就粘贴到光标处」是这个软件的核心动作**，而右键菜单把它从
+   * 1 次点击变成"右键 → 瞄准 → 点"，还要先知道有右键菜单这回事。
+   * 高频动作每多一步都是明显变慢。所以是**保留按钮 + 额外提供右键菜单**，
+   * 两条路都通。
+   */
+  const snippetMenu = (s: Snippet): ContextMenuItem[] => [
+    {
+      id: "type",
+      label: "键入到当前光标",
+      icon: <Send size={13} />,
+      onSelect: () => void paste(s),
+    },
+    {
+      id: "copy",
+      label: "复制",
+      icon: <Copy size={13} />,
+      hint: "Ctrl+C",
+      onSelect: () => void copyOnly(s),
+    },
+    {
+      id: "edit",
+      label: "编辑",
+      icon: <Pencil size={13} />,
+      dividerBefore: true,
+      onSelect: () => openEditor(s),
+    },
+    {
+      id: "move",
+      label: "移动到…",
+      icon: <FolderInput size={13} />,
+      onSelect: () => setMovingId(s.id),
+    },
+    {
+      id: "star",
+      label: s.starred ? "取消收藏" : "收藏置顶",
+      icon: <Star size={13} fill={s.starred ? "currentColor" : "none"} />,
+      onSelect: () => toggleFlag(s.id, "starred"),
+    },
+    {
+      id: "delete",
+      label: "删除",
+      icon: <Trash2 size={13} />,
+      danger: true,
+      dividerBefore: true,
+      onSelect: () => void remove(s.id),
+    },
+  ];
 
   /**
    * 打开编辑器时那条片段原来的样子，供「撤销改动」还原。
@@ -316,13 +509,83 @@ export function SnippetsPanel() {
   const isNewRef = useRef(false);
   /** 本次编辑里数据是否真的被动过。只用来决定要不要报「已保存 / 已撤销」。 */
   const dirtyRef = useRef(false);
+  /**
+   * **最近一次真的写进数据里的那一份草稿**（`onDraftChange` 里 `cleaned`）。
+   *
+   * 「完成」时要拿它和磁盘上那一条比一比，确认"存下去的到底是不是我这一版" ——
+   * 跨窗口合并可能在两边都改过同一条时留下**对面那版**，那时还说"已保存"就是撒谎。
+   *
+   * ⚠️ 存的是**最后一次真的写过的那份**，不是编辑器当前那份：正文被清空时
+   * `onDraftChange` 会提前 return（不写空内容），这时数据里留着的仍是上一次那份，
+   * 拿"当前草稿"去比会误判成"被对面盖了"。
+   */
+  const lastWrittenRef = useRef<Snippet | null>(null);
 
   const openEditor = (s: Snippet) => {
     snapshotRef.current = s;
     isNewRef.current = !snippets.some((x) => x.id === s.id);
     dirtyRef.current = false;
+    lastWrittenRef.current = null;
     setEditing(s);
   };
+
+  /**
+   * 收到搜索定位请求：进文件夹 → 滚到可见 → 高亮 →（需要时）打开编辑器。
+   *
+   * # 为什么这个 effect 放在 `openEditor` **后面**
+   *
+   * 它要调用 `openEditor`，而 `const` 声明在初始化之前是不可用的
+   * （TDZ）。effect 的**回调**虽然要等 commit 之后才跑，但闭包捕获的是
+   * 绑定本身 —— 只要 effect 的定义在 `openEditor` 之前，第一次 commit 时
+   * 读取它就是 `ReferenceError`。所以顺序不能挪。
+   *
+   * # 为什么要等 `folders.loading` 结束
+   *
+   * `useFolders` 的文件夹列表是异步读回来的。请求到达时如果还没读完，
+   * `enter(folderId)` 设进去的 id 会立刻被 `folders-ui.tsx:122-125` 那条
+   * "当前文件夹不存在就退回顶层"的兜底清掉 —— 用户看到的是"跳到了顶层，
+   * 而那条在别的文件夹里"。
+   *
+   * # 为什么只 `enter` 一次
+   *
+   * `done()` 之后 `pending` 变 `null`、effect 会再跑一次，那时必须早退，
+   * 否则会把用户手动切到的文件夹又拽回去。
+   *
+   * `folders` / `snippets` / `openEditor` 刻意不进依赖：它们是每次渲染
+   * 都变的新对象/新函数，进来会让这个 effect 变成"每渲染跑一次"，
+   * 于是每次重渲染都重新 `enter()` 一遍文件夹。真正需要"再跑一次"的
+   * 触发点只有 `pending`、`folders.loading` 与 `loading` 三个。
+   *
+   * # ⚠️ 为什么两个 loading 都要等（缺一个都会「按了回车没反应」）
+   *
+   * 从别的页签按回车跳过来时，本页是**刚挂载**的：`snippets` 初值是 `[]`、
+   * 文件夹列表也还在异步路上。这时如果直接消费请求：
+   * - `pending.open` 时 `snippets.find(...)` 拿到 `undefined` → **编辑器打不开**；
+   * - 紧接着 `focusDone()` 把请求消费掉，数据回来也不会再跑。
+   *
+   * 所以两个守卫都必须在 `done()` **之前**，而且两个都要进依赖 ——
+   * 只加守卫不加依赖的话，数据回来时 effect 永远不会再跑，
+   * 等于换了个方式继续坏。这与备忘页等 `loading` 是同一条道理：
+   * **定位请求必须等这一页的数据就绪再消费**。
+   */
+  useEffect(() => {
+    if (!pending) return;
+    if (folders.loading || loading) return;
+
+    const folder = folderToEnter(pending);
+    if (folder.known) folders.enter(folder.folderId);
+
+    focus.show(highlightFrom(pending));
+    scrollIntoViewSoon(focusDomId(FOCUS_DOM_PREFIX, pending.id));
+
+    if (pending.open) {
+      const found = snippets.find((s) => s.id === pending.id);
+      if (found) openEditor(found);
+    }
+
+    focusDone();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending, folders.loading, loading]);
 
   /**
    * 编辑器里改一下就写一次数据 —— **自动保存**，没有「保存」按钮了。
@@ -342,12 +605,21 @@ export function SnippetsPanel() {
    *
    * 正文为空时**不写**：和原来「保存」按钮的 `disabled` 是同一条规矩 ——
    * 不存空正文的片段。所以清空正文再退出，数据里仍是上一次的内容。
+   *
+   * ⚠️ 有了图片之后，判据从"正文非空"换成 **"正文非空 或 有图片"**
+   * （`hasAnyContent`）。不换的话，一条**只有图片**的笔记会被这一句
+   * 悄悄拦掉：用户贴了一张图、点「完成」，回来发现图没了 ——
+   * 而且没有任何提示，因为"没写"和"写了"在界面上长得一样。
+   * 同时**不能**把"真的空"（没文字也没图片）也放行，那会重新引入空壳条目。
    */
   const onDraftChange = (draft: Snippet) => {
-    if (!draft.content.trim()) return;
+    if (!hasAnyContent(draft.content, draft.images)) return;
     dirtyRef.current = true;
     const cleaned: Snippet = {
       ...draft,
+      // 标题留空时取正文开头几个字。**不用图片信息去编一个标题** ——
+      // 标题会进全文搜索，拿"图片 2 张"或文件名当标题会让搜索多出
+      // 一堆看不出为什么命中的结果
       title: draft.title.trim() || summarize(draft.content, 24) || "未命名",
       updatedAt: Date.now(),
     };
@@ -355,6 +627,21 @@ export function SnippetsPanel() {
       const exists = prev.some((s) => s.id === cleaned.id);
       return exists ? prev.map((s) => (s.id === cleaned.id ? cleaned : s)) : [cleaned, ...prev];
     });
+    // 记下"这次真的写进去的是哪一份"，供「完成」时核对（见 `lastWrittenRef`）
+    lastWrittenRef.current = cleaned;
+  };
+
+  /** 从磁盘上读回某一条。读不回来（或形状不对）返回 `null`。 */
+  const readSavedSnippet = async (id: string): Promise<Snippet | null> => {
+    try {
+      const all = await api.readData<Snippet[]>(DATA_FILE);
+      // `readData<T>` 是纯类型断言、运行期零校验（见 `store.ts` 那段说明），
+      // 所以这里自己确认一下"确实是个数组"
+      if (!Array.isArray(all)) return null;
+      return all.find((s) => s.id === id) ?? null;
+    } catch {
+      return null;
+    }
   };
 
   /**
@@ -363,15 +650,49 @@ export function SnippetsPanel() {
    * 仍然要 `await flush()` 之后再报「已保存」—— `update()` 只是排了一次
    * 400ms 的防抖写盘，磁盘满 / 数据目录只读时它不会成功，而无条件说
    * "已保存"就是撒谎（这条原来踩过，见 CHANGELOG 的「保存失败却告诉用户已保存」）。
+   *
+   * # ⚠️ 写盘成功 ≠ 存下去的是我这一版
+   *
+   * 跨窗口合并（`lib/merge-by-id.ts`）在**两边都改过同一条**时可能留下**对面那版**
+   * （内容对内容时"较晚的那次编辑赢"）。这时 `flush()` 照样返回 `true`，
+   * 但磁盘上不是用户刚敲的内容 —— 再说"已保存"就是第二个版本的同一个谎。
+   *
+   * 所以回读一次、比 `updatedAt`：合并是**整条挑一份**（不是逐字段合并），
+   * 所以"时间戳还是我那个"就等于"存下去的确实是我这一版"。
+   *
+   * 为什么不用内存里那份比：`await flush()` 之后 React 还没把采纳结果渲染出来，
+   * 闭包捕获的那份 `snippets` 是旧的；**磁盘才是权威**。
+   *
+   * 读不回来时不下结论（宁可说"已保存"—— 写盘确实成功了，也不谎报"被对面盖了"）。
    */
   const finishEdit = async () => {
     setEditing(null);
     if (!dirtyRef.current) return;
-    if (await flush()) {
-      showFeedback("已保存");
+    if (!(await flush())) {
+      showFeedback("保存失败：改动只在内存里，请检查数据目录能不能写", "warn");
       return;
     }
-    showFeedback("保存失败：改动只在内存里，请检查数据目录能不能写", "warn");
+
+    const draft = lastWrittenRef.current;
+    const saved = draft ? await readSavedSnippet(draft.id) : null;
+    if (draft && saved && saved.updatedAt !== draft.updatedAt) {
+      showFeedback("这一条在另一个窗口被改过，已保存的是对面那版（你刚敲的没存住）", "warn");
+      return;
+    }
+    showFeedback("已保存");
+  };
+
+  /**
+   * 删掉一批**已经确认没人引用**的图片文件。
+   *
+   * 失败一律吞掉：这些都是"清理残留"，报错会让用户以为刚才那步操作失败了。
+   * 留下的孤儿文件看不见、不影响使用，比一个假的失败提示好得多。
+   */
+  const cleanOrphanFiles = (ids: readonly string[]) => {
+    if (ids.length === 0) return;
+    void Promise.all(ids.map((id) => api.mediaDelete(id).catch(() => undefined))).then(() =>
+      library.refreshStats(),
+    );
   };
 
   /**
@@ -379,28 +700,82 @@ export function SnippetsPanel() {
    *
    * 只有真的动过数据才需要写 —— 否则会白白排一次写盘，还会把
    * "没改过" 的东西重新写一遍。
+   *
+   * # 顺手清理撤销之后没人引用的图片
+   *
+   * 笔记页是自动保存的：导入的图片**立刻**进了数据。撤销会把数据退回快照，
+   * 于是"这次编辑期间加进来、快照里没有"的那些图就没人引用了 ——
+   * 不清理的话，用户每撤销一次，`media/` 里就多一份永远看不见的文件。
+   *
+   * 候选集分两种（这里必须分清，否则会删掉还在用的图）：
+   * - **本次新建**的条目：撤销之后整条消失 → 它带的所有图都作废；
+   * - **已有**的条目：撤销只是把数据换成快照 → 只有"快照里没有的那些"作废，
+   *   快照里的图撤销之后**又有人引用了**，一个都不能删。
+   *
+   * ⚠️ 这里**不能**用 `orphanedByItemRemoval`：它的语义是"这些 id 正从条目里
+   * 被移除"，会把来源条目自身的引用整个排除掉 —— 那会把快照里的图也当成孤儿。
    */
   const discardEdit = () => {
     const snap = snapshotRef.current;
     if (snap && dirtyRef.current) {
+      const stored = snippets.find((s) => s.id === snap.id);
+      const storedIds = (stored?.images ?? []).map((image) => image.id);
+      const snapIds = new Set((snap.images ?? []).map((image) => image.id));
+      const candidates = isNewRef.current
+        ? storedIds
+        : storedIds.filter((id) => !snapIds.has(id));
+
+      // 撤销之后数据长什么样
+      const restored = isNewRef.current
+        ? snippets.filter((s) => s.id !== snap.id)
+        : snippets.map((s) => (s.id === snap.id ? snap : s));
+      const orphans = candidates.filter((id) => !referencedImageIds(restored).has(id));
+
       update((prev) =>
         isNewRef.current
           ? prev.filter((s) => s.id !== snap.id)
           : prev.map((s) => (s.id === snap.id ? snap : s)),
       );
       showFeedback("已撤销改动");
+      cleanOrphanFiles(orphans);
     }
     setEditing(null);
   };
 
-  /** 删除一条。同样要等落盘结果再说话 —— 不可逆的操作尤其不能谎报成功。 */
+  /**
+   * 删除一条。同样要等落盘结果再说话 —— 不可逆的操作尤其不能谎报成功。
+   *
+   * 顺手清理**没人再引用**的图片文件：导入按内容 sha256 去重，同一张图
+   * 被几条片段引用是正常的，只有一条都不剩时才能删磁盘文件。
+   * 图片清理失败**不该**让整次删除报错 —— 片段已经删掉了，报错会让用户
+   * 以为没删成功、再删一次。
+   *
+   * # ⚠️ 已知限制：有一种顺序会留下孤儿文件（刻意不修）
+   *
+   * 「导入一张图 → 在编辑器里把它移除 → 删掉这条笔记」这条路径下，
+   * 那张图既不在条目当前的 `images` 里（已经被移除），也不在任何别处，
+   * 而这里的 `orphanedByItemRemoval` 只看条目**当前**引用的图片 ——
+   * 于是它的文件会留在 `%APPDATA%\浮光\media\` 里，界面上再也看不到它。
+   *
+   * 彻底修需要一个跨条目的"本次会话碰过的图片"流水，而收益只有"少占一点磁盘"：
+   * **漏掉一个孤儿文件是可恢复的（只是占着空间），删掉一个还在被引用的文件
+   * 是不可恢复的（对方立刻裂图）** —— 两者不对称，所以宁可漏删。
+   * 已写进 CHANGELOG 的已知限制。
+   */
   const remove = async (id: string) => {
+    const orphans = orphanedByItemRemoval(snippets, id);
     update((prev) => prev.filter((s) => s.id !== id));
     const ok = await flush();
     showFeedback(
       ok ? "已删除" : "删除失败：改动只在内存里，重启后它还会回来",
       ok ? "ok" : "warn",
     );
+    if (ok && orphans.length > 0) {
+      await Promise.all(
+        orphans.map((imageId) => api.mediaDelete(imageId).catch(() => undefined)),
+      );
+      library.refreshStats();
+    }
   };
 
   const toggleFlag = (id: string, key: "starred" | "sensitive") => {
@@ -493,7 +868,20 @@ export function SnippetsPanel() {
           onChange={onDraftChange}
           onDone={finishEdit}
           onDiscard={discardEdit}
+          // 编辑器正文区的右键菜单（键入到光标 / 复制 / 剪切 / 粘贴 / 全选）
+          // 需要两个能力：把文字打出去（typeInto）、以及把结果说给用户听（onNotice）
+          onTypeInto={typeInto}
+          onNotice={showFeedback}
+          contextMenu={ctx}
+          // 图片附件：导入机制在页面级（拖放订阅只能有一份），
+          // 判重与"这张图还有没有别人在用"要用页面那份完整列表
+          library={library}
+          registerDrop={registerDrop}
+          allItems={() => snippets}
+          // 撤销还原的是**打开编辑器那一刻**的快照，所以这里给的是它
+          undoImages={() => snapshotRef.current?.images ?? []}
         />
+        {ctx.menu}
       </div>
     );
   }
@@ -580,7 +968,7 @@ export function SnippetsPanel() {
           <div className="snip__empty">
             {snippets.length === 0 ? (
               <>
-                还没有任何文本片段。
+                还没有任何笔记。
                 <br />
                 点右上角「新建」加一条，比如你的邮箱、常用地址、一段格式模板。
               </>
@@ -612,10 +1000,19 @@ export function SnippetsPanel() {
 
         {visible.map((s) => {
           const shown = s.sensitive && !revealed.has(s.id);
+          // `Snippet.images` 是**可选**字段（片段是前端拥有的类型，老数据里
+          // 没有这一项），所以这里兜一次，下面就不用到处写 `?? []`
+          const images = s.images ?? [];
           return (
             <article
               key={s.id}
-              className={`card${drag.draggingId === s.id ? " drag-source" : ""}`}
+              id={focusDomId(FOCUS_DOM_PREFIX, s.id)}
+              className={`card${drag.draggingId === s.id ? " drag-source" : ""}${
+                isHighlighted(focus.highlight, s.id) ? " card--focus" : ""
+              }`}
+              // 右键：和这一条有关的动作。列表行上原有的「粘贴」「复制」按钮
+              // **保留**（理由见 snippetMenu 的说明），右键只是多一条路。
+              onContextMenu={(e) => ctx.open(e, () => snippetMenu(s))}
               {...drag.handleProps(s.id)}
             >
               <div className="card__head">
@@ -626,11 +1023,25 @@ export function SnippetsPanel() {
                     {t}
                   </span>
                 ))}
+                {/* 列表行只给一个**数量标记**，不塞缩略图：卡片只有几十像素高，
+                    放一张图会把"一眼扫十条"变成"一眼看两条"。 */}
+                {images.length > 0 && (
+                  <span className="media__marker" title={`${images.length} 张图片`}>
+                    <ImageIcon size={10} />
+                    {images.length}
+                  </span>
+                )}
               </div>
 
-              <div className="card__content">
-                {shown ? mask(s.content) : summarize(s.content)}
-              </div>
+              {/* 正文摘要。**只有图片没有文字**时这一行整个不渲染 ——
+                  否则会留下一个空行（而空行看起来像"内容加载失败"）。
+                  敏感条目的遮罩也要先判正文非空：对空串调 `mask` 会给出
+                  六个圆点，那是"有内容但被遮住了"的假象。 */}
+              {(shown ? s.content.trim().length > 0 : summarize(s.content).length > 0) && (
+                <div className="card__content">
+                  {shown ? mask(s.content) : summarize(s.content)}
+                </div>
+              )}
 
               {s.note && <div className="card__note">{s.note}</div>}
 
@@ -694,6 +1105,10 @@ export function SnippetsPanel() {
           onClose={() => setMovingId(null)}
         />
       )}
+
+      {/* 右键菜单。挂在这里而不是每张卡片里：它是 `position: fixed` 的
+          独立浮层，只有一份，跟着"哪一条被右键"变内容 */}
+      {ctx.menu}
     </div>
   );
 }
@@ -704,12 +1119,45 @@ function SnippetEditor({
   onChange,
   onDone,
   onDiscard,
+  onTypeInto,
+  onNotice,
+  contextMenu,
+  library,
+  registerDrop,
+  allItems,
+  undoImages,
 }: {
   draft: Snippet;
   /** 每改一下就回调一次 —— 数据是自动保存的，这里没有「提交」这个动作。 */
   onChange: (s: Snippet) => void;
   onDone: () => void;
   onDiscard: () => void;
+  /** 「键入到当前光标」：把选中的那段文字打到外部窗口。 */
+  onTypeInto: (text: string) => void;
+  /**
+   * 右键菜单里那些"顺手做一下"的结果提示（复制成功、剪贴板读不到…）。
+   *
+   * 由上层传进来而不是这里自己 `setFeedback`：提示条渲染在
+   * `SnippetsPanel` 那一层（`notices`），编辑器里再存一份就会有两处
+   * 需要同步的状态。
+   */
+  onNotice: (text: string, kind: "ok" | "warn") => void;
+  /** 上层已经建好的右键菜单实例（一份就够，不用每个输入框各建一个）。 */
+  contextMenu: UseContextMenuResult;
+  /** 页面级媒体库（导入机制 + 占用统计 + 拖放订阅）。 */
+  library: MediaLibraryApi;
+  /** 把本编辑器注册成拖放目标（页面级订阅只有一个）。 */
+  registerDrop: (handler: ((paths: string[]) => void) | null) => void;
+  /** 全部片段的图片引用，用来判"这张图还有没有别人在用"。 */
+  allItems: () => readonly Snippet[];
+  /**
+   * 「撤销改动」会还原回来的那份图片（= 打开编辑器那一刻的快照）。
+   *
+   * 必须是**快照**而不是"数据里现在那份"：撤销还原的是快照，
+   * 而数据里那份已经被自动保存改过了。用错的话，用户删掉一张图再撤销，
+   * 数据里的图回来了、文件却被我们删了 —— 界面上是个"读不到"的格子。
+   */
+  undoImages: () => readonly MediaRef[];
 }) {
   const [form, setForm] = useState<Snippet>(draft);
 
@@ -720,13 +1168,63 @@ function SnippetEditor({
    * 而"取消"就是丢掉刚写的东西。这正是「写好东西没点保存就不保存」里
    * 最坑人的一条：想收起面板，顺手按个 Esc，字就没了，还没有提示。
    * 想退回原样请用「撤销改动」—— 一个明确的、带文字的按钮。
+   *
+   * ⚠️ 浮层（大图预览 / 右键菜单）开着时**不认领** Esc：那一下 Esc 是
+   * "关掉浮层"，不是"退出编辑器"。第二个参数交给 `useEscapeToClose`，
+   * 它会**先判认领、再决定拦不拦传播** —— 不认领时既不 `stopPropagation`
+   * 也不回调，事件原样走到菜单那一层，由菜单自己关掉自己。
+   *
+   * （笔记页 Esc 走 `onDone`（自动保存），最坏只是关掉编辑器；
+   * 备忘页那边同一个坑的后果严重得多，见 `lib/escape.ts` 的说明。）
    */
-  useEscapeToClose(onDone);
+  useEscapeToClose(
+    onDone,
+    () => !media.blocksEscapeNow(),
+  );
   const [tagInput, setTagInput] = useState(draft.tags.join(", "));
-  const contentRef = useRef<HTMLTextAreaElement>(null);
+
+  /**
+   * 图片附件：三路导入（按钮 / 拖放 / Ctrl+V）+ 网格 + 大图 + 图片右键菜单。
+   *
+   * `images` 传函数而不是值：导入 / 删除之后要拿到**最新**的那一份列表，
+   * 而这个 hook 里那些回调（右键菜单项）是稳定的，读值会在闭包里过期。
+   */
+  const media = useMediaAttachments({
+    // `Snippet.images` 是可选字段（老数据里没有），所以兜一次
+    images: () => form.images ?? [],
+    onChange: (next) => patch({ images: next }),
+    itemId: form.id,
+    allItems,
+    onNotice,
+    contextMenu,
+    library,
+    undoImages,
+  });
+
+  /** 有图片时正文框才让位（见 media.css 顶部那段说明）。 */
+  const hasImages = (form.images?.length ?? 0) > 0;
+
+  /**
+   * 正文区的右键菜单：键入到光标 / 复制 / 剪切 / 粘贴 / 全选。
+   *
+   * 用 `useTextAreaMenu` 而不是在这里手写：备忘页的正文框要的是同一套
+   * 菜单、同一套"写剪贴板失败就不删正文"的判断。两边各写一遍必然漂移。
+   */
+  const area = useTextAreaMenu(contextMenu, {
+    onTypeInto,
+    onNotice,
+    copyText: api.copyText,
+  });
 
   useEffect(() => {
-    contentRef.current?.focus();
+    // 打开编辑器就聚焦正文（原来那个 ref 交给 `useTextAreaMenu` 了）。
+    // 先判 `typeof !== "function"`：`Ref` 可能是回调形式的 ref，
+    // 那种形态没有 `.current`。`useTextAreaMenu` 现在给的是对象形式，
+    // 但类型上分不出来，硬断言以后一定会被改坏。
+    const el = area.ref;
+    if (el && typeof el !== "function") el.current?.focus();
+    // 只在挂载时聚焦一次：`area` 每次渲染都是新对象，进依赖会变成"每渲染抢焦点"
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /**
@@ -742,7 +1240,13 @@ function SnippetEditor({
   };
 
   return (
-    <div className="editor">
+    <div
+      className={`editor${hasImages ? " editor--media" : ""}`}
+      // Ctrl+V：剪贴板里有图片就导入，是文字就**完全不碰**（走浏览器原路）。
+      // 挂在编辑器根节点上而不是 textarea 上：焦点可能在标题/标签框里，
+      // 粘贴事件会从那儿冒泡上来，一处就够。
+      onPaste={media.onPaste}
+    >
       <div className="editor__head">
         <span>{draft.title ? "编辑片段" : "新建片段"}</span>
       </div>
@@ -763,13 +1267,24 @@ function SnippetEditor({
           <em className="field__hint">点「粘贴」时会被送出去的内容</em>
         </span>
         <textarea
-          ref={contentRef}
+          ref={area.ref}
           className="field__input field__input--area"
           value={form.content}
           placeholder="要反复输入的文本、账号、地址、模板…"
           onChange={(e) => patch({ content: e.target.value })}
+          // 选中一段文字右键 → 「键入到当前光标」把它打到外部窗口。
+          // 没选中时那一项是禁用的（理由见 lib/context-menu.tsx 的 useTextAreaMenu）
+          onContextMenu={area.onContextMenu}
         />
       </label>
+
+      {/* 图片区紧跟在正文后面：它和正文一样是"这条笔记的内容" */}
+      <MediaSection
+        images={form.images ?? []}
+        media={media}
+        contextMenu={contextMenu}
+        onRegisterDrop={registerDrop}
+      />
 
       <label className="field">
         <span className="field__label">
@@ -827,8 +1342,14 @@ function SnippetEditor({
         <button
           className="btn btn--primary"
           onClick={onDone}
-          disabled={!form.content.trim()}
-          title={form.content.trim() ? "" : "正文不能为空"}
+          // ⚠️ 判据是「正文非空 **或** 有图片」：只有图片的笔记是合法的，
+          // 而只判正文的话那条笔记会被这句 `disabled` 拦在「完成」外面 ——
+          // 用户贴了图却按不动完成，而且不知道为什么。
+          // 「真的空」（没文字也没图片）仍然禁用，空壳条目不写。
+          disabled={!hasAnyContent(form.content, form.images)}
+          title={
+            hasAnyContent(form.content, form.images) ? "" : "正文和图片至少要有一个"
+          }
         >
           <Check size={13} />
           完成
@@ -845,8 +1366,32 @@ function truncate(text: string, max: number): string {
 
 /** 注册到功能表。 */
 export const SnippetsFeature: FeatureModule = {
+  /**
+   * ⚠️ `id` **绝对不能改**。它同时是：
+   * - `snippets.json` 这个数据文件名的前缀（见 `DATA_FILE`）；
+   * - `folders.json` 里每个文件夹的 `feature` 字段值（`Folder.feature`）。
+   *
+   * 改掉它，用户现有的全部片段和文件夹归属会一次性失联 —— 数据还在盘上，
+   * 但界面上一条都看不到。所以「文本」改名成「笔记」只动 `title`：
+   * 标题栏面包屑（`PanelWindow.tsx` 的 `active.panelTitle ?? active.title`）、
+   * 页签的悬停提示（同文件 `f.description ?? f.title`）、
+   * 页签上显示的名字（同文件 `<span>{f.title}</span>`）——
+   * 三处全部从 `title` 派生，改这一处就够了。
+   *
+   * ⚠️ 这里刻意**只写表达式、不写行号**：行号在别的任务改动
+   * `PanelWindow.tsx` 之后会静默变成谎话（RV3 报的 F7 就是这么来的，
+   * 原来写的是 `:199` / `:196` / `:150-152`，实际已经漂到别处）。
+   * 上面三个表达式都能直接 grep 到，不会过期。
+   */
   id: "snippets",
-  title: "文本",
+  /**
+   * 页签显示名。原来叫「文本」，用户要求改成「笔记」。
+   *
+   * 备忘页原来大量把「笔记」当名词用（"共 N 条笔记"、"编辑笔记"），
+   * 两个页签都叫「笔记」会让人分不清，所以那一页的用词一并改成了
+   * 「备忘」口径（见 `features/memo/index.tsx`）。
+   */
+  title: "笔记",
   description: "常用文本、账号、模板，一点就粘贴到光标处",
   icon: Clipboard,
   order: 10,

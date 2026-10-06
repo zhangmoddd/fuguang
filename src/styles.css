@@ -231,14 +231,45 @@ textarea {
 .panel__crumb {
   color: var(--text-faint);
   font-size: var(--fs-md);
+  /* 标题栏现在有四个按钮，而 crumb 是这一行里唯一可以变短的东西。
+     不给它 ellipsis 的话，长标题（或用户把字号调到最大档）会把按钮
+     挤出 420px 的窗口 —— 而按钮一旦被挤出去就再也点不到了。 */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 「新建窗口失败」这类一次性提示。挂在这一行的中间，
+   宽度让给 crumb，所以同样要能省略。 */
+.panel__notice {
+  font-size: var(--fs-xs);
+  color: var(--warning);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .panel__window-actions {
   margin-left: auto;
   display: flex;
   gap: 2px;
+  /* 按钮永远不参与压缩：宁可让 crumb 变短（它有 ellipsis），
+     也不能把 ✕ 挤到窗口外面去 */
+  flex-shrink: 0;
 }
 
+/* 通用小图标按钮。
+   24×24 是给**内容区里**那些按钮用的（片段行、计时卡片、文件夹格子…），
+   标题栏那一组另有 28×28 的覆盖，见下面 `.panel__window-actions`。
+   不直接把这里改成 28：`.iconbtn` 被十几个调用点共用（`features/*` 与
+   `folders-ui.tsx`），其中文件夹格子的两个操作按钮挤在 86px 宽的卡片里，
+   而这一轮没有 GUI 可以逐个核对改完的观感 —— 需求要的也只是"右上角搜索键"。
+
+   尺寸与图标：图标大小写在 JSX 的 `size={n}` 上（lucide 会把它写成 svg 的
+   width/height 属性），**不要**在这里再写一份 `svg { width }`：
+   同一个数字写两处，迟早对不上。 */
 .iconbtn {
   display: inline-flex;
   align-items: center;
@@ -253,6 +284,15 @@ textarea {
   flex-shrink: 0;
 }
 
+/* 标题栏右上角那一组（搜索 / 新建窗口 / 图钉 / ✕）。
+   提到 28×28，与备忘页日期条上的翻页按钮同一个规格 ——
+   它是面板里最高频的几个点击目标，24px 在桌面触控板上偏小（用户这一轮
+   提的就是"右上角搜索键有点小"）。 */
+.panel__window-actions .iconbtn {
+  width: 28px;
+  height: 28px;
+}
+
 .iconbtn:hover {
   background: var(--bg-hover);
   color: var(--text);
@@ -261,6 +301,27 @@ textarea {
 .iconbtn--danger:hover {
   background: rgba(217, 45, 32, 0.12);
   color: var(--danger);
+}
+
+/* 搜索键是标题栏那一组里**唯一的动作**（其余三个是窗口按钮：
+   新建 / 置顶 / 收起），给它一个看得见的修饰：淡强调底 + 强调色图标。
+   刻意克制：不加边框、不加阴影、不改尺寸 —— 四个按钮里只要一个看起来
+   "是个动作"，其余三个仍然是安静的窗口按钮。 */
+.iconbtn--search {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* 悬停时保持强调色。
+   `.iconbtn--search`（0,1,0）压不过 `.iconbtn:hover`（0,2,0），
+   所以这一条必须写在 `.iconbtn:hover` **之后**、并且带上 `:hover`
+   （两条特异性都是 0,2,0，靠书写顺序定胜负）。
+   不写的话，鼠标一移上去"搜索是个动作"这个提示就消失了。 */
+.iconbtn--search:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  /* 用内描边表示悬停，而不是换成 --bg-hover —— 那会盖掉强调底 */
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 
 /* 页签栏 */

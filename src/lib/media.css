@@ -1,0 +1,262 @@
+/* ============================================================
+   图片附件（lib/media-ui.tsx）
+
+   # 和那 280px 正文区的谈判
+
+   `styles.css:585-601` 把 `.field--grow`（正文框）写死成 `height: 280px`，
+   注释原文是「280px 是按 640px 高的面板定的」。那是**没有图片区时**的取舍，
+   现在编辑器里多了一块图片区，那 280px 就必须让位 —— 否则图片区会被顶到
+   640px 的窗口之外，用户点完「加图片」**什么都看不见**，只会以为没成功。
+
+   让位方式（三条一起，缺一条都会出问题）：
+
+   1. **只在本编辑器真的有图片区时缩**：靠 `.editor--media` 这个修饰类
+      （由 `snippets/index.tsx` / `memo/index.tsx` 在渲染时按需加上）。
+      没有图片区的编辑器行为一个字都不变。
+   2. **缩到 180px 而不是更小**：180px 约 7 行正文，够用；
+      而 `min-height: 90px` 是 `styles.css` 里就有的，我没有覆盖它 ——
+      用户照样能拖着改高度，也拖不到比 90px 更小。
+   3. **整个编辑器照旧是唯一那条滚动**（`.editor` 的 `overflow-y: auto`
+      来自 `styles.css`）：图片多了往下滚，不做嵌套滚动区。
+      嵌套滚动在 420px 宽的面板里会出现"滚轮到底了内容还没到底"的迷惑感。
+
+   ⚠️ 为什么不改 `styles.css` 里的 280px 本身：那是另一个人的文件，
+   而且那个值在"没有图片"这个多数场景下仍然是对的。
+
+   # 为什么类名都带 `media__` 前缀
+
+   这些规则是全局的（CSS 没有作用域），而项目里已经有 `.card` / `.btn`
+   级别的通用命名空间。前缀是唯一能保证不撞车的做法。
+   ============================================================ */
+
+/* ---- 让位：有图片区时正文框矮一截 ---- */
+
+.editor--media .field--grow {
+  height: 180px;
+}
+
+/* ---- 图片区 ---- */
+
+.media {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* 不设 `flex: 1`：图片区的高度由内容决定，撑高的是编辑器的滚动区。
+     设了 flex 会让它在内容少时也占满，把下面的输入框顶出去。 */
+  flex: 0 0 auto;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.02);
+}
+
+/* 拖放悬停中：整块变色，用户知道"松手就进来" */
+.media--drop {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.media__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+}
+
+.media__label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 600;
+}
+
+.media__spacer {
+  flex: 1 1 auto;
+}
+
+/* 「加图片」这类小按钮。刻意不用 `.btn`：那是 styles.css 的类，
+   而 main.tsx 顶部那段注释说明了"基础类与模块类特异性相同时谁在后面谁赢"
+   这件事有多容易踩 —— 自己的按钮自己定义，不依赖打包顺序。 */
+.media__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 7px;
+  background: var(--bg-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--fs-sm);
+  cursor: default;
+}
+
+.media__btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.media__btn:disabled {
+  color: var(--text-faint);
+}
+
+/* ---- 缩略图网格 ---- */
+
+.media__grid {
+  display: grid;
+  /* `auto-fill` + 78px：420px 面板下正好四列。
+     用固定列数会在用户调大字号后挤成一团，`minmax` 会自己少一列。 */
+  grid-template-columns: repeat(auto-fill, minmax(78px, 1fr));
+  gap: 6px;
+}
+
+.media__cell {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 正方形格子：图片宽高比千奇百怪，格子统一了看起来才整齐 */
+  aspect-ratio: 1;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.05);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: default;
+}
+
+.media__cell:hover {
+  border-color: var(--accent);
+}
+
+.media__thumb {
+  width: 100%;
+  height: 100%;
+  /* `contain` 而不是 `cover`：截图里往往有文字，裁掉一部分比留白糟得多 */
+  object-fit: contain;
+}
+
+/* 缩略图还没读回来时的占位。不能留白 —— 空白格子看起来像"图片丢了" */
+.media__loading {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+}
+
+/* 读不出图片（文件被删了 / 磁盘坏了）时的占位 */
+.media__broken {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  color: var(--danger);
+  font-size: var(--fs-2xs);
+  text-align: center;
+  padding: 2px;
+}
+
+.media__empty {
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+/* ---- 占用统计一行 ---- */
+
+.media__stats {
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+/* 越过阈值时变成警示色 + 换成一句完整的话（见 lib/media.ts 的 largeLibraryNotice）。
+   用琥珀而不是红：它不是错误，是"再涨下去备份会变慢"。 */
+.media__stats--warn {
+  color: var(--warning);
+}
+
+/* ---- 列表行上的图片数量标记 ----
+   列表里**不塞大图**：一张缩略图在 420px 宽、每条卡片只有几十像素高的列表里
+   会把"一眼扫十条"变成"一眼看两条"。所以只给一个数字。 */
+
+.media__marker {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+}
+
+/* ---- 大图预览 ---- */
+
+.media__viewer {
+  position: fixed;
+  inset: 0;
+  /* 低于右键菜单（context-menu.css 的 z-index: 100）：
+     在预览层上右键图片，菜单要能盖在它上面。
+     ⚠️ 这句不是"以后要做"的设想 —— `ImageViewer` 的 `<img>` 上**真的**挂了
+     `onContextMenu`（RV4 的 F2：原来这里只有注释、没有实现，而原生菜单又被
+     `main.tsx` 全局关掉了，于是右键什么都不发生）。改这一层时要连着看那处。 */
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 14px;
+  background: rgba(0, 0, 0, 0.72);
+}
+
+.media__viewer-img {
+  max-width: 100%;
+  max-height: calc(100% - 46px);
+  /* 同样 `contain`：预览要看到整张图，不是被裁过的一块 */
+  object-fit: contain;
+  background: var(--bg-solid);
+  border-radius: var(--radius-sm);
+}
+
+.media__viewer-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: var(--fs-xs);
+}
+
+.media__viewer-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+}
+
+/* 预览层里的按钮要能在深色底上读清，所以自带配色，不用 `.btn` */
+.media__viewer-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 6px;
+  color: #fff;
+  font-family: var(--font);
+  font-size: var(--fs-xs);
+  cursor: default;
+}
+
+.media__viewer-btn:hover {
+  background: rgba(255, 255, 255, 0.26);
+}

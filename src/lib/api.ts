@@ -91,6 +91,69 @@ export interface Timer {
 }
 
 // ===============================================================
+// 图片媒体
+// ===============================================================
+
+/**
+ * 一张图片的引用。**只有元数据，像素不在里面。**
+ *
+ * 像素落在 `%APPDATA%\浮光\media\`（Rust 侧 `media.rs`），JSON 里只留这个引用。
+ * 为什么不把 base64 塞进数据文件：数据文件是**整份覆盖写**的，
+ * 而且前端每次改一条片段都可能重写整份 `snippets.json`（见 `lib/store.ts`）——
+ * 塞进去会让文件体积按图片大小膨胀几个数量级，还会污染全文搜索的语义。
+ *
+ * 与 Rust 侧 `models::MediaRef` 一一对应（字段名驼峰）。
+ */
+export interface MediaRef {
+  /**
+   * 图片 id，等于**文件内容的 sha256 前 32 位十六进制**。
+   *
+   * 用内容摘要当 id 而不是随机 id：同一张图导入两次算出的 id 相同，
+   * Rust 那边直接复用已有文件，天然去重。
+   */
+  id: string;
+  /** 原始文件名（或剪贴板图片的自动命名），用于显示与「另存为」的默认名。 */
+  name: string;
+  /** MIME 类型，例如 `image/png`。由**文件头**判定，不看扩展名。 */
+  mime: string;
+  /**
+   * 宽（像素）。**导入时是 0**，要由前端用 canvas 量出来、
+   * 通过 {@link api.mediaSetMeta} 回填。
+   *
+   * 为什么宽高不由 Rust 算：算宽高就得把图片解码一遍，而"不解码"正是
+   * Rust 侧能不引图片库（体积代价）的原因 —— 与 `linkicon` 的分工一致。
+   */
+  width: number;
+  /** 高（像素）。见 {@link MediaRef.width}。 */
+  height: number;
+  /** 文件字节数。 */
+  bytes: number;
+  /** 导入时刻（Unix 毫秒）。 */
+  addedAt: number;
+}
+
+/** 媒体库统计，与 Rust 侧 `media::MediaStats` 一一对应。 */
+export interface MediaStats {
+  /** 图片张数（不含缩略图与元数据文件）。 */
+  count: number;
+  /** 占用字节数。**含**缩略图与元数据 —— 这是"这个目录占了我多少磁盘"。 */
+  bytes: number;
+}
+
+/**
+ * 备份导入的结果，与 Rust 侧 `backup::ImportReport` 一一对应。
+ *
+ * 为什么导入要返回东西：「数据里引用到、但备份里没带的图片」在界面上是**裂图**，
+ * 而用户刚看到"恢复成功"。不报出来他就只能一张张翻过去找。
+ */
+export interface ImportReport {
+  /** 备份里带回、并写回 `media/` 的图片张数。 */
+  mediaWritten: number;
+  /** 导入进来的数据引用到、但库里没有的图片 id（空数组 = 全都在）。 */
+  missingMedia: string[];
+}
+
+// ===============================================================
 // 备忘录
 // ===============================================================
 
@@ -103,6 +166,13 @@ export interface Memo {
   title: string;
   body: string;
   tags: string[];
+  /**
+   * 这条备忘里附带的图片。
+   *
+   * ⚠️ **永远存在**（Rust 侧是 `#[serde(default)]` 的普通字段，老数据读出来是 `[]`）。
+   * 写回去时也必须带上：`memo_save` 是整条覆盖写，漏掉这个字段等于把图片删了。
+   */
+  images: MediaRef[];
   /** 下一次该提醒的绝对时刻。null 表示不提醒。 */
   remindAt: number | null;
   repeat: Repeat;
@@ -205,6 +275,15 @@ export interface Snippet {
    * 过滤时会把「没有」和「指向不存在的文件夹」都当成顶层。
    */
   folderId: string | null;
+  /**
+   * 这条笔记里附带的图片。
+   *
+   * 可选（`?`）而不是必填：老数据里**没有这一项**，读出来是 `undefined`，
+   * 所以用之前一律 `s.images ?? []`。与 `Memo.images` 的区别在于数据来源 ——
+   * 备忘走 Rust 的强类型结构（那边 `#[serde(default)]` 会补齐），
+   * 而片段是前端自己拥有的通用 JSON（见这个接口的说明）。
+   */
+  images?: MediaRef[];
   createdAt: number;
   updatedAt: number;
 }
@@ -258,14 +337,54 @@ export interface Settings {
 
 export const api = {
   // ---- 窗口与进程 ----
-  togglePanel: () => invoke<void>("toggle_panel"),
-  showPanel: () => invoke<void>("show_panel"),
-  hidePanel: () => invoke<void>("hide_panel"),
+  /**
+   * 切换主面板显隐。
+   *
+   * @param label 目标面板；省略表示第一个面板（`panel`）。
+   *              悬浮球左键点击、托盘左键点击都是这个语义。
+   */
+  togglePanel: (label?: string) => invoke<void>("toggle_panel", { label: label ?? null }),
+  /**
+   * 显示主面板；目标面板不存在时**创建**它。
+   *
+   * @param label 目标面板；省略表示第一个面板（`panel`）。
+   */
+  showPanel: (label?: string) => invoke<void>("show_panel", { label: label ?? null }),
+  /**
+   * 隐藏主面板（窗口实例保留，下次打开更快）。
+   *
+   * ⚠️ `label` 省略时藏的是**调用方自己那个窗口**（Rust 侧取命令的调用窗口），
+   * 不是"第一个面板"。面板标题栏上的 ✕ 就是靠这条语义在 `panel-2` 里也能正确收起。
+   */
+  hidePanel: (label?: string) => invoke<void>("hide_panel", { label: label ?? null }),
+  /**
+   * 新建一个主面板窗口，返回它的 label（`panel-2`、`panel-3`……）。
+   *
+   * 用**最小空闲编号**：关掉 `panel-2` 之后新建的又叫 `panel-2`，
+   * 于是它会回到用户上次放它的位置。多面板的入口在托盘菜单和悬浮球右键菜单的
+   * 「新建窗口」，前端要自己加按钮也可以调这个。
+   */
+  newPanel: () => invoke<string>("new_panel"),
+  /** 当前存在的全部面板 label（按编号排序，`panel` 在最前）。 */
+  listPanels: () => invoke<string[]>("list_panels"),
+  /**
+   * 关闭一个面板窗口。
+   *
+   * 第一个面板（`panel`）是常驻的：它只会被隐藏，不会被销毁。
+   */
+  closePanel: (label: string) => invoke<void>("close_panel", { label }),
   hideBall: () => invoke<void>("hide_ball"),
   showBall: () => invoke<void>("show_ball"),
   quit: () => invoke<void>("quit_app"),
   showBallMenu: () => invoke<void>("show_ball_menu"),
-  setAlwaysOnTop: (label: string, value: boolean) =>
+  /**
+   * 设置某个窗口是否置顶。
+   *
+   * @param label 目标窗口；传 `null` 表示**调用方自己那个窗口**。
+   *              面板标题栏上的图钉必须传 `null`（或自己那个 label）——
+   *              写死 `"panel"` 会让 `panel-2` 上的图钉去改第一个面板的置顶状态。
+   */
+  setAlwaysOnTop: (label: string | null, value: boolean) =>
     invoke<void>("set_always_on_top", { label, value }),
   /**
    * 记住悬浮球当前的位置（小球窗口在移动后防抖调用）。
@@ -273,6 +392,8 @@ export const api = {
    * 存进单独的 `window.json`，**不写设置**：设置是整份覆盖写的，
    * 小球和主面板两个窗口各持一份副本，互相会冲掉
    * （见 Rust 侧 `windows::FILE_WINDOW` 的说明）。
+   *
+   * 面板的位置不用前端管：Rust 侧监听 `WindowEvent::Moved` 自己记。
    */
   saveBallPos: (x: number, y: number) => invoke<void>("save_ball_pos", { x, y }),
 
@@ -284,6 +405,94 @@ export const api = {
   pasteText: (text: string, restoreDelayMs?: number) =>
     invoke<PasteOutcome>("paste_text", { text, restoreDelayMs }),
   copyText: (text: string) => invoke<boolean>("copy_text", { text }),
+  /**
+   * 读取剪贴板里的**文本**（右键菜单的「粘贴」用它）。
+   *
+   * # 为什么不用 `navigator.clipboard.readText()`
+   *
+   * WebView2 里那个 API 要剪贴板读权限，而浮光没开任何剪贴板权限、
+   * 也没装剪贴板插件，所以它在浮光里是不可靠的（轻则弹权限提示、重则直接
+   * reject），右键「粘贴」就只剩"请用 Ctrl+V"这句降级提示。Rust 侧本来就有
+   * 这份能力（模拟粘贴一直在用它读用户的原文做备份），所以走命令。
+   *
+   * @returns `null` 表示**剪贴板里没有文本**（只有图片、或者空的）——
+   *          这是**正常路径**，不是错误：调用方应当"这次不粘贴，
+   *          退回让用户自己 Ctrl+V"。剪贴板里是图片时也返回 `null`，
+   *          图片走 {@link api.mediaImportClipboard}。
+   */
+  readClipboardText: () => invoke<string | null>("read_clipboard_text"),
+
+  // ---- 图片媒体 ----
+  //
+  // 像素单独落盘在 `%APPDATA%\浮光\media\`，JSON 里只有 `MediaRef` 引用
+  // （理由见 `MediaRef` 的说明）。这些命令就是图片的唯一入口。
+  /**
+   * 从磁盘上的一个文件导入图片（「选择文件」/ 拖放）。
+   *
+   * 扩展名与文件头都必须是图片；按内容 sha256 去重 —— 同一张图导入两次
+   * 只会留一份，第二次直接返回已有引用（`addedAt` 不变）。
+   */
+  mediaImportPath: (path: string) => invoke<MediaRef>("media_import_path", { path }),
+  /**
+   * 从剪贴板导入图片（Ctrl+V 粘图 / 「从剪贴板添加」）。
+   *
+   * 返回 `null` 表示**剪贴板里没有图片**（用户复制的是文字）——
+   * 这是正常情况，调用方应当退回"粘贴文字"，**不要报错**。
+   *
+   * 反过来，`reject` 表示**有图片但读不出来**（剪贴板被其他程序占用、
+   * 格式认不出、超过 20 MB 上限）。这种情况下**必须把错误文案显示给用户**：
+   * 吞掉它就变成"复制了截图却什么都没发生"。
+   */
+  mediaImportClipboard: () => invoke<MediaRef | null>("media_import_clipboard"),
+  /**
+   * 回填宽高与缩略图。
+   *
+   * @param thumbPngBase64 canvas 的 `toDataURL("image/png")` **去掉**
+   *        `data:image/png;base64,` 前缀之后的部分。必须是 PNG，否则会被拒绝
+   *        （存进去一个非 PNG 会让列表里的缩略图全部裂掉，而且很难查）。
+   *
+   * 导入时 `width`/`height` 是 0，靠这一步补齐；列表里显示缩略图也靠它。
+   * 缩略图不是必须的：没有缩略图时 {@link api.mediaRead} 会退回原图。
+   */
+  mediaSetMeta: (id: string, width: number, height: number, thumbPngBase64: string) =>
+    invoke<MediaRef>("media_set_meta", { id, width, height, thumbPngBase64 }),
+  /**
+   * 读一张图片，返回可直接放进 `<img src>` 的 data URL。
+   *
+   * @param full `false`（默认）优先读缩略图，没有就退回原图 —— 列表里一律用它。
+   *        `true` 读原图；⚠️ 原图会被 base64 一遍，几十兆的图会让 IPC 很慢。
+   *
+   * MIME 由真实格式决定（可能是 `image/jpeg` 等），不要假设一定是 PNG。
+   */
+  mediaRead: (id: string, full = false) => invoke<string>("media_read", { id, full }),
+  /** 删除一张图片（原图 + 缩略图 + 元数据）。幂等，重复调用不报错。 */
+  mediaDelete: (id: string) => invoke<void>("media_delete", { id }),
+  /**
+   * 把一张图片另存到用户选定的位置（原图字节，不重新编码）。
+   *
+   * 路径由前端的保存对话框给出（`@tauri-apps/plugin-dialog` 的 `save`）。
+   */
+  mediaExport: (id: string, destPath: string) => invoke<void>("media_export", { id, destPath }),
+  /**
+   * 把一张图片写进剪贴板（`CF_DIB`），供「复制图片」用。
+   *
+   * ⚠️ 会**清空用户原来的剪贴板**，而且图片不做还原（文本路径才有还原）。
+   * 所以调用方应当把"剪贴板被替换了"告诉用户。
+   */
+  mediaCopyImage: (id: string) => invoke<void>("media_copy_image", { id }),
+  /**
+   * 把一张图片「键入到当前光标」：放进剪贴板 → 切回上一次的外部窗口 → 模拟 Ctrl+V。
+   *
+   * 返回值与文本路径的 {@link api.pasteText} 是同一个 `PasteOutcome`，
+   * 所以提示方式可以完全一致（`ok` 为假时 `message` 里已经写好了"可手动 Ctrl+V"）。
+   */
+  mediaPasteToTarget: (id: string) => invoke<PasteOutcome>("media_paste_to_target", { id }),
+  /**
+   * 媒体库统计（张数与占用字节数），设置页显示"图片占了多少空间"用。
+   *
+   * 媒体目录不存在（从没存过图）时返回全 0，不报错。
+   */
+  mediaStats: () => invoke<MediaStats>("media_stats"),
 
   // ---- 通用数据文件（文本片段还在用）----
   readData: <T>(file: string) => invoke<T | null>("read_data", { file }),
@@ -341,15 +550,24 @@ export const api = {
   folderRemove: (id: string) => invoke<void>("folder_remove", { id }),
 
   // ---- 备份 ----
-  /** 把全部数据导出成一个备份文件。路径由保存对话框给出。 */
+  /**
+   * 把全部数据导出成一个备份文件（含**被引用到的图片**，以 base64 内嵌）。路径由保存对话框给出。
+   *
+   * 图片为什么不放在 JSON 里却在备份里内嵌：数据文件是每次击键都可能整份重写的，
+   * 而备份是"换台电脑也要能用"的一次性产物 —— 不带上图片的话，
+   * 恢复之后数据里的引用全指向不存在的文件，界面上一片裂图。
+   */
   exportAll: (path: string) => invoke<void>("export_all", { path }),
   /**
    * 从备份文件恢复全部数据。**会覆盖当前数据**，调用前必须先让用户确认。
    *
    * 导入完成后前端要把面板整页重载：各功能模块的状态都是导入前那份，
    * 不重载会显示已经不存在的数据。
+   *
+   * @returns 导入报告。`missingMedia` 非空时要**显示给用户** ——
+   *          那些图片在界面上是裂图，而用户刚看到"恢复成功"。
    */
-  importAll: (path: string) => invoke<void>("import_all", { path }),
+  importAll: (path: string) => invoke<ImportReport>("import_all", { path }),
 
   // ---- 设置 ----
   settingsGet: () => invoke<Settings>("settings_get"),

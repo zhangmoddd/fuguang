@@ -92,7 +92,7 @@ export function isIdItem(value: unknown): boolean {
  * | 有 | 无 | 无 | 两边都删了 → 删掉 |
  * | 有 | 有 | 无 | 远端删了 → 本地没动过就跟着删；本地改过就保住本地那份 |
  * | 有 | 无 | 有 | 本地删了 → **本地赢**（删除是用户明确的动作） |
- * | 有 | 有 | 有 | 谁跟 base 不同谁赢；都不同（或都没变）时**本地赢** |
+ * | 有 | 有 | 有 | 只有一边改过 → 改过的那边赢；两边都改过 → 见下 |
  * | 无 | 有 | 有 | 两边各自新增了同一个 id → 本地赢 |
  *
  * ⚠️ **"远端删除"和"本地新增"看起来都是"id 只出现在一边"**，光看 id 在不在
@@ -100,16 +100,27 @@ export function isIdItem(value: unknown): boolean {
  * 一个 id 在 `base` 里出现过，才谈得上"被谁删了"；没出现过就是"谁新加的"。
  * 这是整个合并里最容易写错的一处，`merge-by-id.test.ts` 有专门用例钉它。
  *
+ * # 两边都改过同一条时谁赢
+ *
+ * 分两档：
+ *
+ * 1. **两边都真的刷过时间戳**（各自的 `updatedAt` 都比 `base` 新）且不相等 →
+ *    **较晚的那次编辑赢**。这样结果与"谁后写盘"无关（见 `preferNewer`，
+ *    那里写了这条规则的前提和边界）。
+ * 2. 其余情况（只有一边刷过、没有 `updatedAt`、类型不对、同一毫秒）→ **本地赢**。
+ *    本地那一份是**用户此刻正在看的**：远端那份已经落盘、磁盘上还有，
+ *    而本地这份只活在内存里，盖掉就永久没了。两害相权取其轻。
+ *
+ * ⚠️ 第 1 档只对**有** `updatedAt` 的数据生效：目前只有 `Snippet` 和 `Memo` 有，
+ * `Timer` / `LinkItem` / `Folder` 都没有（它们永远走第 2 档）。
+ *
+ * 无论哪一档，被盖掉的那一次修改都会丢 —— 一条记录只有一个版本。
+ *
  * # 顺序
  *
  * 以 `local` 的顺序为准，远端新增的按 `remote` 里的顺序接在后面。
  * `snippets.json` 的顺序本身没有语义（界面按"收藏 → 使用次数 → 最近更新"重排），
  * 所以这里只求**稳定、可预期**：同一个窗口连续两次合并不会让列表跳来跳去。
- *
- * # 两边改了同一条时为什么本地赢
- *
- * 本地那一份是**用户此刻正在敲的**。远端那份已经落盘了、还在磁盘上（下次读还在），
- * 而本地这份只活在内存里，盖掉就永久没了。两害相权取其轻。
  */
 export function mergeById<T extends HasId>(base: T[], local: T[], remote: T[]): T[] {
   const baseMap = new Map(base.map((item) => [item.id, item]));
@@ -131,6 +142,92 @@ export function mergeById<T extends HasId>(base: T[], local: T[], remote: T[]): 
   for (const item of remote) take(item.id);
 
   return out;
+}
+
+/**
+ * 两边都改过同一条时，能不能靠 `updatedAt` 明确分出谁更新。
+ *
+ * @param base 共同祖先（必须由调用方传进来，**不要在这里重新构造** —— 那会多出一个
+ *   真相来源，而"谁比 base 新"正是这条规则的判据）
+ * @returns 该留下的那一份；`null` 表示"分不出来"，调用方退回"本地赢"。
+ *
+ * # 前提：**两边都必须真的刷过时间戳**
+ *
+ * 只有 `localAt > baseAt && remoteAt > baseAt`（两边各自的 `updatedAt` 都比 base 新）
+ * 时才比大小。少了这一条会踩一个**静默丢用户操作**的坑：
+ *
+ * `moveTo` / `moveItems`（把条目拖进文件夹）**刻意不刷 `updatedAt`**
+ * （见 `features/snippets` 那段说明：归类不是改内容，一刷时间戳就会把条目顶到
+ * "最近更新"最前面）。于是"本地刚把条目拖进文件夹"这一版的时间戳**等于** base：
+ *
+ * ```
+ * base   : { folderId: null, updatedAt: T0 }
+ * local  : { folderId: "f1", updatedAt: T0 }   ← 刚拖进去，时间戳没变
+ * remote : { title: "改了正文", updatedAt: T1 } ← 另一窗口后来改了内容
+ * ```
+ *
+ * 不检查前提的话两边都算"改过"，取较新的那一侧 → **远端的 `folderId: null` 胜出**
+ * → 用户的拖拽被丢弃并写回磁盘，条目自己跳回原位，而且没有任何提示。
+ * 加上前提之后这一档退回"本地赢"，拖拽保住了。
+ *
+ * 镜像的那一档（远端只挪文件夹、本地改正文）同样由"本地赢"兜住：
+ * 远端没刷时间戳 → 不比大小 → 本地那份内容编辑留下。
+ *
+ * ⚠️ 代价说清楚：**一边只挪文件夹、另一边改内容**时，无论方向如何都是"本地赢"，
+ * 也就是**远端那一次修改会丢**。要两边都留住得做逐字段合并（内容取一边、
+ * `folderId` 取另一边），那是数据模型级别的改动，本轮不做。
+ *
+ * # 内容对内容
+ *
+ * 两边都真的刷过时间戳（即都是内容编辑）时，仍然是**较晚的那次编辑赢** ——
+ * 与写盘顺序无关。这一档没有被上面那个前提削弱，`merge-by-id.test.ts` 里
+ * 「两边都改过同一条：靠 updatedAt 分先后」那一组钉的就是它。
+ *
+ * # 哪些数据有 `updatedAt`
+ *
+ * 只有 `Snippet`（`api.ts` 的 `Snippet.updatedAt`）和 `Memo`（`Memo.updatedAt`）有；
+ * **`Timer` / `LinkItem` / `Folder` 都没有** —— 对它们这条规则永远不生效，
+ * 一律走"本地赢"。这是刻意的：`mergeById` 是通用的，不能要求所有调用方都提供
+ * 这个字段（也不该给没有时间戳的数据硬造一个）。
+ *
+ * # ⚠️ 它与"保住用户正在敲的东西"的关系（别以为万无一失）
+ *
+ * - 片段编辑器**每敲一下**都会把 `updatedAt` 刷成当前时间
+ *   （`features/snippets` 的 `onDraftChange`；编辑器的每个输入框都走
+ *   `patch()` → `onChange` → 那里）。所以"我正在编辑这一条"几乎总是较新的一侧。
+ * - 但"几乎"不是"总是"：如果**另一侧在这之后**也编辑了同一条，那一侧更新，
+ *   于是本窗口刚敲的那版会被换成对面那版 —— 用户会看到自己刚写的内容被替换。
+ *   这是"较新的编辑赢"的代价，换来的正是上面那条"结果与写盘顺序无关"。
+ *   编辑器「完成」时的提示会如实说明（见 `features/snippets` 的 `finishEdit`）。
+ * - 正在编辑中的那一条通常不会真的丢内容：编辑器手里还有一份自己的草稿
+ *   （`SnippetEditor` 的 `form`），下一次敲键会把整条重写回去。
+ * - `moveTo`（移动到文件夹）**刻意不刷 `updatedAt`**，所以它走第 2 档、永远是
+ *   本地赢 —— 拖拽不会被吃掉（见上面那个例子）。
+ */
+function preferNewer<T extends HasId>(base: T, local: T, remote: T): T | null {
+  const baseAt = updatedAtOf(base);
+  const localAt = updatedAtOf(local);
+  const remoteAt = updatedAtOf(remote);
+  if (baseAt === null || localAt === null || remoteAt === null) return null;
+
+  /**
+   * ⚠️ 两边都必须**真的刷过**时间戳（严格比 base 新）才比大小。
+   *
+   * 用 `<=` 而不是 `===` 来挡：时间戳倒退（系统时钟被改、或数据被手改过）时
+   * 也当成"分不出先后"，退回本地赢 —— 那比"按一个不可信的先后去覆盖"安全。
+   */
+  if (localAt <= baseAt || remoteAt <= baseAt) return null;
+
+  // 同一毫秒（两边都在这一毫秒里刷过）分不出先后 → 本地赢
+  if (localAt === remoteAt) return null;
+  return remoteAt > localAt ? remote : local;
+}
+
+/** 读一条记录的 `updatedAt`；没有或者不是有限数字就返回 `null`。 */
+function updatedAtOf(item: unknown): number | null {
+  if (typeof item !== "object" || item === null || !("updatedAt" in item)) return null;
+  const value = item.updatedAt;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 /** 决定某一个 id 最终留哪一份；返回 `undefined` 表示这条不该出现在结果里。 */
@@ -157,7 +254,12 @@ function resolve<T extends HasId>(
 
   const localChanged = !sameValue(local, base);
   const remoteChanged = !sameValue(remote, base);
-  // 谁跟 base 不同谁赢；都不同（或都没变）时本地赢
+  // 只有一边改过：改过的那边赢
   if (remoteChanged && !localChanged) return remote;
-  return local;
+  if (localChanged && !remoteChanged) return local;
+
+  // 两边都改过（或都没改过）：能靠 `updatedAt` 分出先后就取较新的，否则本地赢。
+  // `base` 必须一路传下去 —— "谁真的刷过时间戳"的判据就是"谁比 base 新"，
+  // 在 preferNewer 里重新构造一个 base 会多出第二个真相来源。
+  return preferNewer(base, local, remote) ?? local;
 }

@@ -156,22 +156,41 @@
   font-size: var(--fs-2xs);
 }
 
+/* 底部提示条分两行：第一行是当前选中项能按的动作（按类型不同），
+   第二行是通用按键与结果条数。三档按键的文案在 380px 宽里一行排不下，
+   挤在一起会换行成锯齿状，反而更难读。 */
 .palette__foot {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 3px;
   padding: 6px 11px;
   border-top: 1px solid var(--border);
   background: var(--bg-raised);
   flex-shrink: 0;
 }
 
+.palette__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+
+/* 一条动作不许在 `<kbd>` 和它的说明之间断开 */
+.palette__action {
+  white-space: nowrap;
+}
+
 .palette__keys {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: var(--fs-xs);
   color: var(--text-faint);
 }
 
-.palette__keys kbd {
+.palette__foot kbd {
   display: inline-block;
   padding: 0 4px;
   margin: 0 1px;

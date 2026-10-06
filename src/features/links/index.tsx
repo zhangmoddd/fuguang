@@ -30,6 +30,7 @@ import type { LucideIcon } from "lucide-react";
 import {
   AppWindow,
   Check,
+  Copy,
   FileText,
   Folder,
   FolderInput,
@@ -48,19 +49,31 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   api,
   newId,
+  onStateChanged,
   type Folder as FolderItem,
   type IconData,
   type LinkItem,
   type LinkKind,
 } from "../../lib/api";
 import { FolderBar, FolderEditor, FolderPicker, FolderTiles, useFolders } from "../../lib/folders-ui";
+import {
+  scrollIntoViewSoon,
+  useContextMenu,
+  useFocusHighlight,
+  type ContextMenuItem,
+} from "../../lib/context-menu";
 import { allPaths } from "../../lib/dialog";
 import { previewOrder, useDragSort } from "../../lib/drag-drop";
+import { focusDomId, folderToEnter, highlightFrom, isHighlighted } from "../../lib/focus-highlight";
 import { placeMenu } from "../../lib/menu-position";
+import { usePendingFocus } from "../../lib/navigation";
 import { useZoom } from "../../lib/zoom";
 import type { FeatureModule } from "../registry";
 
 import "./links.css";
+
+/** 定位高亮用的 DOM id 前缀。见 `lib/focus-highlight.ts` 的 `focusDomId`。 */
+const FOCUS_DOM_PREFIX = "link-focus";
 
 /** 认作「程序」的扩展名。与「添加程序」文件选择框里的过滤器保持一致。 */
 const PROGRAM_EXTENSIONS = new Set(["exe", "lnk", "bat", "cmd"]);
@@ -401,6 +414,47 @@ export function LinksPanel() {
     void reload();
   }, [reload]);
 
+  /**
+   * 订阅后端的「数据变了」广播。
+   *
+   * # 为什么链接页必须有这个（RV2 报的 F1）
+   *
+   * `import_all` 会**整份替换** `links.json`（`backup.rs`），
+   * 而本页原来**只在挂载时读一次盘** —— 于是"设置页导入备份之后，
+   * 别的窗口里的链接页还显示导入前那一份"，而且它下一次保存会把
+   * 刚恢复的备份**整份盖回旧值**（`lib/store.ts` 的注释里把这条
+   * 当成已知风险写着，却漏了链接页这一处订阅）。
+   *
+   * # 为什么 `folders` 不用在这里处理
+   *
+   * 文件夹有它自己的订阅（`lib/folders-ui.tsx:160-180`，按
+   * `what.includes("folders")` 重拉）。两处各管各的数据，不重复拉。
+   *
+   * 照抄备忘 / 计时器那两处的卸载退订：订阅是异步的，回调到达时
+   * 组件可能已经卸载，那就立刻退订，否则监听器会一直挂在后端上。
+   */
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: UnlistenFn | undefined;
+
+    void onStateChanged((what) => {
+      if (disposed || !what.includes("links")) return;
+      void reload();
+    })
+      .then((off) => {
+        if (disposed) off();
+        else unlisten = off;
+      })
+      .catch(() => {
+        /* 订阅不上只影响跨窗口同步，不该影响界面 */
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [reload]);
+
   // ---- 文件夹与缩放 ----
 
   /**
@@ -423,6 +477,12 @@ export function LinksPanel() {
 
   const folders = useFolders("links", { moveItems });
   const zoom = useZoom("links");
+
+  /** 右键菜单（和右上角「⋯」菜单是两套，互不干扰）。 */
+  const ctx = useContextMenu();
+  /** 定位高亮：短暂 + 一交互就灭，见 lib/context-menu.tsx 的 useFocusHighlight。 */
+  const focus = useFocusHighlight();
+  const { target: pending, done: focusDone } = usePendingFocus("links");
 
   /**
    * 当前文件夹里该显示的链接。
@@ -778,6 +838,98 @@ export function LinksPanel() {
     if ((link.folderId ?? null) === folderId) return;
     await persist({ ...link, folderId }, `已移动「${link.name}」`);
   };
+
+  /**
+   * 一条链接在右键菜单里的动作。
+   *
+   * 和右上角那个「⋯」菜单的关系：两者**内容有重叠**（编辑 / 移动到 / 删除），
+   * 这是刻意的。「⋯」是鼠标悬停就出现、位置贴着格子的固定入口（用户知道
+   * 那儿有菜单），右键是"在任何位置都能就地操作"的第二条路 ——
+   * 只有 420px 宽的面板里，格子可能被拖到最右边，专门去够那个「⋯」
+   * 反而费事。
+   *
+   * 多了「打开」和「复制地址」两项：右键是"我要对这一条做点什么"，
+   * 而这两个正是链接最常用的动作（「⋯」菜单里没有，因为它原来只有
+   * "改和删"这一类管理动作）。
+   */
+  const linkMenu = (link: LinkItem): ContextMenuItem[] => [
+    {
+      id: "open",
+      label: "打开",
+      icon: <LinkGlyph link={link} />,
+      onSelect: () => void launch(link),
+    },
+    {
+      id: "copy-target",
+      label: "复制地址",
+      icon: <Copy size={13} />,
+      hint: "Ctrl+C",
+      onSelect: () => {
+        void api.copyText(link.target).then((ok) => {
+          setNotice({
+            kind: ok ? "ok" : "error",
+            text: ok ? "已复制到剪贴板" : "复制失败，剪贴板可能被占用",
+          });
+        });
+      },
+    },
+    {
+      id: "edit",
+      label: "编辑",
+      icon: <Pencil size={13} />,
+      dividerBefore: true,
+      onSelect: () => startEdit(link),
+    },
+    {
+      id: "move",
+      label: "移动到…",
+      icon: <FolderInput size={13} />,
+      onSelect: () => setMovingId(link.id),
+    },
+    {
+      id: "delete",
+      label: "删除",
+      icon: <Trash2 size={13} />,
+      danger: true,
+      dividerBefore: true,
+      onSelect: () => void remove(link),
+    },
+  ];
+
+  /**
+   * 收到搜索定位请求：进文件夹 → 滚到可见 → 高亮 →（需要时）打开编辑器。
+   *
+   * 链接页的"打开编辑器"是**就地编辑**（格子里直接变成输入框），
+   * 不是另开一层表单 —— 所以 `pending.open` 走 `startEdit`，
+   * 和用户点「⋯」→「编辑」是同一条路。
+   *
+   * # ⚠️ 为什么必须等 `folders.loading` **和** `loading`
+   *
+   * 从别的页签按回车跳过来时本页是刚挂载的：`links` 初值 `[]`、
+   * 文件夹列表还在异步路上。不等就消费请求的话，`links.find(...)` 拿到
+   * `undefined` → **就地编辑器打不开**，而且 `focusDone()` 已经把请求
+   * 消费掉，数据回来也不会再跑 —— 症状就是"按了回车没反应"。
+   * 两个守卫都必须在 `done()` 之前，而且都要进依赖。
+   */
+  useEffect(() => {
+    if (!pending) return;
+    if (folders.loading || loading) return;
+
+    const folder = folderToEnter(pending);
+    if (folder.known) folders.enter(folder.folderId);
+
+    focus.show(highlightFrom(pending));
+    scrollIntoViewSoon(focusDomId(FOCUS_DOM_PREFIX, pending.id));
+
+    if (pending.open) {
+      const found = links.find((l) => l.id === pending.id);
+      if (found) startEdit(found);
+    }
+
+    focusDone();
+    // 理由同片段页：`folders` 每次渲染都是新对象，进依赖会让 effect 每渲染跑一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending, folders.loading, loading]);
 
   // ---- 就地编辑（名字 / 目标 / 启动参数）----
 
@@ -1160,13 +1312,18 @@ export function LinksPanel() {
           return (
             <article
               key={link.id}
+              id={focusDomId(FOCUS_DOM_PREFIX, link.id)}
               className={[
                 "links__tile",
                 busyId === link.id ? "links__tile--busy" : "",
+                isHighlighted(focus.highlight, link.id) ? "links__tile--focus" : "",
               ]
                 .filter(Boolean)
                 .join(" ")}
               title={link.args ? `${link.target}\n参数：${link.args}` : link.target}
+              // 右键：打开 / 复制地址 / 编辑 / 移动到… / 删除。
+              // 和右上角「⋯」菜单内容有重叠是刻意的（见 linkMenu 的说明）。
+              onContextMenu={(e) => ctx.open(e, () => linkMenu(link))}
               {...drag.itemProps(link.id)}
             >
               <button
@@ -1269,6 +1426,11 @@ export function LinksPanel() {
           }}
         />
       )}
+
+      {/* 右键菜单。和上面的「⋯」菜单是两套，同时最多只该开一个：
+          `ctx.open` 里会先关掉自己那一套，而点「⋯」时 `startEdit` / 移动 / 删除
+          都会把 `menu` 清掉（见各自的 onSelect）。 */}
+      {ctx.menu}
     </div>
   );
 }
@@ -1366,6 +1528,14 @@ function LinkMenu({
       style={{ left: pos?.left ?? 0, top: pos?.top ?? 0, visibility: pos ? "visible" : "hidden" }}
       // 菜单内部的点击不该冒泡到别处（例如格子的"点开"）
       onClick={(e) => e.stopPropagation()}
+      // 在这个菜单上再右键**不要**把第二个菜单（全应用共用的那个右键菜单）
+      // 也弹出来。不拦的话会出现两个菜单同时开着，而 Esc 只会关掉这一个
+      // （它的 document 捕获监听器先跑并 stopPropagation，另一个菜单的
+      // React 处理器就收不到事件了）—— 另一个只能靠点别处关掉。
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }}
     >
       {/* 把整条名字显示出来：格子里的名字最多两行、会被截断，
           这里是用户唯一能看到全名的地方 */}

@@ -7,8 +7,19 @@
  * 它属于文本片段而不是备忘录，再切过去，再在那一页里搜。东西一多，
  * "我记得记过但想不起来记在哪"就成了最大的摩擦。
  *
- * 这个面板把四类数据放在一起搜，并且**回车直接执行主操作**——
- * 搜到片段就粘贴到光标处，搜到链接就打开，不用先切页签再点。
+ * 这个面板把四类数据放在一起搜，并且**回车直接跳到那一条并把它打开** ——
+ * 不用先切页签、也不用在目标页里再找一遍。
+ *
+ * # 三个键各自做什么
+ *
+ * - `Enter` = **去那里把它打开**（片段 / 备忘 / 计时器打开编辑器；链接只定位高亮，
+ *   因为链接的"打开"是启动程序，那是它的主动作）
+ * - `Ctrl+Enter` = **执行这个条目的主动作**（片段 → 键入到光标；链接 → 启动；
+ *   备忘 / 计时器 → 打开编辑器）
+ * - `Shift+Enter` = **复制这一条的内容到剪贴板**
+ *
+ * 这张表在 `lib/navigation.ts` 的 `paletteActions()` 里，底部提示条和键盘处理
+ * **共用同一份数据** —— 两边各写一套的话，迟早出现"提示条上写着能按、按下去却没反应"。
  *
  * # 为什么是浮层而不是第五个页签
  *
@@ -34,6 +45,16 @@ import {
 import type { LucideIcon } from "lucide-react";
 
 import { api, type LinkItem, type Memo, type Snippet, type Timer } from "./api";
+import {
+  actionForKey,
+  featureOfKind,
+  focusTargetOf,
+  paletteActions,
+  paletteKeyOf,
+  type FocusRequestInput,
+  type PaletteActionKind,
+  type PaletteKey,
+} from "./navigation";
 import { searchAll, type SearchData, type SearchHit, type SearchKind } from "./search";
 
 import "./command-palette.css";
@@ -54,24 +75,6 @@ const KIND_LABEL: Record<SearchKind, string> = {
   timer: "计时",
 };
 
-/**
- * 回车会做什么。显示在底部提示里 —— 不然用户不知道按下去会发生什么。
- *
- * ⚠️ 这里的文案必须与**实际行为**一致。原来 memo / timer 写的是
- * 「去备忘看这一天」「去计时器看这条」，但实现只是 `setActiveId` 切了个页签 ——
- * 备忘页仍然停在今天、计时器页也不会定位到那一条，用户按提示操作后
- * 发现"点了没反应"，只能自己再搜一次。
- *
- * 要恢复那种文案，得先让 `onNavigate` 带上定位信息（备忘的日期 / 计时器的 id）
- * 并让两个页面接住它。在那之前，文案只能说它真正做的事。
- */
-const ACTION_LABEL: Record<SearchKind, string> = {
-  snippet: "粘贴到光标处",
-  link: "打开",
-  memo: "切到备忘页",
-  timer: "切到计时器页",
-};
-
 /** 四份原始数据。搜索结果只带 `id`，执行动作时要回来取完整对象。 */
 interface RawData {
   snippets: Snippet[];
@@ -83,8 +86,13 @@ interface RawData {
 export interface CommandPaletteProps {
   /** 关闭面板。 */
   onClose: () => void;
-  /** 切到某个页签（备忘 / 计时器的结果用得上）。 */
-  onNavigate: (featureId: string) => void;
+  /**
+   * 切到某个页签并**定位到某一条**。
+   *
+   * 位置信息（`folderId` / `date`）必须一起带过去：光切页签的话，目标页可能正停在
+   * 别的文件夹或别的日期上，那一条根本不在列表里 —— 用户看到的是"按了回车没反应"。
+   */
+  onNavigate: (featureId: string, target: FocusRequestInput) => void;
 }
 
 export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
@@ -209,21 +217,56 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
   // ---- 执行 ----
 
   const run = useCallback(
-    async (hit: SearchHit) => {
+    async (hit: SearchHit, action: PaletteActionKind) => {
       if (!raw || busy) return;
 
-      // 同一条片段刚粘过、警告还在屏幕上时，回车别再粘一次（会在目标程序里
+      // 同一条片段刚「键入到光标」过、警告还在屏幕上时，别再粘一次（会在目标程序里
       // 留下两份内容）。
       //
-      // ⚠️ 必须挡在 `setError(null)` **之前**：挡在后面的话，第二次回车会先把
+      // 只对主动作成立：跳转 / 复制重复执行最多是多跳一次、多复制一次，没有破坏性。
+      //
+      // ⚠️ 必须挡在 `setError(null)` **之前**：挡在后面的话，第二次按键会先把
       // 那条"剪贴板原文已被替换、无法还原"的警告**清掉**，然后什么都不做 ——
       // 用户看到警告消失却没有任何反馈，只会更糊涂。
-      if (justPastedId.current === hit.id) return;
+      if (action === "primary" && justPastedId.current === hit.id) return;
 
       setBusy(true);
       setError(null);
 
       try {
+        // ---- 跳转：只定位 / 定位 + 打开 ----
+        if (action === "focus" || action === "open") {
+          onNavigate(featureOfKind(hit.kind), focusTargetOf(hit, action === "open"));
+          onClose();
+          return;
+        }
+
+        // ---- 复制这一条的内容 ----
+        if (action === "copy") {
+          const text =
+            hit.kind === "snippet"
+              ? raw.snippets.find((s) => s.id === hit.id)?.content
+              : raw.links.find((l) => l.id === hit.id)?.target;
+          // 数据可能在这几百毫秒里被删掉了（多窗口下最常见的成因：另一个面板
+          // 刚把它删了）。这时**必须说一句**，不能默默 return：
+          // - 复制一段空文本更糟，会把用户剪贴板里原来的东西**静默清掉**；
+          // - 什么都不做的话，用户按了键、界面毫无反应，只能以为软件坏了。
+          //   用户这一轮抱怨的原始 bug 就是「按了没反应」。
+          if (text === undefined) {
+            setError({ text: "这条已经不存在了（可能在别的窗口里被删掉）", kind: "fail" });
+            return;
+          }
+          if (await api.copyText(text)) {
+            onClose();
+            return;
+          }
+          setError({ text: "复制失败，没能写进剪贴板", kind: "fail" });
+          return;
+        }
+
+        // ---- 主动作 ----
+        // 走到这里 action 只可能是 "primary"（"none" 根本不会被派发进来）。
+        // 这一档才需要看类型：每一类的主动作本来就不同，这是它存在的意义。
         if (hit.kind === "snippet") {
           const snippet = raw.snippets.find((s) => s.id === hit.id);
           if (!snippet) return;
@@ -238,9 +281,9 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
               // （剪贴板里原来是图片/文件、已被替换且无法还原）。
               //
               // 两个都不能做：直接 onClose() 会把警告丢掉；用红色"失败"样式
-              // 又会让用户以为没粘上、**再按一次回车** —— 第二次会真的再粘一遍。
+              // 又会让用户以为没粘上、**再按一次** —— 第二次会真的再粘一遍。
               //
-              // 所以用中性的警示样式，并用 `justPastedId` 挡住重复回车。
+              // 所以用中性的警示样式，并用 `justPastedId` 挡住重复按键。
               // ⚠️ **不要用 `setQuery("")` 来挡**：它在这行 `await` **之后**才执行，
               // 会把用户在等待期间新敲进搜索框的字一起清掉（输入框一直有焦点，
               // 粘贴要花上百毫秒到几秒），用户会看到自己刚打的字凭空消失。
@@ -266,8 +309,8 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
           return;
         }
 
-        // 备忘和计时器没有"一句话就能做完"的动作，切到对应页签最实在
-        onNavigate(hit.kind === "memo" ? "memo" : "timer");
+        // 备忘和计时器没有"一句话就能做完"的动作，打开编辑器最实在
+        onNavigate(featureOfKind(hit.kind), focusTargetOf(hit, true));
         onClose();
       } catch (err) {
         setError({ text: String(err), kind: "fail" });
@@ -278,9 +321,26 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
     [raw, busy, onClose, onNavigate],
   );
 
+  /**
+   * 按某个键做那一档动作。
+   *
+   * **分支里不再自己判断 `kind`** —— "哪个键 + 哪种结果 = 干什么"全部由
+   * `lib/navigation.ts` 的 `actionForKey` 决定（那边有单测钉着）。
+   * 这里只负责分发；`none` 表示这一类型上没有这个动作，什么都不做。
+   */
+  const act = useCallback(
+    (hit: SearchHit, key: PaletteKey) => {
+      const action = actionForKey(key, hit.kind);
+      if (action === "none") return;
+      void run(hit, action);
+    },
+    [run],
+  );
+
   // `hits` 在 render 期重算，而"把 cursor 归零"发生在 effect 里（commit 之后）。
   // 所以 query 变短的那一帧 `hits[cursor]` 可能是 undefined：高亮消失、
-  // 页脚的回车提示退化成"执行"，用户看不出回车到底会做什么。用派生值兜住这一帧。
+  // 底部的动作提示退化成"输入关键词开始搜索"，用户看不出按回车会发生什么。
+  // 用派生值兜住这一帧。
   const current = hits[cursor < hits.length ? cursor : 0];
 
   /** 当前高亮那一行，用来把它滚进可视区。 */
@@ -290,8 +350,8 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
    * 键盘移动选中项时，必须把它滚进可视区。
    *
    * 不滚的话，结果超过一屏之后高亮行会移出视口 —— 界面上看起来"选中项消失了"，
-   * 而 Enter 执行的**正是那条看不见的结果**。对文本片段来说，这意味着把内容
-   * 粘贴到一个用户根本没看见的条目上：一个看不见的破坏性动作。
+   * 而回车执行的**正是那条看不见的结果**。对片段来说，`Ctrl+回车` 意味着把内容
+   * 键入到一个用户根本没看见的条目上：一个看不见的破坏性动作。
    */
   useEffect(() => {
     activeRowRef.current?.scrollIntoView({ block: "nearest" });
@@ -317,7 +377,9 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
             autoFocus
             spellCheck={false}
             value={query}
-            placeholder="搜索文本片段、链接、备忘、计时器…"
+            // 列的是四个**页签名**，所以跟着页签一起改名：
+            // 「文本」已经叫「笔记」了，这里还写旧名会让用户以为搜的是别的东西
+            placeholder="搜索笔记、链接、备忘、计时器…"
             // 焦点始终在这个输入框上（行本身不可聚焦），所以要用
             // aria-activedescendant 把"当前选中哪一行"告诉屏幕阅读器 ——
             // 只给行挂 role="option"/aria-selected 是断链的，读屏用户
@@ -342,7 +404,15 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
                 move(-1);
               } else if (e.key === "Enter") {
                 e.preventDefault();
-                if (current) void run(current);
+                if (!current) return;
+                // 按的是哪一档**由 `actionForKey` 决定**，这里不再自己判断类型：
+                // 两边各写一套迟早对不上，表现成"提示条上写着能按、按下去却没反应"。
+                // 这一类型上没有这个动作时（例如备忘上的 Shift+回车）什么都不做 ——
+                // 提示条上也不会列出它。
+                act(
+                  current,
+                  paletteKeyOf({ ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey }),
+                );
               }
             }}
           />
@@ -385,7 +455,10 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
                 onMouseEnter={() => setCursor(i)}
                 // 按下时不让输入框失焦：失焦之后上下键就选不动了
                 onMouseDown={(e) => e.preventDefault()}
-                onClick={() => void run(hit)}
+                // 点一行 = 按回车那一档（"去那里把它打开"）。
+                // 鼠标点是最容易误触的入口，得让它做**最可预期**的那件事 ——
+                // 而不是"复制"或"键入到光标"。
+                onClick={() => act(hit, "Enter")}
               >
                 <Icon size={14} className="palette__rowicon" />
                 <span className="palette__text">
@@ -398,13 +471,37 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
           })}
         </div>
 
+        {/*
+          底部提示条分两行：
+          第一行是**当前选中项真正能按的动作**（按类型不同而不同），
+          第二行是通用按键（上下选择 / Esc 关闭）和结果条数。
+
+          原来只有一行、而且文案是写死的「切到备忘页」—— 那是"实现只做了切页签"
+          时用来兜底的实话。现在定位真的带位置了，提示条也就该说它真正做的事。
+
+          两行而不是一行：三档按键的文案在 380px 宽的浮层里一行排不下，
+          挤在一起会换行成锯齿状，反而更难读。
+        */}
         <div className="palette__foot">
+          <span className="palette__actions">
+            {current ? (
+              paletteActions(current.kind).map((a) => (
+                <span className="palette__action" key={a.id}>
+                  <kbd>{a.key}</kbd> {a.label}
+                </span>
+              ))
+            ) : (
+              // 没有选中项（还没输入关键词）时说清"下一步做什么"，
+              // 而不是留一片空白让用户猜
+              <span className="palette__action">输入关键词开始搜索</span>
+            )}
+          </span>
+
           <span className="palette__keys">
             <kbd>↑</kbd>
-            <kbd>↓</kbd> 选择 · <kbd>Enter</kbd> {current ? ACTION_LABEL[current.kind] : "执行"} ·{" "}
-            <kbd>Esc</kbd> 关闭
+            <kbd>↓</kbd> 选择 · <kbd>Esc</kbd> 关闭
+            {hits.length > 0 && <span className="palette__count">{hits.length} 条</span>}
           </span>
-          {hits.length > 0 && <span className="palette__count">{hits.length} 条</span>}
         </div>
       </div>
     </div>

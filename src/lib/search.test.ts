@@ -143,6 +143,56 @@ describe("命中范围", () => {
   });
 });
 
+describe("定位字段", () => {
+  it("片段的 folderId 被带出来", () => {
+    // 光有 id 定位不了：条目分散在文件夹里，目标页签切过去时可能停在别的文件夹，
+    // 那条根本不在当前列表里 —— 用户看到的是"按了回车没反应"
+    const d = data({ snippets: [snip("s", { title: "账号", folderId: "f1" })] });
+    expect(searchAll("账号", d)[0].folderId).toBe("f1");
+  });
+
+  it("顶层条目的 folderId 是 null，不是 undefined", () => {
+    // 让"顶层"始终是一个明确的值，调用方不用每处都写 `?? null`
+    const d = data({ snippets: [snip("s", { title: "账号", folderId: null })] });
+    expect(searchAll("账号", d)[0].folderId).toBeNull();
+  });
+
+  it("老数据没有 folderId 字段时也补成 null", () => {
+    // `Snippet.folderId` 是后加字段，老数据里没有这一项，读出来是 undefined
+    const d = data({ snippets: [snip("s", { title: "账号" })] });
+    expect(searchAll("账号", d)[0].folderId).toBeNull();
+  });
+
+  it("链接的 folderId 被带出来", () => {
+    const d = data({ links: [{ id: "l", name: "记事本", target: "", folderId: "f2" }] });
+    expect(searchAll("记事本", d)[0].folderId).toBe("f2");
+  });
+
+  it("计时器的 folderId 被带出来", () => {
+    const d = data({
+      timers: [{ id: "t", name: "煮蛋", kind: "countdown", folderId: "f3" }],
+    });
+    expect(searchAll("煮蛋", d)[0].folderId).toBe("f3");
+  });
+
+  it("备忘带出结构化的日期，而不是只有拼好的显示文本", () => {
+    // 原来日期只拼进 detail；定位要靠它，必须单独带一份
+    const d = data({
+      memos: [{ id: "m", date: "2026-09-25", title: "交材料", body: "带章", tags: [] }],
+    });
+    const [hit] = searchAll("交材料", d);
+    expect(hit.date).toBe("2026-09-25");
+    expect(hit.detail).toContain("2026-09-25");
+  });
+
+  it("备忘不带 folderId —— 它的组织维度是日期，没有文件夹", () => {
+    const d = data({
+      memos: [{ id: "m", date: "2026-09-25", title: "交材料", body: "", tags: [] }],
+    });
+    expect(searchAll("交材料", d)[0].folderId).toBeUndefined();
+  });
+});
+
 describe("敏感内容", () => {
   it("敏感片段在搜索结果里同样被遮罩", () => {
     // 不遮的话 Ctrl+K 就成了绕过列表遮罩的后门，

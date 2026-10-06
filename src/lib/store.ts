@@ -24,19 +24,65 @@
  * （见 `merge-by-id.ts`），再写合并结果。没有收到过外部改动时一行都不变 ——
  * 单窗口场景仍然是"直接写 `latest.current`、不多读一次盘"。
  *
- * ## 仍然可能丢的情形（诚实列出）
+ * ## 仍然可能丢的情形（诚实列出，不是"已经彻底解决"）
  *
- * - **读盘失败 / 文件形状不对**：合并没法做，只能退回"直接写自己那份"，
- *   别处的改动这一次就保不住了（但绝不因此不写 —— 不写会丢掉用户自己的东西）。
- * - **两边改了同一条**：按规则**本地赢**，远端那次修改会丢。它已经落过盘，
- *   但会被我们这一份覆盖。要彻底解决得让每条记录带上版本号 / 合并策略，
- *   那是数据模型级别的改动。
- * - **导入备份时正好有一次写盘在飞**：`yieldToReplacedFile` 能取消"还没开始写"
- *   的那一次（清定时器 + 清 dirty），但已经发出去的 IPC 拦不住 —— 它会带着
- *   导入前的旧数据落地，把刚导入的 `snippets.json` 盖回去。窗口只有一次
- *   IPC 往返那么宽（毫秒级），而且下一次任何写盘都会把内存那份（导入后的）写回去。
- * - **窗口被强制杀掉**（任务管理器结束进程）：防抖窗口内没落盘的改动本来就丢，
- *   与合并无关。
+ * 下面每一条都是**已知的、刻意保留的**残留。改这块代码之前请先读完，
+ * 别把"已知残留"当成"没做"又去修一遍（或者更糟：以为不存在）。
+ *
+ * ### 1. 读-合并-写之间的毫秒级窗口（无法用前端锁消除）
+ *
+ * 慢路径是「`readData` → 合并 → `writeData`」三步。中间**没有锁** ——
+ * Rust 侧 `write_data` 的注释原文就写着"这把锁只串行化写盘，读取完全不受影响"。
+ * 所以另一个窗口在这三步之间落盘的内容，会被我们的合并结果整份盖掉。
+ *
+ * 窗口从"整个打字过程"缩到了毫秒级，但**没有消除**。
+ * 根治要么给 `read_data` 带上世代号、由 `write_data` 在锁内比对（乐观并发），
+ * 要么把整个读-合并-写搬进 Rust。**队长裁决本轮不做**：那是数据层换模型，
+ * 风险比它修的那个毫秒级窗口大。详见 CHANGELOG 的「已知限制」。
+ *
+ * ### 2. 两边改了同一条
+ *
+ * 两边都带数字 `updatedAt` 时取**较新**的那次编辑；分不出先后（只有一边带、
+ * 类型不对、同一毫秒）时**本地赢**。注意只有 `Snippet` 与 `Memo` 有 `updatedAt`
+ * —— `Timer` / `LinkItem` / `Folder` 都没有，它们永远走"本地赢"。
+ * 无论哪种，被盖掉的那一次修改会丢 —— 一条记录只有一个版本，
+ * 要两边都留住得做逐字段合并或版本历史，那是数据模型级别的改动。
+ * 这条规则的边界（包括"正在编辑的那一侧是否总是较新"）写在 `merge-by-id.ts`
+ * 的 `preferNewer` 上。
+ *
+ * ### 3. 导入备份时"已经在飞"的那次写盘（拦不住）
+ *
+ * `yieldToReplacedFile` 能取消**还没发出**的那次写盘（清定时器 + 清 dirty），
+ * 但已经发出去的 IPC 拦不住 —— 它会带着导入前的数据落地，可能把刚导入的
+ * `snippets.json` 盖回去。
+ *
+ * ⚠️ 这种时序的**结果是不确定的**，前端也判定不出来：
+ * 我们读回导入结果和那次写盘落地**谁先谁后**决定了两件不同的事 ——
+ * - 读在写之前 → 内存是导入后的数据，磁盘随后被旧数据盖掉；
+ * - 读在写之后 → 内存和磁盘**都是导入前的旧数据**。
+ *
+ * 后一种情况下，用户看到的是"导入好像没生效"，而且没有任何提示。
+ * 前端能做的只是"下次写盘时把内存那份写回去"，但内存那份**不保证**是导入后的
+ * （见上）。要可靠地判定，只能靠 Rust 侧的世代号校验（同第 1 条的根治方案）。
+ *
+ * 发起导入的那个窗口自己也会踩这个坑，而且它连 `force` 广播都收不到
+ * （广播只发给别的窗口）—— 所以 `settings/index.tsx` 的导入流程会**自己先让位**。
+ *
+ * ### 4. 读盘失败 / 文件形状不对
+ *
+ * 合并没法做，只能退回"直接写自己那份"，别处的改动这一次就保不住了。
+ * 但绝不因此不写 —— 不写会丢掉用户自己的东西。
+ *
+ * ### 5. 窗口被强制杀掉（任务管理器结束进程）
+ *
+ * 防抖窗口内（400ms）没落盘的改动本来就丢，与合并无关。
+ *
+ * ### 6. 已知但**不修**：`sameValue` 对"多一个 `undefined` 值的键"判成不同
+ *
+ * `{"a":1}` 与 `{"a":1,"b":undefined}` 会被判成"改过了"。审查员把它标为
+ * **推测、未构造出反例**，而且对 `snippets.json` 不可达 —— JSON 里没有
+ * `undefined` 这个值（`JSON.parse` 不会产出它）。**刻意不修**：
+ * 为一条不可达的路径给深比较加分支，只会让这段最容易出错的代码更难读。
  */
 import { useEffect, useRef, useState, useCallback } from "react";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -48,6 +94,18 @@ import { WriteCoordinator } from "./write-coordinator";
 
 /** 写入防抖延迟。太短会频繁写盘，太长会在异常退出时丢更多数据。 */
 const WRITE_DEBOUNCE_MS = 400;
+
+/**
+ * `flushAll` 最多等多久。
+ *
+ * 为什么要超时：关窗口和导入备份都在等它，而**一次永不返回的写盘会让调用方
+ * 永远卡住** —— 用户点了「覆盖导入，无法撤销」，界面一直 busy、导入永远不开始、
+ * 也没有任何提示。那是典型的"卡死且不解释"。
+ *
+ * 3 秒是取舍：正常的写盘是毫秒级，磁盘慢（机械盘 + 杀软扫描）也就几百毫秒；
+ * 超过 3 秒说明这一次写盘大概率有问题，不该再让用户干等。
+ */
+const FLUSH_ALL_TIMEOUT_MS = 3000;
 
 // ===============================================================
 // 跨窗口同步
@@ -134,13 +192,22 @@ export async function emitDataChanged(file: string, force = false): Promise<void
  *
  * 1. `fuguang:data-changed`（`file: "*"`）：走 `usePersistentState` 的那些
  *    （目前是 `snippets.json`）会重新读盘；
- * 2. `state-changed`：备忘 / 计时器 / 链接页各自持有一份**自己的**内存状态，
- *    它们订阅的是 Rust 侧那条既有的事件（`what` 里点名了哪几类数据变了，
- *    见 `main.tsx` 与两个功能页的订阅）。
+ * 2. `state-changed`：备忘 / 计时器 / 链接页 / 文件夹各自持有一份**自己的**
+ *    内存状态，它们订阅的是 Rust 侧那条既有的事件（`what` 里点名了哪几类数据变了，
+ *    见 `main.tsx` 与各功能页的订阅）。文件夹那一份在 `lib/folders-ui.tsx` 的
+ *    `useFolders` 里（三个用到文件夹的页签共用同一套）；`snippets` 不走这条，
+ *    它走上面第 1 条。
+ *
+ *    ⚠️ 改这个 `what` 数组时请同步确认那几处还在听 —— 少一项就是"某个页签在别的
+ *    窗口里永远是旧的"，而用户会以为导入没生效。
  *
  * 只发第 1 条的话，别的面板窗口会一直显示导入前那份，而且它下一次保存就会把
  * 刚恢复的备份**整份写回旧值** —— Rust 侧的写锁拦不住这个（它只串行化写盘，
  * 内容本身就是旧的）。
+ *
+ * ⚠️ 这条广播**发不到发起导入的那个窗口自己**（它就在发消息的窗口里，而
+ * `decideExternalChange` 会忽略自己发的）。所以发起方必须自己让位 ——
+ * 见 `settings/index.tsx` 的导入流程（先 `flushAll()` 再 `importAll`）。
  *
  * `force: true`：用户刚在确认框上点了「覆盖导入，无法撤销」，
  * 这时候别的窗口里没落盘的改动也该让位。
@@ -270,6 +337,121 @@ export function shouldAdoptMerge<T>(localAtMerge: T, localNow: T): boolean {
   return localNow === localAtMerge;
 }
 
+/** 读盘回来之后该怎么做。 */
+export type ReloadDecision =
+  /** 采纳磁盘上那一份。 */
+  | "adopt"
+  /** 读盘期间我们自己的写盘落地了 —— 读到的可能比磁盘还旧，重读一次。 */
+  | "retry"
+  /** 读盘期间真的敲了字 —— 不能采纳（会删掉刚敲的），留给下一次写盘之后再读。 */
+  | "defer";
+
+/**
+ * 读盘回来之后，这次读到的值该不该采纳。
+ *
+ * 抽成纯函数是因为三种情况的判据**互相很像、错一种就静默丢数据**：
+ *
+ * | 读盘期间发生了什么 | 判据 | 结论 |
+ * |---|---|---|
+ * | 用户真的敲了字 | `coord.revision` 变了 | `defer`（读到的值里没有那几个字） |
+ * | 我们自己的写盘落地了 | `writeGen` 变了 | `retry`（读到的可能比磁盘还旧） |
+ * | 什么都没发生 | 两个都没变 | `adopt` |
+ *
+ * ⚠️ 第一行**不能**用 `dirty` 布尔来判断：读盘期间那次改动若已经落盘，`dirty`
+ * 会变回假，于是"期间真的改过"这件事被掩盖掉，读到的旧值就会盖掉用户刚敲的字
+ * （而且因为 `dirty` 是假的，不会再补写一次）。版本号只增不减，掩盖不了。
+ */
+export function decideReload(args: {
+  /** 发 `readData` **之前**记下的本地改动版本号。 */
+  revisionAtRead: number;
+  /** 读回来之后本地改动版本号。 */
+  revisionNow: number;
+  /** 发 `readData` 之前记下的写盘成功次数。 */
+  writeGenAtRead: number;
+  /** 读回来之后的写盘成功次数。 */
+  writeGenNow: number;
+}): ReloadDecision {
+  if (args.revisionNow !== args.revisionAtRead) return "defer";
+  if (args.writeGenNow !== args.writeGenAtRead) return "retry";
+  return "adopt";
+}
+
+// ===============================================================
+// 关窗口之前把挂起的写盘催一遍
+// ===============================================================
+
+/**
+ * 已挂载的 `usePersistentState` 的「立即落盘」回调。
+ *
+ * # 为什么需要它
+ *
+ * 兜底落盘原来挂在 `beforeunload` / `visibilitychange` / 组件卸载上。
+ * 但**销毁窗口**（`close_panel` → `destroy()`）不一定跑得到那三个钩子 ——
+ * 用户在面板里刚敲完字（400ms 防抖还没到点）就点 ✕，**最后几个字就没了，
+ * 而且一句话都不说**。
+ *
+ * 所以关窗口之前主动催一次。用登记表而不是让 `PanelWindow` 去 `import`
+ * 某个具体数据文件：面板外壳不该知道有几个数据文件、分别叫什么。
+ */
+const flushers = new Set<() => Promise<boolean>>();
+
+/**
+ * 登记一个「立即落盘」回调，返回注销函数。
+ *
+ * `usePersistentState` 在挂载时登记、卸载时注销 —— 注销一定要做，
+ * 否则面板被销毁后登记表里会留着指向已卸载组件的回调（内存泄漏）。
+ */
+export function registerFlush(fn: () => Promise<boolean>): () => void {
+  flushers.add(fn);
+  return () => {
+    flushers.delete(fn);
+  };
+}
+
+/**
+ * 把所有已挂载的数据都催一次落盘。
+ *
+ * 它**只是把已经挂起的写盘跑完**：每个 `flush()` 自己会判断"有没有待写内容"，
+ * 没有就立刻返回成功。所以它不会平白多读一次盘、也不会写多余的东西。
+ * `flush()` 自己的契约没变（仍然如实回答"存上了没有"）。
+ *
+ * @param timeoutMs 最多等多久，默认 {@link FLUSH_ALL_TIMEOUT_MS}。**到点就放行**
+ *   （返回 `false`），不让调用方无限期卡住。
+ * @returns 是不是全都存下来了。超时也算 `false`。
+ *   ⚠️ 调用方**不该**因为它是 `false` 就不关窗口 / 不导入 ——
+ *   关不掉比丢几个字更烦人；但**必须让用户看见**，不能静默放行
+ *   （见 `PanelWindow` 的 `closeOrHide` 与 `settings` 的导入流程）。
+ */
+export async function flushAll(
+  timeoutMs: number = FLUSH_ALL_TIMEOUT_MS,
+): Promise<boolean> {
+  const all = Promise.all(
+    [...flushers].map((flush) =>
+      // 单个失败不该拖垮其余的：一个面板的磁盘错误不该让另一个面板的数据也不落盘
+      flush().catch(() => false),
+    ),
+  ).then((results) => results.every(Boolean));
+
+  // 超时**不取消**那次写盘（它可能只是慢，硬砍会留下一个写到一半的文件），
+  // 只是不再等它 —— 放行给调用方，由调用方把"有东西没落盘"告诉用户。
+  //
+  // 这里用**全局的** `setTimeout` / `clearTimeout` 而不是这个文件别处的
+  // `window.setTimeout`：这个函数会被单测直接调用，而测试跑在 node 环境
+  // （没有 `window`）。`ReturnType<typeof setTimeout>` 在浏览器里是 `number`、
+  // 在 node 里是 `Timeout`，两边都对，不需要任何断言。
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([all, timeout]);
+  } finally {
+    // 别留一个空转的定时器（写盘先回来时它还在跑）
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
 /**
  * 把一份数据绑定到磁盘上的一个 JSON 文件。
  *
@@ -357,42 +539,52 @@ export function usePersistentState<T>(
    * 调用时机：收到"别处改了"的广播且本地没有未落盘的改动；以及那个广播被推迟到
    * 本地落盘完成之后（见 `flush` 的成功分支）。
    *
-   * # 为什么最多读两次
+   * # 判据是版本号，不是 `dirty` 布尔
    *
-   * 读盘是异步的，而写盘也是。可能出现"读在写之前发出、写却先落地"：
-   * 这时读回来的内容是**写之前**的磁盘，比我们手里那份还旧。判据是
-   * {@link writeGen} 有没有变。撞上就重读一次 —— 第二次读到的是写完之后的内容。
-   * 两次都撞上（极小概率）就不采纳，只留一个"待重拉"，等下一次写盘之后再读。
+   * 读盘是异步的，而写盘也是。三种情况必须分开（见 {@link decideReload}）：
+   *
+   * - 读盘期间**真的敲了字**（`coord.revision` 变了）→ 不能采纳：读到的值里没有
+   *   那几个字，采纳等于把它们删掉。判据**不能**用 `dirty` 布尔 —— 那次改动若
+   *   在读盘期间落盘了，`dirty` 会变回假，于是"期间真的改过"这件事被掩盖掉。
+   * - 读盘期间**我们自己的写盘**落地了（`writeGen` 变了）→ 读到的可能比磁盘还旧
+   *   （读在写之前发出、写却先落地），**重读一次**。
+   * - 都没有 → 采纳。
+   *
+   * 最多读两次；两次都在"写盘落地"上撞车（极小概率）就不采纳，只留一个"待重拉"。
+   *
+   * # 这里为什么**不**弹提示
+   *
+   * 采纳磁盘上的值会让"本地有、磁盘没有"的条目消失。听起来该提醒用户一句，
+   * 但把所有能走到这里的路径列一遍就会发现：`reload` 只在**本地没有未落盘改动**
+   * 时才会被调用（`decideExternalChange` 的 `reload` 分支要求 `!dirty`，
+   * 另一处是 `flush` 成功之后）。也就是说我们手里那份和磁盘是一致的，
+   * 磁盘少了的条目只可能是**别的窗口删掉的** —— 那是同步在正常工作。
+   * 每删一条就在另一个窗口弹一句"有东西没了"，那是噪音，不是帮助。
+   *
+   * 真正会**静默丢掉用户自己东西**的地方是导入备份（本地没落盘的改动被覆盖），
+   * 提示加在那里，见 `yieldToReplacedFile`。
    */
   const reload = useCallback(async () => {
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const gen = writeGen.current;
-      // 读盘期间用户又敲了新东西的话，这次读到的值就**不该**采纳：
-      // 采纳等于把用户刚敲的丢掉。所以先记下当前状态，读完再比一次。
-      const wasDirty = coord.current.dirty;
+      const revisionAtRead = coord.current.revision;
+      const writeGenAtRead = writeGen.current;
 
       try {
         const loaded = await api.readData<T>(file);
         if (loaded === null || loaded === undefined) return;
 
-        /**
-         * 读盘期间**新冒出来**一次本地改动 → 这次读到的值不能采纳
-         * （采纳等于把用户刚敲的那几个字删掉）。
-         *
-         * ⚠️ 判据只能是"原来干净、现在脏了"。写成 `wasDirty !== dirty`（两边不等就放弃）
-         * 会漏掉"进来时就脏、读盘期间那次写盘落地"这种情况 —— 那不是"新改动"，
-         * 重读一次就能拿到可信的值（下面那一条）。
-         *
-         * 放弃时不是"不管了"：把"待重拉"记下来，等这次改动落盘之后（见 `flush`）
-         * 再读一遍，内存与磁盘最终会重新一致。
-         */
-        if (!wasDirty && coord.current.dirty) {
+        const decision = decideReload({
+          revisionAtRead,
+          revisionNow: coord.current.revision,
+          writeGenAtRead,
+          writeGenNow: writeGen.current,
+        });
+        if (decision === "defer") {
+          // 读盘期间真的敲了字：这次不采纳，等这次改动落盘之后（见 `flush`）再读
           reloadPending.current = true;
           return;
         }
-
-        // 读盘期间**我们自己的写盘**落地了 → 这次读到的值可能比磁盘还旧，重读
-        if (writeGen.current !== gen) continue;
+        if (decision === "retry") continue;
 
         if (shapeRef.current && !shapeRef.current(loaded)) {
           setError(
@@ -407,6 +599,13 @@ export function usePersistentState<T>(
         latest.current = loaded;
         base.current = loaded;
         reloadPending.current = false;
+        /**
+         * 采纳之后内存与磁盘一致，**之后的写盘不必再合并**。
+         *
+         * 这一行原来漏了：干净窗口收到广播 → `reload` 采纳 → `externalSeen`
+         * 还留着真 → 之后每一次写盘都白读一次盘（不是数据问题，是白干活）。
+         */
+        externalSeen.current = false;
         setValue(loaded);
         setError(null);
         return;
@@ -432,6 +631,14 @@ export function usePersistentState<T>(
    * "导入后的新数据"，于是**旧条目被合并回来**，用户看到自己刚清掉的东西又冒出来。
    */
   const yieldToReplacedFile = useCallback(async () => {
+    /**
+     * 这个窗口里有没有"还没存到磁盘"的改动。
+     *
+     * 要在清掉之前问，清完就问不出来了。它决定下面要不要给用户一句提示 ——
+     * 那些改动连磁盘都没到过，会被导入的数据直接盖掉，**不能静默**。
+     */
+    const hadPendingChanges = coord.current.dirty;
+
     // 1. 取消挂起的写盘。定时器清了，还要把"有未落盘改动"这个标记清掉 ——
     //    只清定时器是不够的：`dirty` 仍为真，下一次 `flush()` 照样会把旧数据写出去。
     if (timer.current !== null) {
@@ -440,21 +647,50 @@ export function usePersistentState<T>(
     }
     discardPendingWrite(coord.current);
 
-    // 2. 本地这份不再有任何价值，之后的写盘也不需要再合并（内存马上就是导入后的那份）
-    externalSeen.current = false;
-    reloadPending.current = false;
-
-    // 3. 把导入后的那一份读回来，同时替换内存与合并基底
+    // 2. 把导入后的那一份读回来，同时替换内存与合并基底
     try {
       const loaded = await api.readData<T>(file);
-      if (loaded === null || loaded === undefined) return;
-      if (shapeRef.current && !shapeRef.current(loaded)) return;
+      if (loaded === null || loaded === undefined) {
+        // 读不回来 → 内存里还是导入前那份，而用户以为导入成功了。必须说一句
+        setError("导入后的数据没能读回来，本窗口显示的仍是导入前的内容 —— 请重开这个窗口。");
+        return;
+      }
+      if (shapeRef.current && !shapeRef.current(loaded)) {
+        setError("导入后的数据形状不对（文件可能被改过），本窗口显示的仍是导入前的内容。");
+        return;
+      }
+
+      /**
+       * ⚠️ 这两个标记要等**读回成功之后**才清。
+       *
+       * 读回失败就提前 return 的话，如果先把 `externalSeen` 清成 false，
+       * 下一次写盘会走**快路径**、把内存里那份（导入前的）整份写出去 ——
+       * 把刚导入的文件盖回旧值，**导入静默失效**。
+       * 保持 `true` 时下一次写盘会走"读-合并-写"，导入的那份才保得住。
+       * `reloadPending` 同理：留着它，下一次写盘成功之后还会再拉一次盘。
+       */
+      externalSeen.current = false;
+      reloadPending.current = false;
 
       touched.current = false;
       latest.current = loaded;
       base.current = loaded;
       setValue(loaded);
-      setError(null);
+      /**
+       * 给用户一句提示，**不能静默**。
+       *
+       * 这是整个数据层里唯一一处"用户自己没存下的东西被丢掉"的地方：
+       * 导入是**另一个窗口**发起的，而这个窗口里可能正敲着字。用户点确认框时
+       * 想的是"覆盖磁盘上的数据"，未必想到"另一个面板里没保存的编辑也会没"。
+       *
+       * 没有未落盘改动时不提示：那时候被换掉的只是磁盘上的旧内容，
+       * 而那正是用户刚刚明确要求覆盖的东西。
+       */
+      setError(
+        hadPendingChanges
+          ? "另一个面板导入了备份，本窗口里还没存下的改动已被覆盖（导入时确认过「覆盖全部数据」）"
+          : null,
+      );
     } catch (err) {
       setError(String(err));
     }
@@ -600,6 +836,26 @@ export function usePersistentState<T>(
       if (pending.current === task) pending.current = null;
     }
   }, [file, reload]);
+
+  /**
+   * 把「立即落盘」登记到模块级的表里 —— 关窗口之前 / 导入备份之前（`flushAll`）要用。
+   *
+   * # 注销为什么放在"最后一次落盘落地之后"
+   *
+   * 卸载时（切页签、关窗口）组件会消失，但**它的写盘可能还在飞**。
+   * 如果这时候立刻把回调从表里摘掉，`flushAll()` 就看不到这次写 ——
+   * 于是"导入备份之前先把本窗口的写盘催完"会漏掉它，那次写盘随后落地，
+   * 把刚导入的文件盖回旧值（导入静默失效）。
+   *
+   * 所以：先催一次落盘，**等它落地再注销**。落地之后这次写已经不影响任何人了。
+   * `flush()` 自己会判断"有没有待写内容"，没有就立刻返回，不会平白多写一次。
+   */
+  useEffect(() => {
+    const off = registerFlush(flush);
+    return () => {
+      void flush().finally(off);
+    };
+  }, [flush]);
 
   // 首次加载：从磁盘读，读不到就用 initial
   useEffect(() => {

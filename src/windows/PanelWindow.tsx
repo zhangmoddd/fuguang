@@ -4,22 +4,180 @@
  * 结构：标题栏 + 页签栏 + 当前功能内容。
  * 页签栏完全由 `registry.ts` 推导，这里不认识任何具体功能，
  * 所以以后新增功能不需要改动这个文件。
+ *
+ * # 多窗口
+ *
+ * 同一个前端包可以同时跑出好几个面板窗口，每个窗口有自己的 label
+ * （`panel` / `panel-2` / …，见 `src-tauri/src/windows.rs`）。
+ * 所以这里有一条硬规矩：**任何窗口相关的调用都要带上自己的 label**。
+ * 原来代码里把 `"panel"` 写死在调用点上，多窗口之后那就是
+ * "只有第一个窗口的 ✕ 有用、第二个窗口的 ✕ 点不动"这类 bug。
+ *
+ * 每个窗口记住自己停在哪（页签 + 文件夹层级），键按 label 分
+ * （见 `lib/panel-state.ts`）—— 窗口 A 停在「临时」、窗口 B 停在「账号密码」，
+ * 重启后各自回到原处。
  */
-import { useEffect, useMemo, useState } from "react";
-import { Pin, PinOff, Search, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AppWindow, Pin, PinOff, Search, X } from "lucide-react";
+
+import { ask } from "@tauri-apps/plugin-dialog";
 
 import { DEFAULT_FEATURE_ID, sortedFeatures } from "../features/registry";
 import { api, emitSettingsChanged, onSettingsChanged } from "../lib/api";
 import { CommandPalette } from "../lib/command-palette";
+import {
+  FocusContext,
+  useFocusBus,
+  type FocusRequestInput,
+} from "../lib/navigation";
+import {
+  FALLBACK_PANEL_LABEL,
+  currentPanelLabel,
+  readPanelState,
+  writePanelState,
+} from "../lib/panel-state";
+import { flushAll } from "../lib/store";
+import { panelCommands } from "./panel-commands";
 
 export function PanelWindow() {
   const features = useMemo(() => sortedFeatures(), []);
-  const [activeId, setActiveId] = useState(DEFAULT_FEATURE_ID);
+
+  /**
+   * 本窗口的 label。整个生命周期里不变，所以只取一次。
+   *
+   * 所有窗口相关调用（收起、置顶）和持久化的键都从它派生 ——
+   * 写死 `"panel"` 的写法在多窗口下会操作错窗口。
+   */
+  const label = useMemo(() => currentPanelLabel(), []);
+
+  /**
+   * 是不是**第一个**面板（`panel`）。
+   *
+   * 它和别的面板身份不同：它是常驻入口，托盘 / 悬浮球只会唤回它
+   * （`windows::spawn_show_panel` 传的是 `None`），所以它只能被**隐藏**，
+   * 不能销毁 —— 销毁之后托盘那两项就没有目标了。见 `closeOrHide`。
+   */
+  const isFirstPanel = label === FALLBACK_PANEL_LABEL;
+
+  /** 标题栏上那条会自己消失的提示（标题栏只有 420px，常驻会把品牌名挤没）。 */
+  const [newPanelError, setNewPanelError] = useState<string | null>(null);
+  const newPanelSeq = useRef(0);
+
+  const showNotice = useCallback((text: string) => {
+    const seq = ++newPanelSeq.current;
+    setNewPanelError(text);
+    window.setTimeout(() => {
+      if (newPanelSeq.current === seq) setNewPanelError(null);
+    }, 4000);
+  }, []);
+
+  /**
+   * ✕ 与 Esc 的行为：**第一个面板是隐藏，其余的是真正关掉**。
+   *
+   * # 为什么必须分开
+   *
+   * `new_panel` 用**最小空闲编号**（见 `api.ts` 的 `newPanel`）。如果所有面板的 ✕
+   * 都只是 `hidePanel`，那么：
+   *
+   * ```
+   * 开 panel-2 → 用完点 ✕（其实只是藏起来，窗口还活着）
+   * → 再点「新建窗口」→ 拿到 panel-3（panel-2 的号还占着）
+   * → panel-2 从此看不见、也回不来，WebView 一直占着内存
+   * ```
+   *
+   * 反复几次就是几百 MB 的僵尸窗口（每个 WebView2 约 30–50MB）。
+   *
+   * 第一个面板（`panel`）是常驻入口：托盘和悬浮球的「显示面板」唤回的都是它
+   * （`windows::spawn_show_panel` 传的是 `None`），所以它只能被**隐藏**。
+   * `panel-2` 及以后没有这种身份，用户点 ✕ 就是想关掉它 —— 而且关掉是可恢复的：
+   * 再点「新建窗口」会拿回同一个 label，连同它上次停的页签与文件夹
+   * （见 `panel-state.ts` 里 label 复用那段说明）。
+   *
+   * # 关之前必须先把挂起的写盘催一遍
+   *
+   * `close_panel` 走的是 `destroy()`，**不一定**跑得到 `beforeunload` /
+   * `visibilitychange` / 组件卸载那三个兜底钩子 —— 用户刚敲完字（400ms 防抖还没到点）
+   * 就点 ✕，最后几个字会没了、而且一句话都不说。所以先 `flushAll()`。
+   *
+   * 催不动时**照样关**（关不掉比丢几个字更烦人），但用系统原生确认框问一句，
+   * 别静默丢掉：原生框不受这个窗口影响，而且和「删除文件夹」用的是同一套做法。
+   */
+  const closeOrHide = useCallback(async () => {
+    if (isFirstPanel) {
+      await panelCommands.hidePanel(label).catch(() => {});
+      return;
+    }
+
+    const saved = await flushAll();
+    if (!saved) {
+      try {
+        const force = await ask(
+          "有改动没能存到磁盘（可能是数据目录写不了）。\n现在关掉这个窗口的话，那些改动会丢。",
+          { title: "关闭窗口", kind: "warning", okLabel: "仍然关闭", cancelLabel: "留在这里" },
+        );
+        // 用户选择留下：窗口不关，他可以再点一次 ✕ 重试落盘
+        if (!force) return;
+      } catch {
+        // 确认框都弹不出来（权限/插件异常）时不再拦着用户 —— 关窗口是他的明确动作
+      }
+    }
+
+    await panelCommands.closePanel(label).catch((err) => {
+      showNotice(`关闭窗口失败：${String(err)}`);
+    });
+  }, [isFirstPanel, label, showNotice]);
+
+  /**
+   * 上次停在哪个页签。
+   *
+   * 初值从按 label 分的持久化里读。**必须校验**：存的 id 可能是已经被删掉/改名的
+   * 页签（或者用户手改过 localStorage），那样 `find` 会返回 undefined，
+   * 面板会显示"没有注册任何功能模块"—— 一个改配置就能把界面弄坏的死角。
+   */
+  const [activeId, setActiveId] = useState(() => {
+    const saved = readPanelState(label).featureId;
+    return saved && features.some((f) => f.id === saved) ? saved : DEFAULT_FEATURE_ID;
+  });
+
   const [pinned, setPinned] = useState(true);
   /** 全局搜索面板是否打开。 */
   const [paletteOpen, setPaletteOpen] = useState(false);
 
+  /**
+   * 定位请求总线。
+   *
+   * 请求必须存在**这里**、不能存在功能页里：面板只挂载当前页签
+   * （见下面的 `<Active />`），用户按回车那一刻目标页签的组件还没挂载，
+   * 请求放在组件里会随卸载丢掉。详见 `lib/navigation.ts`。
+   */
+  const focusBus = useFocusBus();
+
   const active = features.find((f) => f.id === activeId) ?? features[0];
+
+  /** 切页签，并把它记下来（重启后回到这一页）。 */
+  const selectFeature = useCallback(
+    (id: string) => {
+      setActiveId(id);
+      writePanelState(label, { featureId: id });
+    },
+    [label],
+  );
+
+  /**
+   * 命令面板的定位请求：切页签 + 把请求交给目标页签。
+   *
+   * 两件事的顺序不重要（都是 state 更新），但**两件都得做**：
+   * 只切页签是这一轮要修的原始 bug（"按了回车没反应"），
+   * 只发请求则目标页签根本不会被挂载出来。
+   */
+  const navigateTo = useCallback(
+    (featureId: string, target: FocusRequestInput) => {
+      setActiveId(featureId);
+      writePanelState(label, { featureId });
+      focusBus.request(target);
+    },
+    [focusBus, label],
+  );
 
   // 图钉的初值必须**读设置**，不能硬编码 true。
   // 面板窗口创建时就是按设置决定置顶的（见 windows.rs 的 show_panel），
@@ -47,8 +205,9 @@ export function PanelWindow() {
 
     void onSettingsChanged((s) => {
       setPinned(s.panelAlwaysOnTop);
-      // 这个监听器就活在面板窗口里，所以窗口必然存在，可以直接套用
-      void api.setAlwaysOnTop("panel", s.panelAlwaysOnTop).catch(() => {
+      // 套用的是**本窗口自己的** label：设置是全局的，但"置顶"这个动作
+      // 必须落到每个窗口头上（`applyAlwaysOnTopToAllPanels` 管别的窗口）
+      void api.setAlwaysOnTop(label, s.panelAlwaysOnTop).catch(() => {
         /* 套用失败只影响置顶，不该影响界面其余部分 */
       });
     }).then((fn) => {
@@ -60,7 +219,7 @@ export function PanelWindow() {
       disposed = true;
       unlisten?.();
     };
-  }, []);
+  }, [label]);
 
   // Ctrl+K 全局搜索；Esc 收起面板；数字键 1-9 快速切页签。
   // 这些快捷键让用户不用鼠标也能操作，是「效率工具」的基本素养。
@@ -95,19 +254,27 @@ export function PanelWindow() {
         target?.isContentEditable === true;
 
       if (e.key === "Escape") {
-        void api.hidePanel();
+        // 与 ✕ 同一套语义：第一个面板是"收起来"，其余的是"关掉"。
+        //
+        // 不能一律 hide：`new_panel` 用**最小空闲编号**，被隐藏的 `panel-2` 仍占着
+        // 那个号，而托盘 / 悬浮球只会唤回第一个面板 —— 于是它既看不见、又回不来、
+        // 还一直占着内存。关掉反而是可恢复的：再点「新建窗口」会拿回同一个 label，
+        // 连同它上次停的页签与文件夹（见 `panel-state.ts` 的 label 复用说明）。
+        //
+        // 只收**自己**这个窗口：不带 label 的话多窗口时操作的永远是第一个。
+        void closeOrHide();
         return;
       }
       if (typing) return;
 
       const index = Number(e.key) - 1;
       if (Number.isInteger(index) && index >= 0 && index < features.length) {
-        setActiveId(features[index].id);
+        selectFeature(features[index].id);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [features]);
+  }, [features, label, selectFeature, closeOrHide]);
 
   const togglePin = async () => {
     const next = !pinned;
@@ -115,7 +282,7 @@ export function PanelWindow() {
 
     // 第一步：把窗口真正置顶 / 取消置顶。**只有它失败才该把图标翻回去。**
     try {
-      await api.setAlwaysOnTop("panel", next);
+      await api.setAlwaysOnTop(label, next);
     } catch {
       setPinned(!next);
       return;
@@ -131,6 +298,21 @@ export function PanelWindow() {
       await emitSettingsChanged(saved);
     } catch {
       /* 存不下来只影响下次启动，界面按真实状态显示 */
+    }
+  };
+
+  /**
+   * 再开一个面板窗口。
+   *
+   * 命令调用失败（例如窗口数量到上限被 Rust 拒绝）时给一条明确的提示 ——
+   * 静默什么都不做正是这一轮要修的那类毛病。
+   */
+  const openNewPanel = async () => {
+    setNewPanelError(null);
+    try {
+      await panelCommands.newPanel();
+    } catch (err) {
+      showNotice(`新建窗口失败：${String(err)}`);
     }
   };
 
@@ -151,15 +333,31 @@ export function PanelWindow() {
           {active.panelTitle ?? active.title}
         </span>
 
+        {newPanelError && <span className="panel__notice">{newPanelError}</span>}
+
         <div className="panel__window-actions">
           {/* 搜索按钮是 Ctrl+K 的可见入口：不给按钮的话，
               这个功能只有读过文档的人才知道存在 */}
           <button
-            className="iconbtn"
+            className="iconbtn iconbtn--search"
             onClick={() => setPaletteOpen(true)}
             title="全局搜索（Ctrl+K）"
           >
-            <Search size={13} />
+            <Search size={15} />
+          </button>
+
+          {/*
+            再开一个面板窗口。
+            放在标题栏而不是设置页：这是"我要并排放两个"的即时动作，
+            去设置页翻一遍再回来太远。代价是标题栏多一个按钮 ——
+            所以尺寸跟着统一到 28×28，四个按钮加起来仍只占约 120px。
+          */}
+          <button
+            className="iconbtn"
+            onClick={() => void openNewPanel()}
+            title="再开一个面板窗口"
+          >
+            <AppWindow size={15} />
           </button>
 
           <button
@@ -167,11 +365,11 @@ export function PanelWindow() {
             onClick={() => void togglePin()}
             title={pinned ? "取消置顶" : "保持置顶"}
           >
-            {pinned ? <Pin size={13} /> : <PinOff size={13} />}
+            {pinned ? <Pin size={15} /> : <PinOff size={15} />}
           </button>
 
           {/*
-            ✕ 只收起面板，不退出软件。
+            ✕ 只处理这个窗口，不退出软件。
             
             这里踩过一个坑：最初 ✕ 绑的是"退出浮光"，结果用户按窗口惯例
             点它想关面板，整个软件被杀掉了，悬浮球也跟着消失。
@@ -179,9 +377,16 @@ export function PanelWindow() {
             
             退出软件改到设置页底部，以及小球的右键菜单和托盘菜单里 ——
             那几处是用户明确表达"我要退出"的地方。
+
+            具体行为（隐藏还是销毁、关之前要不要落盘）都在 `closeOrHide` 里，
+            与 Esc 共用同一套语义。
           */}
-          <button className="iconbtn" onClick={() => void api.hidePanel()} title="收起面板">
-            <X size={13} />
+          <button
+            className="iconbtn"
+            onClick={() => void closeOrHide()}
+            title={isFirstPanel ? "收起面板" : "关闭这个面板窗口"}
+          >
+            <X size={15} />
           </button>
         </div>
       </header>
@@ -192,7 +397,7 @@ export function PanelWindow() {
           <button
             key={f.id}
             className={`tabs__item${f.id === activeId ? " tabs__item--active" : ""}`}
-            onClick={() => setActiveId(f.id)}
+            onClick={() => selectFeature(f.id)}
             title={`${f.description ?? f.title}${i < 9 ? `（快捷键 ${i + 1}）` : ""}`}
           >
             <f.icon size={14} />
@@ -202,14 +407,24 @@ export function PanelWindow() {
         ))}
       </nav>
 
+      {/*
+        当前功能页。
+        `<Active />` **保持无 props**（页签是刻意做成可扩展的，
+        不该因为外壳要加一个能力就让每个功能模块都改签名）；
+        定位请求通过 context 往下发，功能页自己用 `usePendingFocus` 取。
+
+        Provider 不渲染任何 DOM，所以不影响布局。
+      */}
       <main className="panel__body">
-        <Active />
+        <FocusContext.Provider value={focusBus}>
+          <Active />
+        </FocusContext.Provider>
       </main>
 
       {/* 搜索面板盖在内容之上，但页签栏和标题栏仍然可见——
           用户能一眼看出"我还在这四个页签的应用里" */}
       {paletteOpen && (
-        <CommandPalette onClose={() => setPaletteOpen(false)} onNavigate={setActiveId} />
+        <CommandPalette onClose={() => setPaletteOpen(false)} onNavigate={navigateTo} />
       )}
     </div>
   );

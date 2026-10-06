@@ -34,8 +34,9 @@ import {
 } from "lucide-react";
 import { ask } from "@tauri-apps/plugin-dialog";
 
-import { api, newId, type Folder } from "./api";
+import { api, newId, onStateChanged, type Folder } from "./api";
 import { childrenOf, flattenFolders, folderPath, foldersOf } from "./folders";
+import { currentPanelLabel, folderOf, readPanelState, writePanelState } from "./panel-state";
 
 import "./folders.css";
 
@@ -90,9 +91,38 @@ export function useFolders(feature: string, options: UseFoldersOptions = {}): Fo
   const [all, setAll] = useState<Folder[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [currentId, setCurrentId] = useState<string | null>(null);
+
+  /**
+   * 本窗口的 label。它决定了"停在哪一层文件夹"这件事**记给谁**。
+   *
+   * 两个并排的面板可以各自停在不同文件夹：窗口 A 在「临时」、窗口 B 在「账号密码」。
+   * 键不按 label 分的话，后动的那一个会把另一个的位置也改掉 ——
+   * 表现是"我明明没碰过这个窗口，它自己跳走了"。
+   */
+  const label = useMemo(() => currentPanelLabel(), []);
+
+  /** 当前所在的文件夹 id，`null` 表示顶层。初值取本窗口上次停的那一层。 */
+  const [currentId, setCurrentId] = useState<string | null>(() =>
+    folderOf(readPanelState(label), feature),
+  );
 
   const { moveItems } = options;
+
+  /**
+   * 切到某个文件夹，并**记下来**。
+   *
+   * 每次 `enter` 都写一次 `localStorage`：它是同步的、只写几十字节，
+   * 比"等一会儿再防抖写"简单得多，也不会因为面板被隐藏/卸载而丢。
+   */
+  const enter = useCallback(
+    (id: string | null) => {
+      setCurrentId(id);
+      const state = readPanelState(label);
+      // 只动本页签那一项，别把同窗口其它页签记的位置冲掉
+      writePanelState(label, { folders: { ...state.folders, [feature]: id } });
+    },
+    [feature, label],
+  );
 
   const reload = useCallback(async () => {
     try {
@@ -109,6 +139,46 @@ export function useFolders(feature: string, options: UseFoldersOptions = {}): Fo
     void reload();
   }, [reload]);
 
+  /**
+   * 订阅「文件夹被别处改过」。
+   *
+   * # 为什么必须有
+   *
+   * `folders.json` 有三个写者（链接页 / 笔记页 / 计时器页），而且主面板现在
+   * 可以同时开好几个窗口。不订阅的话，别的窗口里新建/改名/删掉文件夹之后，
+   * 本窗口的列表会**一直是旧的** —— 用户看到的是"另一个面板里刚建的文件夹
+   * 在我这儿不存在"，点面包屑也进不去。
+   *
+   * 导入备份那条更严重：`emitDataReplacedAll` 会广播 `folders`，
+   * 本窗口却充耳不闻，于是它继续用导入前那份文件夹表渲染，条目会指向
+   * 已经不存在的文件夹 id（表现成"东西自己跑到顶层去了"）。
+   *
+   * 事件与载荷形状跟备忘 / 计时器页完全一致（`state-changed` 的 `what` 数组），
+   * 照抄那两处的卸载退订处理：订阅是异步的，回调到达时组件可能已经卸载，
+   * 那就立刻退订，否则监听器会一直挂在后端上。
+   */
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    void onStateChanged((what) => {
+      if (disposed || !what.includes("folders")) return;
+      void reload();
+    })
+      .then((off) => {
+        if (disposed) off();
+        else unlisten = off;
+      })
+      .catch(() => {
+        /* 订阅不上只影响跨窗口同步，不该影响界面 */
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [reload]);
+
   const mine = useMemo(() => foldersOf(all, feature), [all, feature]);
   const children = useMemo(() => childrenOf(mine, currentId), [mine, currentId]);
   const trail = useMemo(() => folderPath(mine, currentId), [mine, currentId]);
@@ -118,11 +188,14 @@ export function useFolders(feature: string, options: UseFoldersOptions = {}): Fo
    *
    * 不兜这一步的话 `childrenOf` 会一直返回空数组，
    * 界面看起来就像卡在一个打不开的空目录里，而面包屑又是空的。
+   *
+   * 走 `enter`（而不是裸 `setCurrentId`）：记下来的位置也要一起退回顶层，
+   * 否则下次启动会重新钻进一个不存在的文件夹，界面又变成那个空目录。
    */
   useEffect(() => {
     if (loading) return;
-    if (currentId !== null && !mine.some((f) => f.id === currentId)) setCurrentId(null);
-  }, [loading, mine, currentId]);
+    if (currentId !== null && !mine.some((f) => f.id === currentId)) enter(null);
+  }, [loading, mine, currentId, enter]);
 
   const create = useCallback(
     async (name: string, note: string) => {
@@ -197,7 +270,7 @@ export function useFolders(feature: string, options: UseFoldersOptions = {}): Fo
         // 用户看到的是"东西自己跑了"。
         if (moveItems) await moveItems(folder.id, folder.parentId);
         await api.folderRemove(folder.id);
-        if (currentId === folder.id) setCurrentId(folder.parentId);
+        if (currentId === folder.id) enter(folder.parentId);
         await reload();
         setError(null);
       } catch (err) {
@@ -206,7 +279,7 @@ export function useFolders(feature: string, options: UseFoldersOptions = {}): Fo
         setError(String(err));
       }
     },
-    [moveItems, currentId, reload],
+    [moveItems, currentId, enter, reload],
   );
 
   return {
@@ -214,7 +287,7 @@ export function useFolders(feature: string, options: UseFoldersOptions = {}): Fo
     currentId,
     children,
     trail,
-    enter: setCurrentId,
+    enter,
     create,
     update,
     reorder,

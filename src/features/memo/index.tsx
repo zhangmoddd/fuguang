@@ -32,14 +32,26 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  Copy,
+  Image as ImageIcon,
   NotebookPen,
   Pencil,
   Plus,
+  Send,
   Trash2,
+  TriangleAlert,
   Undo2,
 } from "lucide-react";
 
 import { api, newId, onStateChanged, type Memo, type Repeat } from "../../lib/api";
+import {
+  scrollIntoViewSoon,
+  useContextMenu,
+  useFocusHighlight,
+  useTextAreaMenu,
+  type ContextMenuItem,
+  type UseContextMenuResult,
+} from "../../lib/context-menu";
 import {
   REPEAT_OPTIONS,
   combineLocalSkippingGap,
@@ -52,6 +64,16 @@ import {
   todayKey,
 } from "../../lib/datetime";
 import { useEscapeToClose } from "../../lib/escape";
+import { dateToSelect, focusDomId, highlightFrom, isHighlighted } from "../../lib/focus-highlight";
+import { orphanedByItemRemoval, referencedImageIds, referencedImageIdsExcluding } from "../../lib/media";
+import {
+  MediaSection,
+  batchNotice,
+  useMediaAttachments,
+  useMediaLibrary,
+  type MediaLibraryApi,
+} from "../../lib/media-ui";
+import { usePendingFocus } from "../../lib/navigation";
 import { advanceRepeats } from "../../lib/repeat-advance";
 import { useZoom } from "../../lib/zoom";
 import type { FeatureModule } from "../registry";
@@ -59,7 +81,21 @@ import type { FeatureModule } from "../registry";
 import { DatePicker } from "./Calendar";
 
 import "./memo.css";
-/** 空笔记工厂。`date` 由调用方给定：新建时默认落在当前翻到的那一天。 */
+
+/**
+ * 定位高亮用的 DOM id 前缀。和其它页签取不同的前缀，
+ * 保证同一个 id 同时出现在两个页面上时不会找错人。
+ */
+const FOCUS_DOM_PREFIX = "memo-focus";
+/**
+ * 空备忘工厂。`date` 由调用方给定：新建时默认落在当前翻到的那一天。
+ *
+ * `images: []` **必须显式写**：`Memo` 是 Rust 侧的结构体，而 `memo_save`
+ * 是**整条覆盖写** —— 前端漏掉这个字段等于把这条备忘的图片全删了。
+ * 所以它在 TS 里是必填字段（不是可选），漏写在编译期就被拦住。
+ * 对照 `Snippet.images`：那个是可选，因为片段是前端自己拥有的类型、
+ * 老数据里没有这一项，所以读的时候要写 `s.images ?? []`。
+ */
 function emptyMemo(date: string): Memo {
   const now = Date.now();
   return {
@@ -71,6 +107,7 @@ function emptyMemo(date: string): Memo {
     remindAt: null,
     repeat: "none",
     firedFor: null,
+    images: [],
     createdAt: now,
     updatedAt: now,
   };
@@ -106,6 +143,11 @@ function sortMemos(list: Memo[]): Memo[] {
 function summarize(text: string, max = 110): string {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
+/** 截断过长文本用于提示（和片段页同一个做法）。 */
+function truncate(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 /** 重复规则的中文名，用于卡片上显示提醒状态。 */
@@ -146,6 +188,88 @@ export function MemoPanel() {
    * 「今天记了什么」变难找。所以这里只有缩放。
    */
   const zoom = useZoom("memo");
+
+  /** 右键菜单。 */
+  const ctx = useContextMenu();
+  /** 定位高亮：短暂 + 一交互就灭，见 lib/context-menu.tsx 的 useFocusHighlight。 */
+  const focus = useFocusHighlight();
+  const { target: pending, done: focusDone } = usePendingFocus("memo");
+
+  /**
+   * 提示条上的一个图标：成功是对勾，警告是三角。
+   *
+   * `kind === "warn"` 用在"操作没成功 / 有东西没了"这类**必须读完**的提示上
+   * （读剪贴板失败、剪切失败）。它和"已保存"共用同一条通道会让用户
+   * 以为成功了，所以用不同的图标区分开。
+   */
+  const [noticeKind, setNoticeKind] = useState<"ok" | "warn">("ok");
+
+  /**
+   * 右键菜单里那些"顺手做一下"的结果提示。
+   *
+   * 和 `feedback` 共用一条状态（一次只显示一条），但要能区分图标 ——
+   * 所以多一个 `noticeKind`。分开存两份会同时出现两条提示，反而更乱。
+   */
+  const notice = (text: string, kind: "ok" | "warn") => {
+    setNoticeKind(kind);
+    setFeedback(text);
+  };
+
+  // ---- 图片 ----
+
+  /**
+   * 拖放进来的路径要交给谁。
+   *
+   * 用一个 ref 存"当前的处理者"：编辑器开着时它注册自己（图片进那一条），
+   * 没开着时走下面的兜底（新建一条）。**订阅只有一个**（在 `useMediaLibrary` 里），
+   * 页面和编辑器各订阅一份的话一次拖放会导入两遍。
+   */
+  const dropHandlerRef = useRef<(paths: string[]) => void>(() => {});
+  /** 页面级的媒体库：导入机制 + 占用统计 + 拖放订阅。 */
+  const library = useMediaLibrary((paths) => dropHandlerRef.current(paths));
+  /** 编辑器挂载时把自己注册成拖放目标。 */
+  const dropTargetRef = useRef<((paths: string[]) => void) | null>(null);
+  const registerDrop = (handler: ((paths: string[]) => void) | null) => {
+    dropTargetRef.current = handler;
+  };
+
+  /**
+   * 编辑器**没开着**时拖进来：新建一条只装这些图片的备忘，并打开它的编辑器。
+   *
+   * # 为什么不是"什么都不做，提示用户先新建一条"
+   *
+   * 「把图片拖进这个页面」这个手势的意思就是"把这张图存下来"。不新建的话
+   * 用户拖完什么都看不到，只能自己猜到要先点「记一条」—— 那是把软件的
+   * 内部结构（图片必须挂在某一条上）转嫁给用户。
+   *
+   * ⚠️ 备忘页**不会自动保存**（它是显式「保存」的，与笔记页的自动保存不同），
+   * 所以这里只是把编辑器打开并预填好图片，用户仍然要按一次「保存」。
+   * 这个差异是两页原有的设计差异，不去抹平。
+   */
+  const createMemoFromDrop = async (paths: readonly string[]) => {
+    const batch = await library.importPaths(paths);
+    const result = batchNotice(batch, {
+      // 新条目还没有图片；已有的引用都算"别处也在用"
+      inItem: [],
+      elsewhere: referencedImageIdsExcluding(memos, ""),
+    });
+    if (result.text) notice(result.text, result.kind);
+    if (result.added.length === 0) return;
+    setEditing({ ...emptyMemo(selected), images: result.added });
+  };
+
+  // 每次渲染后刷新"当前拖放处理者"。放进 effect 而不是渲染期直接赋值：
+  // 渲染期改 ref 在 StrictMode 的双渲染下会跑两次，虽然这里无害，
+  // 但那是"看起来能用、以后被改坏"的写法。
+  useEffect(() => {
+    dropHandlerRef.current = (paths) => {
+      if (dropTargetRef.current) {
+        dropTargetRef.current(paths);
+        return;
+      }
+      void createMemoFromDrop(paths);
+    };
+  });
 
   /**
    * 推进已经弹过窗的重复提醒，并把改动并回本地列表。
@@ -205,12 +329,13 @@ export function MemoPanel() {
     };
   }, []);
 
-  // 反馈提示 2.4 秒后自动消失
+  // 反馈提示自动消失。警告留久一点 —— 它讲的是"东西没了 / 没成功"，需要读完。
   useEffect(() => {
     if (!feedback) return;
-    const t = window.setTimeout(() => setFeedback(null), 2400);
+    const ttl = noticeKind === "warn" ? 8000 : 2400;
+    const t = window.setTimeout(() => setFeedback(null), ttl);
     return () => window.clearTimeout(t);
-  }, [feedback]);
+  }, [feedback, noticeKind]);
 
   /** 当天要显示的笔记，已排好序。 */
   const visible = useMemo(
@@ -224,6 +349,18 @@ export function MemoPanel() {
     [memos],
   );
 
+  /**
+   * 删掉一批**已经确认没人引用**的图片文件。
+   *
+   * 失败一律吞掉：这些都是"清理残留"，报错会让用户以为刚才那步操作失败了。
+   * 留下的孤儿文件看不见、不影响使用，比一个假的失败提示好得多。
+   */
+  const cleanOrphanFiles = async (ids: readonly string[]) => {
+    if (ids.length === 0) return;
+    await Promise.all(ids.map((id) => api.mediaDelete(id).catch(() => undefined)));
+    library.refreshStats();
+  };
+
   const save = async (draft: Memo) => {
     const cleaned: Memo = {
       ...draft,
@@ -232,13 +369,32 @@ export function MemoPanel() {
       body: draft.body.trim(),
       updatedAt: Date.now(),
     };
+    // 保存**之前**这条备忘在盘上是什么样：保存后要拿它和新版本比，
+    // 找出"这次被移掉、而且别人也没引用"的图片
+    const before = memos.find((m) => m.id === draft.id)?.images ?? [];
     try {
       await api.memoSave(cleaned);
       // 保存后直接切到它被记下的那一天，否则用户会以为保存失败了
       setSelected(cleaned.date);
-      await load();
+      const fresh = await load();
       setEditing(null);
       setFeedback("已保存");
+
+      /**
+       * 清理这次被移掉的图片。
+       *
+       * ⚠️ 这里**不能**用 `orphanedImageIds`：那个函数的语义是"这些 id 正在
+       * 从某个条目里被移除"，它会把来源条目自身的引用排除掉 —— 而我们
+       * 要问的是"**保存后的整份数据**里还有没有人引用它"。
+       * 用错的话会把别的备忘还在用的图删掉。
+       */
+      const removed = before
+        .filter((old) => !cleaned.images.some((now) => now.id === old.id))
+        .map((old) => old.id);
+      if (removed.length > 0) {
+        const referenced = referencedImageIds(fresh);
+        await cleanOrphanFiles(removed.filter((id) => !referenced.has(id)));
+      }
     } catch (err) {
       // ⚠️ 这里**必须**同时给一条用户看得见的提示。
       //
@@ -250,16 +406,191 @@ export function MemoPanel() {
     }
   };
 
+  /**
+   * 放弃这次编辑。
+   *
+   * # 为什么必须在这里清图片
+   *
+   * 草稿里新导入的图片**已经落在磁盘上了**（导入是立即落盘的），而这条备忘
+   * 从没保存过 —— 数据里没有它，也就没有任何引用。不清理的话，用户每按一次
+   * 「取消」，`media/` 里就多一份永远看不见、也删不掉的文件。
+   *
+   * ⚠️ 判据必须是"**整份数据**里还有没有人引用"（`referencedImageIds`），
+   * **不能**用 `orphanedImageIds`：那个函数会把"来源条目"自己的引用排除掉，
+   * 而来源条目在盘上**根本没变**（这次编辑取消了）—— 用它会把这条备忘
+   * 本来就有的图片当成孤儿删掉，用户下次打开就看见裂图。
+   */
+  const cancelEdit = () => {
+    const draft = editing;
+    setEditing(null);
+    if (!draft || draft.images.length === 0) return;
+    const referenced = referencedImageIds(memos);
+    void cleanOrphanFiles(
+      draft.images.filter((image) => !referenced.has(image.id)).map((image) => image.id),
+    );
+  };
+
+  /**
+   * 删除一条备忘，并顺手清理**没人再引用**的图片文件。
+   *
+   * 顺序很重要：先算出孤儿、再删条目、最后删图片。反过来（先删条目）
+   * 也**能**算对（`orphanedByItemRemoval` 允许条目已经不在列表里），
+   * 但那时列表已经变了，出问题时更难对上。
+   *
+   * 图片清理失败**不该**让整次删除报错：备忘已经删掉了，报错会让用户
+   * 以为没删成功，然后再删一次。所以单独 catch，只记一条提示。
+   */
   const remove = async (id: string) => {
     try {
+      // 导入按内容 sha256 去重，同一张图被几条备忘引用是正常的 ——
+      // 只有一条都不剩时才能删磁盘文件
+      const orphans = orphanedByItemRemoval(memos, id);
       await api.memoRemove(id);
       setMemos((prev) => prev.filter((m) => m.id !== id));
       setFeedback("已删除");
+      if (orphans.length > 0) await cleanOrphanFiles(orphans);
     } catch (err) {
       setError(String(err));
       setFeedback(`删除失败：${String(err)}`);
     }
   };
+
+  /**
+   * 把一条备忘的正文打到用户刚才用的外部窗口。
+   *
+   * 为什么可以"打整条"：备忘的正文本来就是用户自己随手记的一段话
+   * （"下周要交的材料清单"），整条发出去是他要的效果。
+   * 计时器页就没有这个动作 —— 计时器的"内容"是个时间，打出去没有意义。
+   *
+   * 不复用 `save` 那条路径，也不动数据：这是"用一下这条内容"，
+   * 不是"改这条内容"。
+   */
+  const typeInto = async (text: string) => {
+    if (!text.trim()) {
+      notice("这条备忘没有正文可键入", "warn");
+      return;
+    }
+    const outcome = await api.pasteText(text);
+    if (outcome.ok) {
+      const base = outcome.target
+        ? `已键入到「${truncate(outcome.target, 18)}」`
+        : "已键入到光标处";
+      // 成功时也可能带回一条必须看到的警告（剪贴板原文已被替换），
+      // 和片段页的处理保持一致
+      notice(
+        outcome.message ? `${base}；${outcome.message}` : base,
+        outcome.message ? "warn" : "ok",
+      );
+      return;
+    }
+    notice(outcome.message ?? "已复制到剪贴板，请手动 Ctrl+V", "warn");
+  };
+
+  /** 只复制，不粘贴。 */
+  const copyOnly = async (text: string) => {
+    if (!text.trim()) {
+      notice("这条备忘没有正文可复制", "warn");
+      return;
+    }
+    const ok = await api.copyText(text);
+    notice(ok ? "已复制到剪贴板" : "复制失败，剪贴板可能被占用", ok ? "ok" : "warn");
+  };
+
+  /**
+   * 一条备忘在右键菜单里的动作。
+   *
+   * 备忘没有「移动到文件夹」（它不做文件夹，组织维度是日期），
+   * 也没有「复制正文」以外的复制对象 —— 所以菜单比片段页短，
+   * 这是对的：**只列真的能做的事**。
+   */
+  const memoMenu = (m: Memo): ContextMenuItem[] => {
+    // 正文为空时只发标题：让「键入到当前光标」永远有东西可发，
+    // 而不是弹一个点了没反应的菜单项
+    const payload = m.body.trim() || m.title;
+    return [
+      {
+        id: "type",
+        label: "键入到当前光标",
+        icon: <Send size={13} />,
+        onSelect: () => void typeInto(payload),
+      },
+      {
+        id: "copy",
+        label: "复制",
+        icon: <Copy size={13} />,
+        hint: "Ctrl+C",
+        onSelect: () => void copyOnly(payload),
+      },
+      {
+        id: "edit",
+        label: "编辑",
+        icon: <Pencil size={13} />,
+        dividerBefore: true,
+        onSelect: () => setEditing(m),
+      },
+      {
+        id: "delete",
+        label: "删除",
+        icon: <Trash2 size={13} />,
+        danger: true,
+        dividerBefore: true,
+        onSelect: () => void remove(m.id),
+      },
+    ];
+  };
+
+  /**
+   * 收到搜索定位请求：切到那一天 → 滚到可见 → 高亮 →（需要时）打开编辑器。
+   *
+   * # 这就是用户报的「搜到备忘回车没反应」的根因修复
+   *
+   * 原来备忘页**没有任何接收外部定位的入参**，`selected` 是本地 state、
+   * 默认「今天」（见下面的 `useState(() => todayKey())`）。于是命令面板里
+   * 回车只会切到备忘页，而页面还停在今天 —— 命中的那条如果记在别的日子，
+   * 它根本不在列表里，用户看到的是"跳过来了，但什么都没有"。
+   *
+   * # 为什么这个 effect 放在 `remove` / `typeInto` 之后
+   *
+   * 它要调用 `setEditing` 之外的东西吗？不用 —— 但放在这里是因为
+   * 它读 `pending`，而 `pending` 来自上面那几行 hook。位置只影响可读性，
+   * 不影响 TDZ（这里用到的都是已经初始化的 `setState`）。
+   *
+   * `memos` / `selected` 刻意不进依赖：它们是每次渲染都变的新值/新数组，
+   * 进来会让 effect 在 `done()` 之后又跑一遍。
+   *
+   * # ⚠️ 为什么必须等 `loading` 结束（这是用户报的那个 bug 的另一半）
+   *
+   * 从**别的页签**按回车跳过来时，本页是**刚挂载**的：`memos` 初值是 `[]`，
+   * 数据还在异步路上。这时：
+   * - 日期切了、高亮也设了，但**列表是空的**；
+   * - `pending.open` 时 `memos.find(...)` 拿到 `undefined`，**编辑器打不开**；
+   * - 紧接着 `focusDone()` 把这次请求**消费掉**了 —— 请求没了，数据回来也不会再跑。
+   *
+   * 症状和用户报的「搜到备忘回车没反应」**一模一样**。所以守卫必须在
+   * `done()` 之前，而且 `loading` 必须进依赖 —— 只加守卫不加依赖的话，
+   * 数据回来时 effect 永远不会再跑，等于换了个方式继续坏。
+   *
+   * 这与片段页等 `folders.loading` 是同一个道理：**定位请求必须等这一页的
+   * 数据就绪再消费**，否则消费掉的是一次"拿不到目标"的请求。
+   */
+  useEffect(() => {
+    if (!pending) return;
+    if (loading) return;
+
+    const date = dateToSelect(pending);
+    if (date) setSelected(date);
+
+    focus.show(highlightFrom(pending));
+    scrollIntoViewSoon(focusDomId(FOCUS_DOM_PREFIX, pending.id));
+
+    if (pending.open) {
+      const found = memos.find((m) => m.id === pending.id);
+      if (found) setEditing(found);
+    }
+
+    focusDone();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending, loading]);
 
   /**
    * 提示条 + 读写异常条。
@@ -271,8 +602,14 @@ export function MemoPanel() {
   const notices = (
     <>
       {feedback && (
-        <div className="memo__feedback">
-          <Check size={13} />
+        <div
+          className={`memo__feedback${
+            noticeKind === "warn" ? " memo__feedback--warn" : ""
+          }`}
+        >
+          {/* 警告用三角而不是对勾：右键菜单里的「剪切失败」「读不到剪贴板」
+              都是**没成功**，挂一个对勾会让用户以为做成了 */}
+          {noticeKind === "warn" ? <TriangleAlert size={13} /> : <Check size={13} />}
           {feedback}
         </div>
       )}
@@ -286,9 +623,16 @@ export function MemoPanel() {
         {notices}
         <MemoEditor
           draft={editing}
-          onCancel={() => setEditing(null)}
+          onCancel={cancelEdit}
           onSave={(m) => void save(m)}
+          onTypeInto={typeInto}
+          onNotice={notice}
+          contextMenu={ctx}
+          library={library}
+          registerDrop={registerDrop}
+          allItems={() => memos}
         />
+        {ctx.menu}
       </div>
     );
   }
@@ -346,9 +690,11 @@ export function MemoPanel() {
 
       <div className="memo__toolbar">
         <span className="memo__hint">
+          {/* ⚠️ 用词是「备忘」不是「笔记」：页签「文本」已经改名成「笔记」，
+              两个页签都自称「笔记」的话用户分不清在说哪一边 */}
           {memos.length === 0
-            ? "还没有任何笔记"
-            : `共 ${memos.length} 条笔记 · ${reminderCount} 条挂了提醒`}
+            ? "还没有任何备忘"
+            : `共 ${memos.length} 条备忘 · ${reminderCount} 条挂了提醒`}
         </span>
         <button className="btn btn--primary" onClick={() => setEditing(emptyMemo(selected))}>
           <Plus size={13} />
@@ -365,7 +711,7 @@ export function MemoPanel() {
           <div className="memo__empty">
             {memos.length === 0 ? (
               <>
-                {formatDateHuman(selected)}还没有笔记。
+                {formatDateHuman(selected)}还没有备忘。
                 <br />
                 点右上角「记一条」。提醒时间是独立的，所以可以今天先记下
                 <br />
@@ -373,7 +719,7 @@ export function MemoPanel() {
               </>
             ) : (
               <>
-                {formatDateHuman(selected)}没有笔记。
+                {formatDateHuman(selected)}没有备忘。
                 <br />
                 其他日期里还有 {memos.length} 条。
               </>
@@ -382,7 +728,15 @@ export function MemoPanel() {
         )}
 
         {visible.map((m) => (
-          <article key={m.id} className="memo__card">
+          <article
+            key={m.id}
+            id={focusDomId(FOCUS_DOM_PREFIX, m.id)}
+            className={`memo__card${
+              isHighlighted(focus.highlight, m.id) ? " memo__card--focus" : ""
+            }`}
+            // 右键：和这一条有关的动作（键入到光标 / 复制 / 编辑 / 删除）
+            onContextMenu={(e) => ctx.open(e, () => memoMenu(m))}
+          >
             <div className="memo__cardhead">
               <span className="memo__title">{m.title}</span>
               {m.tags.map((t) => (
@@ -390,6 +744,14 @@ export function MemoPanel() {
                   {t}
                 </span>
               ))}
+              {/* 列表行只给一个**数量标记**，不塞缩略图：卡片只有几十像素高，
+                  放一张图会把"一眼扫十条"变成"一眼看两条"。 */}
+              {m.images.length > 0 && (
+                <span className="media__marker" title={`${m.images.length} 张图片`}>
+                  <ImageIcon size={10} />
+                  {m.images.length}
+                </span>
+              )}
             </div>
 
             {m.body && <div className="memo__body">{summarize(m.body)}</div>}
@@ -429,6 +791,9 @@ export function MemoPanel() {
           </article>
         ))}
       </div>
+
+      {/* 右键菜单。`position: fixed` 的独立浮层，只有一份 */}
+      {ctx.menu}
     </div>
   );
 }
@@ -438,16 +803,84 @@ function MemoEditor({
   draft,
   onSave,
   onCancel,
+  onTypeInto,
+  onNotice,
+  contextMenu,
+  library,
+  registerDrop,
+  allItems,
 }: {
   draft: Memo;
   onSave: (m: Memo) => void;
   onCancel: () => void;
+  /** 「键入到当前光标」：把选中的那段文字打到外部窗口。 */
+  onTypeInto: (text: string) => void;
+  /** 右键菜单里那些"顺手做一下"的结果提示。 */
+  onNotice: (text: string, kind: "ok" | "warn") => void;
+  /** 上层已经建好的右键菜单实例（一份就够）。 */
+  contextMenu: UseContextMenuResult;
+  /** 页面级媒体库（导入机制 + 占用统计 + 拖放订阅）。 */
+  library: MediaLibraryApi;
+  /** 把本编辑器注册成拖放目标（页面级订阅只有一个）。 */
+  registerDrop: (handler: ((paths: string[]) => void) | null) => void;
+  /** 全部备忘的图片引用，用来判"这张图还有没有别人在用"。 */
+  allItems: () => readonly Memo[];
 }) {
   const [form, setForm] = useState<Memo>(draft);
 
-  // 填到一半按 Esc 应该是「退出编辑」，不是「把整个面板收起来」
-  useEscapeToClose(onCancel);
+  /**
+   * Esc 只关这一层：填到一半按 Esc 应该是「退出编辑」，
+   * 不是「把整个面板收起来」。
+   *
+   * ⚠️ 浮层（大图预览 / 右键菜单）开着时**不认领** Esc —— 这条在备忘页
+   * 后果最严重：这里的 `onCancel` 是 `cancelEdit`，它会**丢弃草稿**、
+   * 并**删掉这次编辑期间刚导入的图片文件**（那是"取消"该有的语义）。
+   * 于是"菜单开着顺手按个 Esc"的真实后果是**"你刚拖进来的那张图没了"**。
+   *
+   * 第二个参数交给 `useEscapeToClose`，它会**先判认领、再决定拦不拦传播** ——
+   * 不认领时既不 `stopPropagation` 也不回调，`onCancel` 根本不会被调用，
+   * 事件原样走到菜单那一层，由菜单自己关掉自己。详见 `lib/escape.ts`。
+   */
+  useEscapeToClose(
+    onCancel,
+    () => !media.blocksEscapeNow(),
+  );
   const [tagInput, setTagInput] = useState(draft.tags.join(", "));
+
+  /**
+   * 图片附件：三路导入（按钮 / 拖放 / Ctrl+V）+ 网格 + 大图 + 图片右键菜单。
+   *
+   * `images` 传函数而不是值：导入 / 删除之后要拿到**最新**的那一份列表，
+   * 而这个 hook 的各个回调（右键菜单项）是稳定的，读值会在闭包里过期。
+   */
+  const media = useMediaAttachments({
+    images: () => form.images,
+    onChange: (next) => patch({ images: next }),
+    itemId: form.id,
+    allItems,
+    onNotice,
+    contextMenu,
+    library,
+    // ⚠️ 备忘是**显式保存**的：草稿里删掉一张图之后按「取消」，
+    // 数据里那条备忘**还引用着这张图**。所以"盘上那份"就是撤销路径 ——
+    // 移除时先看它，图还在盘上那份里就留着文件（取消之后还要用）。
+    // 保存时再统一清理（见下面 `save` 里的 removed 计算）。
+    undoImages: () => allItems().find((m) => m.id === form.id)?.images ?? [],
+  });
+
+  /** 有图片时正文框才让位（见 media.css 顶部那段说明）。 */
+  const hasImages = form.images.length > 0;
+
+  /**
+   * 正文区的右键菜单：键入到光标 / 复制 / 剪切 / 粘贴 / 全选。
+   * 和片段页共用同一套实现（`lib/context-menu.tsx` 的 `useTextAreaMenu`），
+   * 免得两边各写一份、各自漂移。
+   */
+  const area = useTextAreaMenu(contextMenu, {
+    onTypeInto,
+    onNotice,
+    copyText: api.copyText,
+  });
 
   // 提醒拆成「日期 + 时间」两个输入框，所以这里保留字符串形态的草稿。
   // 直接绑 remindAt 的话，用户每改一次日期框都会先经过一个空值状态，
@@ -560,8 +993,14 @@ function MemoEditor({
   };
 
   return (
-    <div className="editor">
-      <div className="editor__head">{draft.title ? "编辑笔记" : "记一条"}</div>
+    <div
+      className={`editor${hasImages ? " editor--media" : ""}`}
+      // Ctrl+V：剪贴板里有图片就导入图片，是文字就**完全不碰**（走浏览器原路）。
+      // 挂在编辑器根节点上而不是 textarea 上：焦点可能在标题/标签框里，
+      // 粘贴事件会从那儿冒泡上来，一处就够。
+      onPaste={media.onPaste}
+    >
+      <div className="editor__head">{draft.title ? "编辑备忘" : "记一条"}</div>
 
       <label className="field">
         <span className="field__label">标题</span>
@@ -577,12 +1016,25 @@ function MemoEditor({
       <label className="field field--grow">
         <span className="field__label">正文</span>
         <textarea
+          ref={area.ref}
           className="field__input field__input--area"
           value={form.body}
           placeholder="今天做了什么、想到了什么、要办什么事…"
           onChange={(e) => patch({ body: e.target.value })}
+          // 选中一段文字右键 → 「键入到当前光标」把它打到外部窗口。
+          // 没选中时那一项是禁用的（理由见 lib/context-menu.tsx 的 useTextAreaMenu）
+          onContextMenu={area.onContextMenu}
         />
       </label>
+
+      {/* 图片区紧跟在正文后面：它和正文一样是"这条备忘的内容"，
+          放到提醒设置下面会让人以为它属于提醒 */}
+      <MediaSection
+        images={form.images}
+        media={media}
+        contextMenu={contextMenu}
+        onRegisterDrop={registerDrop}
+      />
 
       <label className="field">
         <span className="field__label">
@@ -603,7 +1055,7 @@ function MemoEditor({
       <label className="field">
         <span className="field__label">
           记在哪一天
-          <em className="field__hint">决定这条笔记出现在日记的哪一页</em>
+          <em className="field__hint">决定这条备忘出现在日记的哪一页</em>
         </span>
         <input
           className="field__input"
@@ -709,7 +1161,7 @@ function MemoEditor({
 export const MemoFeature: FeatureModule = {
   id: "memo",
   title: "备忘",
-  description: "按日期记笔记，可挂定时提醒",
+  description: "按日期记备忘，可挂定时提醒",
   icon: NotebookPen,
   order: 30,
   component: MemoPanel,

@@ -36,6 +36,20 @@ export interface SearchHit {
   detail: string;
   /** 分数越高越靠前。 */
   score: number;
+  /**
+   * 条目所在的文件夹（片段 / 链接 / 计时器），`null` 表示顶层。
+   *
+   * # 为什么要有这个字段
+   *
+   * 光有 `id` 定位不了：条目分散在文件夹里，目标页签切过去时可能正停在别的
+   * 文件夹，那条**根本不在当前列表里** —— 用户看到的是「按了回车没反应」。
+   * 所以要定位就得连位置一起带出来。
+   *
+   * 备忘没有文件夹（它的组织维度是日期），所以这类不设该字段。
+   */
+  folderId?: string | null;
+  /** 备忘所在的日期（`YYYY-MM-DD`）。原来它只被拼进 `detail` 当显示文本。 */
+  date?: string;
 }
 
 export interface SearchableSnippet {
@@ -45,12 +59,14 @@ export interface SearchableSnippet {
   note: string;
   tags: string[];
   sensitive: boolean;
+  folderId?: string | null;
 }
 
 export interface SearchableLink {
   id: string;
   name: string;
   target: string;
+  folderId?: string | null;
 }
 
 export interface SearchableMemo {
@@ -65,6 +81,7 @@ export interface SearchableTimer {
   id: string;
   name: string;
   kind: string;
+  folderId?: string | null;
 }
 
 /** 一次搜索要用到的全部数据。 */
@@ -182,6 +199,9 @@ export function searchAll(query: string, data: SearchData, limit = 40): SearchHi
       title: s.title || summarize(s.content, 24) || "未命名",
       detail: s.sensitive ? mask(s.content) : summarize(s.content),
       score,
+      // 统一补成 `null`（而不是 `undefined`）：调用方要把它当成"目标文件夹"用，
+      // 让"顶层"始终是一个明确的值，不用每处都写 `?? null`
+      folderId: s.folderId ?? null,
     });
   }
 
@@ -191,7 +211,14 @@ export function searchAll(query: string, data: SearchData, limit = 40): SearchHi
       { text: l.target, weight: WEIGHT.target },
     ]);
     if (score === null) continue;
-    hits.push({ kind: "link", id: l.id, title: l.name, detail: l.target, score });
+    hits.push({
+      kind: "link",
+      id: l.id,
+      title: l.name,
+      detail: l.target,
+      score,
+      folderId: l.folderId ?? null,
+    });
   }
 
   for (const m of data.memos) {
@@ -208,6 +235,8 @@ export function searchAll(query: string, data: SearchData, limit = 40): SearchHi
       title: m.title || summarize(m.body, 24) || "未命名",
       detail: joinDetail([m.date, summarize(m.body)]),
       score,
+      // 日期原来只拼进了 `detail` 当显示文本。定位要靠它，所以单独带一份结构化的。
+      date: m.date,
     });
   }
 
@@ -218,7 +247,14 @@ export function searchAll(query: string, data: SearchData, limit = 40): SearchHi
       { text: label, weight: WEIGHT.note },
     ]);
     if (score === null) continue;
-    hits.push({ kind: "timer", id: t.id, title: t.name, detail: label, score });
+    hits.push({
+      kind: "timer",
+      id: t.id,
+      title: t.name,
+      detail: label,
+      score,
+      folderId: t.folderId ?? null,
+    });
   }
 
   // 分数相同的保持插入顺序（JS 的 sort 是稳定的）：

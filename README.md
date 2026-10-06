@@ -67,6 +67,12 @@ Windows 用户可以直接双击仓库里的 `1-开发模式.bat`：跑的是真
 但前端改动存盘即生效，只有 Rust 代码改了才需要增量编译。
 `2-重新编译.bat` 出正式版，产物在 `src-tauri/target/release/fuguang.exe`。
 
+> ⚠️ **别用 `cargo build` 去看前端改动。** 它**不跟踪 `dist/` 的变化** ——
+> 你改完前端、跑 `cargo build`、启动 exe，看到的会是**上一次构建时嵌进去的旧界面**，
+> 很容易误判成"我的改动没生效"。要跑最新界面请用 `npm run desktop:dev`，
+> 或者 `npm run desktop:build`（它配了 `beforeBuildCommand: npm run build`，
+> 会先重建 `dist/`）。
+
 > 这 4 个 `.bat` 的界面文字是英文，而且刻意写成「纯 ASCII + CRLF 换行」。
 > **用编辑器改它们时请务必保持 CRLF 且不要引入非 ASCII 字符**，
 > 否则双击会毫无反应（实测踩过）。

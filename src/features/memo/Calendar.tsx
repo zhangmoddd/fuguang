@@ -26,6 +26,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { CalendarDays, ChevronLeft, ChevronRight, Undo2 } from "lucide-react";
 
 import { isRealDateKey, monthGrid, todayKey } from "../../lib/datetime";
+import { isContextMenuOpen } from "../../lib/context-menu";
+import { useEscapeToClose } from "../../lib/escape";
 
 /** 周一开头：中文语境里一周从周一开始，原生控件也是这么排的。 */
 const WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"];
@@ -74,21 +76,38 @@ export function DatePicker({ value, onChange, title = "选择日期" }: DatePick
       const wrap = wrapRef.current;
       if (wrap && !wrap.contains(e.target as Node)) setOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      // 面板全局的 Esc 是「收起面板」（PanelWindow.tsx，监听在 window 的冒泡阶段）。
-      // 日历开着的时候 Esc 应该只关日历，所以在捕获阶段就把它截住。
-      e.stopPropagation();
-      setOpen(false);
-    };
 
     document.addEventListener("pointerdown", onDown, true);
-    document.addEventListener("keydown", onKey, true);
     return () => {
       document.removeEventListener("pointerdown", onDown, true);
-      document.removeEventListener("keydown", onKey, true);
     };
   }, [open]);
+
+  /**
+   * Esc 只关日历这一层。
+   *
+   * # 为什么用 `useEscapeToClose` 而不是自己挂监听
+   *
+   * 原来的写法是内联一个 `document` 捕获监听器，`stopPropagation()` 之后
+   * 直接 `setOpen(false)` —— **没有"先判认领"这一步**（t26 扫出来的同类）。
+   * 日历的 z-index 是 30（`memo.css`），而右键菜单是 100
+   * （`context-menu.css`）—— 菜单在日历上面，所以"Esc 关最上面那一层"
+   * 要求日历在菜单开着时**让位**。
+   *
+   * 两个条件缺一不可：
+   * - `open`：这个组件**一直挂着**（弹层只是显隐），不判的话日历关着也会去认领 Esc；
+   * - `!isContextMenuOpen()`：菜单在更上面，那一下 Esc 归它。
+   *
+   * ⚠️ 说实话：**这条路现在撞不上** —— 日历在"点到外面就关"上比谁都积极
+   * （上面的 `onDown`：任何外部 `pointerdown` 都会先把它关掉，而右键也发
+   * `pointerdown`），所以菜单弹出来的时候日历已经关了。这条改动是**把规则补成
+   * 一致的**（每一个浮层都让位给右键菜单），不是修一个现成能复现的 bug。
+   * 详见 `lib/escape.ts` 的 `shouldClaim`。
+   */
+  useEscapeToClose(
+    () => setOpen(false),
+    () => open && !isContextMenuOpen(),
+  );
 
   /** 提交手打的日期。非法就退回原值，绝不让一个不存在的日期进到数据里。 */
   const commit = () => {

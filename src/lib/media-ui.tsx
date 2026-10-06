@@ -1146,6 +1146,16 @@ export interface ImageViewerProps {
  * `media.css` 里那条 z-index 注释却写着"菜单要能盖在它上面"，
  * **注释和实现只有一个能留下**，所以这里把菜单真的接上了：
  * 与缩略图格子同源（`media.imageMenu`），只做两处调整（见下面 `items`）。
+ *
+ * # ⚠️ 接上菜单之后，这一层必须**让位**（t26）
+ *
+ * 菜单的 z-index 是 100（`context-menu.css`），预览层是 80 —— **菜单在预览层上面**。
+ * 而"Esc 关最上面那一层"是这个项目里三层 Esc 分工的全部内容。
+ * 所以这里必须带认领判定：菜单开着时不认领 Esc，让事件原样往下走到菜单那一层，
+ * 由它自己关掉自己（`lib/escape.ts` 的 `shouldClaim` 写了完整机制）。
+ *
+ * 不判的话症状很具体：在大图上右键 → 菜单弹出 → 按 Esc →
+ * **预览层关了、菜单却留在屏幕上**，而且它指向的是一张已经关掉的预览图。
  */
 export function ImageViewer({
   image,
@@ -1153,7 +1163,7 @@ export function ImageViewer({
   contextMenu,
   imageMenu,
 }: ImageViewerProps) {
-  useEscapeToClose(onClose);
+  useEscapeToClose(onClose, () => !isContextMenuOpen());
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
 

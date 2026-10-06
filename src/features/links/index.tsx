@@ -57,12 +57,14 @@ import {
 } from "../../lib/api";
 import { FolderBar, FolderEditor, FolderPicker, FolderTiles, useFolders } from "../../lib/folders-ui";
 import {
+  isContextMenuOpen,
   scrollIntoViewSoon,
   useContextMenu,
   useFocusHighlight,
   type ContextMenuItem,
 } from "../../lib/context-menu";
 import { allPaths } from "../../lib/dialog";
+import { useEscapeToClose } from "../../lib/escape";
 import { previewOrder, useDragSort } from "../../lib/drag-drop";
 import { focusDomId, folderToEnter, highlightFrom, isHighlighted } from "../../lib/focus-highlight";
 import { placeMenu } from "../../lib/menu-position";
@@ -1485,19 +1487,29 @@ function LinkMenu({
       const box = boxRef.current;
       if (box && !box.contains(e.target as Node)) onClose();
     };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      // 同就地编辑：Esc 只关这一层，别连带把整个面板收起来
-      e.stopPropagation();
-      onClose();
-    };
     document.addEventListener("pointerdown", onDown, true);
-    document.addEventListener("keydown", onKey, true);
     return () => {
       document.removeEventListener("pointerdown", onDown, true);
-      document.removeEventListener("keydown", onKey, true);
     };
   }, [onClose]);
+
+  /**
+   * Esc 只关这一层，别连带把整个面板收起来。
+   *
+   * # 为什么用 `useEscapeToClose` 而不是自己挂监听（t26 扫出来的同类）
+   *
+   * 原来这里内联一个 `document` 捕获监听器，`stopPropagation()` 之后直接
+   * `onClose()` —— **没有"先判认领"这一步**。而这个「⋯」菜单的 z-index 是 60
+   * （`links.css`），全应用那个右键菜单是 100（`context-menu.css`）——
+   * 菜单在上面，所以"Esc 关最上面那一层"要求这一层在菜单开着时**让位**。
+   *
+   * ⚠️ 说实话：**这条路现在也撞不上** —— 上面那个 `onDown` 会在任何外部
+   * `pointerdown` 时把「⋯」菜单关掉（右键也发 `pointerdown`），而且
+   * `t13` 还给菜单根节点加了 `onContextMenu` 拦截（右键菜单不会叠在它上面）。
+   * 这条改动是**把规则补成一致的**，不是修一个现成能复现的 bug。
+   * 详见 `lib/escape.ts` 的 `shouldClaim`。
+   */
+  useEscapeToClose(onClose, () => !isContextMenuOpen());
 
   /**
    * 贴住「⋯」按钮定位，但不许出面板。

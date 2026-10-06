@@ -192,7 +192,11 @@ export function SettingsPanel() {
       if (!picked) return;
 
       const confirmed = await ask(
-        "导入会用备份里的内容覆盖当前的全部数据（文本片段、计时器、备忘、链接、文件夹、设置）。\n当前数据会被替换，无法撤销。要继续吗？",
+        // 文案里的功能名必须与页签名一致：页签早就从「文本」改成「笔记」了，
+        // 这里还写「文本片段」会让用户在设置页看到一套对不上号的叫法。
+        // ⚠️ 只改**显示文案** —— `id: "snippets"`、数据文件名、`folders.json` 的
+        // `feature` 字段都是数据契约，一个字都不能动。
+        "导入会用备份里的内容覆盖当前的全部数据（笔记、计时器、备忘、链接、文件夹、设置）。\n当前数据会被替换，无法撤销。要继续吗？",
         { title: "从备份恢复", kind: "warning", okLabel: "覆盖导入", cancelLabel: "取消" },
       );
       if (!confirmed) return;
@@ -698,7 +702,7 @@ export function SettingsPanel() {
         <div className="settings__note settings__note--warn">
           <Info size={13} />
           <span>
-            数据<strong>没有加密</strong>。标记为敏感的文本片段只有列表遮罩这一层视觉保护，
+            数据<strong>没有加密</strong>。标记为敏感的笔记只有列表遮罩这一层视觉保护，
             JSON 里是明文。这是刻意的取舍：加密意味着一旦忘记密码，数据就永久找不回来了。
           </span>
         </div>

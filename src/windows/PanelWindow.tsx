@@ -304,8 +304,15 @@ export function PanelWindow() {
   /**
    * 再开一个面板窗口。
    *
-   * 命令调用失败（例如窗口数量到上限被 Rust 拒绝）时给一条明确的提示 ——
-   * 静默什么都不做正是这一轮要修的那类毛病。
+   * 命令调用失败时给一条明确的提示 —— 静默什么都不做正是这一轮要修的那类毛病。
+   *
+   * ⚠️ 这里原来举例写的是"窗口数量到上限被 Rust 拒绝"，而**没有这个上限**：
+   * `windows::next_panel_label_from` 只是从 2 开始找最小空闲编号（`while used.contains(&n) { n += 1 }`），
+   * 不封顶，全仓库也没有任何面板数量上限。留着那句话会让下一个人去找一个
+   * 不存在的东西，或者以为有保护而不再加。
+   *
+   * 真正会失败的路径是**创建窗口本身**失败（`WebviewWindowBuilder::build` 报错：
+   * WebView2 运行时异常、系统资源不足等），以及命令没注册 / IPC 出错。
    */
   const openNewPanel = async () => {
     setNewPanelError(null);

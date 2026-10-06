@@ -1025,7 +1025,7 @@ export function SnippetsPanel() {
               </>
             ) : query ? (
               <>
-                没有匹配「{query}」的片段。
+                没有匹配「{query}」的笔记。
                 {/* 搜索是**在当前文件夹里**做的（`inFolder` 参与过滤）。
                     不点破的话，用户会以为"这条根本不存在"，而其实它在别的层里 ——
                     界面上唯一的线索只有面包屑那一行。 */}
@@ -1044,7 +1044,7 @@ export function SnippetsPanel() {
                 )}
               </>
             ) : (
-              <>这个文件夹里还没有片段。</>
+              <>这个文件夹里还没有笔记。</>
             )}
           </div>
         )}
@@ -1299,7 +1299,16 @@ function SnippetEditor({
       onPaste={media.onPaste}
     >
       <div className="editor__head">
-        <span>{draft.title ? "编辑片段" : "新建片段"}</span>
+        {/* ⚠️ 用户可见的条目名统一叫「笔记」（与页签名一致）。
+            页签早就从「文本」改成「笔记」了，条目本身再叫「片段」的话，
+            用户会想"片段是什么？和笔记是一回事吗？" —— 一个东西两个名字。
+            备忘页那半边已经统一过了（页签叫「备忘」、页内也叫「备忘」），
+            这边留着就是唯一的不一致。
+            ⚠️ **只改显示文案**：`id: "snippets"`、`snippets.json`、
+            `folders.json` 的 `feature` 字段都是数据契约，一个字都不能动。
+            代码注释里的「片段」是内部用词，也**不改**（批量改会产生几百行
+            纯文本 diff，把真正的改动埋掉）。 */}
+        <span>{draft.title ? "编辑笔记" : "新建笔记"}</span>
       </div>
 
       <label className="field">

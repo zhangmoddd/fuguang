@@ -45,6 +45,8 @@ import {
 import type { LucideIcon } from "lucide-react";
 
 import { api, type LinkItem, type Memo, type Snippet, type Timer } from "./api";
+import { isContextMenuOpen } from "./context-menu";
+import { useEscapeToClose } from "./escape";
 import {
   actionForKey,
   featureOfKind,
@@ -67,9 +69,19 @@ const KIND_ICON: Record<SearchKind, LucideIcon> = {
   timer: TimerIcon,
 };
 
-/** 每一类结果的中文名，显示在行的右端。 */
+/**
+ * 每一类结果的中文名，显示在行的右端。
+ *
+ * ⚠️ 这里的名字**必须与页签名一致**：`snippet` 那一栏原来写「片段」，
+ * 而页签早就叫「笔记」了 —— 用户在同一个界面上看到"笔记"和"片段"两个词，
+ * 只会以为它们是两种东西。所以统一成「笔记」。
+ * （备忘那半边在 t13 里已经统一过：页签叫「备忘」、页内也叫「备忘」。）
+ *
+ * 只改**显示文案**：`SearchKind` 的取值 `"snippet"` 是内部类型标识，
+ * 与 `snippets.json` / `folders.json` 的 `feature` 字段一样是数据契约，不动。
+ */
 const KIND_LABEL: Record<SearchKind, string> = {
-  snippet: "片段",
+  snippet: "笔记",
   link: "链接",
   memo: "备忘",
   timer: "计时",
@@ -194,16 +206,25 @@ export function CommandPalette({ onClose, onNavigate }: CommandPaletteProps) {
     setCursor(0);
   }, [query]);
 
-  // Esc 只关这一层。必须在捕获阶段截住，否则会冒泡到主面板把整个面板收起来
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      e.stopPropagation();
-      onClose();
-    };
-    document.addEventListener("keydown", onKey, true);
-    return () => document.removeEventListener("keydown", onKey, true);
-  }, [onClose]);
+  /**
+   * Esc 只关这一层 —— 但**要让位给更内层的浮层**。
+   *
+   * # 为什么必须判认领（这条是**可复现**的，不是理论问题）
+   *
+   * 1. 右键一张卡片 → 菜单弹出（z-index **100**，`context-menu.css:24`）；
+   * 2. 按 `Ctrl+K` → 命令面板挂载（z-index **60**，**在菜单下面**）；
+   * 3. 按 `Esc` → 原来这段内联监听器无条件 `stopPropagation()` + 关面板
+   *    → **菜单留在屏幕上**，浮在一个已经关掉的面板上。
+   *
+   * 这一层在 `document` 捕获阶段，比菜单的 React `onKeyDown`（委托到根容器、
+   * 冒泡阶段）更早，所以不判认领就一定抢在菜单前面。改成 `useEscapeToClose`
+   * 之后，菜单开着时这一层**既不拦传播也不回调**，事件原样往下走交给菜单；
+   * 菜单自己会 `stopPropagation`，所以主面板的「收起面板」仍然收不起来。
+   *
+   * ⚠️ 原来那段内联 `document` 捕获监听器**已经删掉**（不是并存）——
+   * 两套并存会变成"两个监听器都认领"，比原来的 bug 更难查。
+   */
+  useEscapeToClose(onClose, () => !isContextMenuOpen());
 
   /** 上下移动光标，两端循环。 */
   const move = useCallback(

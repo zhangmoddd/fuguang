@@ -35,6 +35,8 @@ import {
 import { ask } from "@tauri-apps/plugin-dialog";
 
 import { api, newId, onStateChanged, type Folder } from "./api";
+import { isContextMenuOpen } from "./context-menu";
+import { useEscapeToClose } from "./escape";
 import { childrenOf, flattenFolders, folderPath, foldersOf } from "./folders";
 import { currentPanelLabel, folderOf, readPanelState, writePanelState } from "./panel-state";
 
@@ -499,18 +501,25 @@ export function FolderEditor({ target, onSubmit, onClose }: FolderEditorProps) {
       const box = boxRef.current;
       if (box && !box.contains(e.target as Node)) onClose();
     };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      e.stopPropagation();
-      onClose();
-    };
     document.addEventListener("pointerdown", onDown, true);
-    document.addEventListener("keydown", onKey, true);
     return () => {
       document.removeEventListener("pointerdown", onDown, true);
-      document.removeEventListener("keydown", onKey, true);
     };
   }, [onClose]);
+
+  /**
+   * Esc 关掉这个弹层 —— 但**要让位给更内层的浮层**。
+   *
+   * 右键菜单的 z-index 是 100，这个弹层是 40：菜单盖在它上面，
+   * 而"Esc 关最上面那一层"是这套分工的全部内容。不判认领的话，
+   * 菜单开着按 Esc 会把这个弹层关掉、菜单留在屏幕上。
+   *
+   * ⚠️ **这条路现在撞不上**，但不是因为它不该改：这个弹层带"外部 `pointerdown`
+   * 就关自己"，而**右键也发 `pointerdown`** —— 菜单弹出来时它已经关了。
+   * 改它是为了**规则没有例外**：整个机制现在是"浮层都必须认领"，
+   * 留一个不认领的样本，下一个人加浮层时会照抄错的。
+   */
+  useEscapeToClose(onClose, () => !isContextMenuOpen());
 
   const submit = async () => {
     if (busy) return;
@@ -623,16 +632,15 @@ const INDENT_STEP = 16;
 export function FolderPicker({ folders, current, onPick, onClose }: FolderPickerProps) {
   const flat = useMemo(() => flattenFolders(folders), [folders]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      // 同日期选择器：Esc 只关这一层，别连带把整个面板收起来
-      e.stopPropagation();
-      onClose();
-    };
-    document.addEventListener("keydown", onKey, true);
-    return () => document.removeEventListener("keydown", onKey, true);
-  }, [onClose]);
+  /**
+   * Esc 只关这一层（别连带把整个面板收起来）—— 但**要让位给更内层的浮层**。
+   *
+   * 这个选择器 z-index 50、右键菜单 100：菜单盖在它上面，Esc 该先关菜单。
+   *
+   * ⚠️ 与 `FolderEditor` 同样：**这条路现在撞不上**（外部 `pointerdown` 就关自己，
+   * 而右键也发 `pointerdown`）。改它是为了规则没有例外 —— 见那处的说明。
+   */
+  useEscapeToClose(onClose, () => !isContextMenuOpen());
 
   return (
     // 点浮层外面关闭。里面那层要 stopPropagation，否则点任意一行都会先冒泡到这里

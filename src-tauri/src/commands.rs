@@ -24,9 +24,11 @@
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::linkicon::IconData;
-use crate::models::{Folder, Link, LinkKind, Memo, Settings, Timer};
+use crate::models::{Folder, Link, LinkKind, MediaRef, Memo, Settings, Timer};
 use crate::state::{self, Store};
-use crate::{autostart, backup, ballmenu, hotkey, launcher, linkicon, platform, storage, windows};
+use crate::{
+    autostart, backup, ballmenu, hotkey, launcher, linkicon, media, platform, storage, windows,
+};
 
 // ===============================================================
 // 窗口与进程
@@ -48,24 +50,65 @@ pub async fn show_ball_menu(app: AppHandle) -> Result<(), String> {
 }
 
 /// 切换主面板显隐。小球左键点击、托盘点击都调它。
+///
+/// `label` 为 `null` 表示第一个面板（`panel`）——旧版本前端不传参数也是这个语义。
 #[tauri::command]
-pub async fn toggle_panel(app: AppHandle) -> Result<(), String> {
-    windows::toggle_panel(&app).map_err(|e| e.to_string())
+pub async fn toggle_panel(app: AppHandle, label: Option<String>) -> Result<(), String> {
+    windows::toggle_panel(&app, label.as_deref()).map_err(|e| e.to_string())
 }
 
-/// 显示主面板。
+/// 显示主面板（`label` 为 `null` = 第一个面板）。目标不存在时创建它。
 #[tauri::command]
-pub async fn show_panel(app: AppHandle) -> Result<(), String> {
-    windows::show_panel(&app).map(|_| ()).map_err(|e| e.to_string())
+pub async fn show_panel(app: AppHandle, label: Option<String>) -> Result<(), String> {
+    windows::show_panel(&app, label.as_deref())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// 隐藏主面板（保留窗口实例，下次打开更快）。
+///
+/// # `label` 为空时藏的是**调用方自己那个窗口**
+///
+/// 这条命令是面板标题栏上那个 ✕ 调的。如果默认藏 `panel`，
+/// 那么 `panel-2` 上的 ✕ 会把**第一个**面板收起来，用户看到的是"点了没反应、
+/// 另一个窗口莫名其妙消失了"。所以默认值取调用窗口的 label，
+/// 只有在拿不到调用窗口时才退回 `panel`。
 #[tauri::command]
-pub async fn hide_panel(app: AppHandle) -> Result<(), String> {
-    if let Some(win) = app.get_webview_window(windows::PANEL) {
-        win.hide().map_err(|e| e.to_string())?;
-    }
-    Ok(())
+pub async fn hide_panel(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    label: Option<String>,
+) -> Result<(), String> {
+    let target = label
+        .filter(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| window.label().to_string());
+    windows::hide_panel(&app, &target)
+}
+
+/// 新建一个主面板窗口，返回它的 label（`panel-2`、`panel-3`……）。
+///
+/// 新窗口用**最小空闲编号**：关掉 `panel-2` 之后新建的又叫 `panel-2`，
+/// 于是它会回到用户上次放它的位置（见 `windows::close_panel`）。
+#[tauri::command]
+pub async fn new_panel(app: AppHandle) -> Result<String, String> {
+    let label = windows::next_panel_label(&app);
+    windows::show_panel(&app, Some(&label))
+        .map(|_| label)
+        .map_err(|e| e.to_string())
+}
+
+/// 列出当前存在的全部面板 label（按编号排序）。
+#[tauri::command]
+pub async fn list_panels(app: AppHandle) -> Vec<String> {
+    windows::panel_labels(&app)
+}
+
+/// 关闭一个面板窗口。
+///
+/// 第一个面板（`panel`）是常驻的：它只被隐藏，不销毁。
+#[tauri::command]
+pub async fn close_panel(app: AppHandle, label: String) -> Result<(), String> {
+    windows::close_panel(&app, &label)
 }
 
 /// 隐藏悬浮球。
@@ -99,11 +142,22 @@ pub async fn quit_app(app: AppHandle) {
 }
 
 /// 设置某个窗口是否置顶。
+///
+/// `label` 为 `null` 表示"调用方自己那个窗口"（理由同 [`hide_panel`]：
+/// 面板标题栏上的图钉在 `panel-2` 里必须管它自己，不能去管 `panel`）。
 #[tauri::command]
-pub async fn set_always_on_top(app: AppHandle, label: String, value: bool) -> Result<(), String> {
+pub async fn set_always_on_top(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    label: Option<String>,
+    value: bool,
+) -> Result<(), String> {
+    let target = label
+        .filter(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| window.label().to_string());
     let win = app
-        .get_webview_window(&label)
-        .ok_or_else(|| format!("窗口不存在：{label}"))?;
+        .get_webview_window(&target)
+        .ok_or_else(|| format!("窗口不存在：{target}"))?;
     win.set_always_on_top(value).map_err(|e| e.to_string())
 }
 
@@ -143,6 +197,126 @@ pub async fn paste_text(
 #[tauri::command]
 pub async fn copy_text(text: String) -> bool {
     platform::clipboard_set_text(&text)
+}
+
+/// 读取剪贴板里的文本。
+///
+/// # 为什么前端不能直接用 `navigator.clipboard.readText()`
+///
+/// WebView2 里那个 API 需要**剪贴板读权限**（`clipboard-read`），而浮光的
+/// capability 里一个剪贴板权限都没开、也没装剪贴板插件（见
+/// `capabilities/default.json` 的说明：那里只列"前端真的会用、且不能靠
+/// core:default 兜底"的能力）。所以浏览器那个调用在浮光里是**不可靠**的：
+/// 运气好弹权限提示，运气不好直接 reject —— 右键菜单的「粘贴」就只剩
+/// "请用 Ctrl+V"这句降级提示，而用户第 ⑥ 条要的是一个**能用**的粘贴。
+///
+/// Rust 侧本来就有这份能力（[`platform::clipboard_get_text`]，
+/// 模拟粘贴那条路一直在用它读用户的原文做备份），把它暴露出来即可。
+///
+/// # 为什么返回 `Option` 而不是 `Result`
+///
+/// 剪贴板里没有文本（只有图片、或者本来就是空的）是**正常情况**：
+/// 前端收到 `null` 就"这次不粘贴，退回让用户自己 Ctrl+V"。
+/// 把它做成 `Err` 的话，调用方要么把一条正常路径当错误弹给用户，
+/// 要么在每个调用点写 `catch` 去吞它 —— 两者都比 `null` 差。
+///
+/// ⚠️ 这条命令**只读文本**。剪贴板里是图片时同样返回 `None`：
+/// 图片走 [`media_import_clipboard`]（那条路会读 `CF_DIB` 并存进媒体库）。
+#[tauri::command]
+pub async fn read_clipboard_text() -> Option<String> {
+    platform::clipboard_get_text()
+}
+
+// ===============================================================
+// 图片媒体
+//
+// 像素落在 `%APPDATA%\浮光\media\`，JSON 里只留引用 —— 理由见
+// `models::MediaRef` 与 `media` 模块顶部的说明。
+//
+// 这一组命令都是 `async`：读写文件、调 GDI+、碰剪贴板都可能要等，
+// 放在主线程上会卡住窗口消息循环（见文件头的说明）。
+// ===============================================================
+
+/// 从磁盘上的一个文件导入图片。
+///
+/// 扩展名与文件头都必须是图片，按内容 sha256 去重（同一张图导入两次只留一份）。
+#[tauri::command]
+pub async fn media_import_path(app: AppHandle, path: String) -> Result<MediaRef, String> {
+    media::import_path(&app, &path)
+}
+
+/// 从剪贴板导入图片。
+///
+/// 返回 `null` 表示**剪贴板里没有图片**（用户复制的是文字），
+/// 这是正常情况，调用方退回"粘贴文字"即可，不是错误。
+///
+/// 但"有图片却读不出来"（剪贴板被占用、格式认不出、超过体积上限）会走 `Err`，
+/// 前端应当把那条中文原因显示出来 —— 压成 `null` 的话，
+/// 用户看到的是"复制了截图却什么都没发生"。
+#[tauri::command]
+pub async fn media_import_clipboard(app: AppHandle) -> Result<Option<MediaRef>, String> {
+    media::import_clipboard(&app)
+}
+
+/// 回填宽高与缩略图。
+///
+/// 宽高由前端用 canvas 量出来（Rust 侧要量就得引图片库，见 `media` 模块头部）。
+/// `thumb_png_base64` 是 canvas 的 `toDataURL("image/png")` 去掉
+/// `data:image/png;base64,` 前缀之后的部分。
+#[tauri::command]
+pub async fn media_set_meta(
+    app: AppHandle,
+    id: String,
+    width: u32,
+    height: u32,
+    thumb_png_base64: String,
+) -> Result<MediaRef, String> {
+    media::set_meta(&app, &id, width, height, &thumb_png_base64)
+}
+
+/// 读一张图片，返回可直接放进 `<img src>` 的 data URL。
+///
+/// `full = false` 时优先读缩略图（列表里用），没有缩略图就退回原图。
+/// ⚠️ `full = true` 会把整张图 base64 一遍，几十兆的图会让 IPC 很慢，
+/// 列表里一律用缩略图。
+#[tauri::command]
+pub async fn media_read(app: AppHandle, id: String, full: bool) -> Result<String, String> {
+    media::read_data_url(&app, &id, full)
+}
+
+/// 删除一张图片（原图 + 缩略图 + 元数据）。幂等。
+#[tauri::command]
+pub async fn media_delete(app: AppHandle, id: String) -> Result<(), String> {
+    media::delete(&app, &id)
+}
+
+/// 把一张图片另存到用户选定的位置（原图字节，不重新编码）。
+#[tauri::command]
+pub async fn media_export(app: AppHandle, id: String, dest_path: String) -> Result<(), String> {
+    media::export(&app, &id, &dest_path)
+}
+
+/// 把一张图片写进剪贴板（`CF_DIB`）。
+///
+/// ⚠️ 会清空用户原来的剪贴板（`EmptyClipboard`），且**不做还原** ——
+/// 理由见 `media::copy_image_to_clipboard`。
+#[tauri::command]
+pub async fn media_copy_image(app: AppHandle, id: String) -> Result<(), String> {
+    media::copy_image_to_clipboard(&app, &id)
+}
+
+/// 把一张图片"键入到当前光标"：放进剪贴板 → 切回上一次的外部窗口 → 模拟 Ctrl+V。
+///
+/// 返回 `PasteOutcome`，和文本路径共用同一个结构，前端显示提示的方式可以完全一致。
+#[tauri::command]
+pub async fn media_paste_to_target(app: AppHandle, id: String) -> Result<platform::PasteOutcome, String> {
+    media::paste_to_target(&app, &id)
+}
+
+/// 媒体库统计（张数与占用字节数）。
+#[tauri::command]
+pub async fn media_stats(app: AppHandle) -> media::MediaStats {
+    media::stats(&app)
 }
 
 // ===============================================================
@@ -494,8 +668,9 @@ pub async fn export_all(app: AppHandle, path: String) -> Result<(), String> {
 /// 从备份文件恢复全部数据。**会覆盖当前的全部数据。**
 ///
 /// 前端必须先让用户确认过再调这个命令——它没有撤销。
+/// 返回值里带着「带回了多少张图片」和「哪些图片引用缺图」，见 `backup::ImportReport`。
 #[tauri::command]
-pub async fn import_all(app: AppHandle, path: String) -> Result<(), String> {
+pub async fn import_all(app: AppHandle, path: String) -> Result<backup::ImportReport, String> {
     backup::import(&app, std::path::Path::new(&path))
 }
 

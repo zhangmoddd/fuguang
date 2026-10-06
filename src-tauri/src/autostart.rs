@@ -201,7 +201,7 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
 
     // 关闭时如果本来就没有这个值，删除会返回"找不到文件"，这不算错误
     const ERROR_FILE_NOT_FOUND: u32 = 2;
-    if status != ERROR_SUCCESS && !(status == ERROR_FILE_NOT_FOUND && !enabled) {
+    if status != ERROR_SUCCESS && (status != ERROR_FILE_NOT_FOUND || enabled) {
         return Err(format!("写入注册表失败（错误码 {status}）"));
     }
 

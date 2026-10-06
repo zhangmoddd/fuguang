@@ -44,12 +44,22 @@ const CF_UNICODETEXT: u32 = 13;
 /// 那样会对普通文本误报"你的东西被销毁了"。
 const CF_BITMAP: u32 = 2;
 const CF_METAFILEPICT: u32 = 3;
-const CF_DIB: u32 = 8;
+/// `CF_DIB`（设备无关位图）。
+///
+/// 对 `crate::media` 公开：图片模块要靠它判断"剪贴板里是不是图片"、
+/// 以及把图片写进剪贴板。两处各写一个 `8` 的话，将来改一处就会静默错位。
+pub(crate) const CF_DIB: u32 = 8;
 const CF_ENHMETAFILE: u32 = 14;
 const CF_HDROP: u32 = 15;
 const CF_DIBV5: u32 = 17;
 
 /// 浮光自己的窗口标题，用于把「前台窗口」判定为「不是外部目标」。
+///
+/// ⚠️ **这是精确标题匹配，不是前缀匹配。** 多面板（`panel` / `panel-2` / …）
+/// 全部共用同一个标题「浮光·主面板」正是为了这个白名单：一旦给新面板起名
+/// 「浮光·主面板 2」，它就匹配不上这里，前台跟踪线程会把浮光自己的面板
+/// 记成"用户上一次在用的窗口"，于是「粘贴到光标」会把内容打回浮光自己身上。
+/// `windows.rs` 里有 `面板标题必须与平台白名单一致` 这条测试钉着这个依赖。
 pub const OUR_WINDOW_TITLES: [&str; 3] = ["浮光·球", "浮光·主面板", "浮光·提醒"];
 
 /// 用户上一次真正在用的外部窗口句柄。
@@ -142,7 +152,10 @@ fn key_event(vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
 }
 
 /// 模拟按下并松开 Ctrl+V。返回是否**真的**注入成功。
-fn send_ctrl_v() -> bool {
+///
+/// 对 `crate::media` 公开：把图片"键入到当前光标"用的是同一个按键序列，
+/// 所以也必须共用同一份失败判定（`SendInput` 被 UIPI 拦下来时返回 0）。
+pub(crate) fn send_ctrl_v() -> bool {
     let inputs = [
         key_event(VK_CONTROL, 0),
         key_event(VK_V, 0),
@@ -174,7 +187,11 @@ fn send_ctrl_v() -> bool {
 /// 用户原来的剪贴板内容**完好无损**（曾经这里的注释写成"已经被清掉了"，
 /// 那个错误认知让调用方对用户谎报"原文已被清空、无法还原"，
 /// 见 `ClipboardWrite::FailedUntouched`）。
-fn open_clipboard_retry() -> bool {
+///
+/// 对 `crate::media` 公开：图片路径也要打开剪贴板，而"失败就重试几次"这条
+/// 经验（Office、剪贴板管理器会短暂占用剪贴板）对图片同样成立 ——
+/// 各写一份必然会有一份漏掉重试。
+pub(crate) fn open_clipboard_retry() -> bool {
     for _ in 0..5 {
         if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
             return true;
@@ -231,7 +248,10 @@ fn clipboard_state(text: &str) -> Option<bool> {
 }
 
 /// 把字符串转成 NUL 结尾的 UTF-16，供 Win32 的 `*W` 系列函数用。
-fn wide(s: &str) -> Vec<u16> {
+///
+/// 对 `crate::media` 公开：读剪贴板图片时要按**格式名**查注册格式
+/// （`RegisterClipboardFormatW("PNG")`），用的是同一套转换。
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -350,7 +370,7 @@ pub fn clipboard_get_text() -> Option<String> {
             CloseClipboard();
             return None;
         }
-        let ptr = GlobalLock(handle as *mut core::ffi::c_void) as *const u16;
+        let ptr = GlobalLock(handle) as *const u16;
         if ptr.is_null() {
             CloseClipboard();
             return None;
@@ -365,7 +385,7 @@ pub fn clipboard_get_text() -> Option<String> {
             }
         }
         let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
-        GlobalUnlock(handle as *mut core::ffi::c_void);
+        GlobalUnlock(handle);
         CloseClipboard();
         Some(text)
     }

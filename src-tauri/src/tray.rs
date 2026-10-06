@@ -12,12 +12,18 @@ use crate::windows;
 /// 创建托盘图标与右键菜单。
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "打开主面板", true, None::<&str>)?;
+    // 多面板的入口之一。托盘是"兜底入口"，所以"再开一个面板"也必须有 ——
+    // 否则用户把小球藏起来之后就只剩主面板那一个窗口能点了。
+    let new_panel = MenuItem::with_id(app, "new_panel", "新建窗口", true, None::<&str>)?;
     let toggle_ball = MenuItem::with_id(app, "toggle_ball", "显示/隐藏悬浮球", true, None::<&str>)?;
     let open_data = MenuItem::with_id(app, "open_data", "打开数据文件夹", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出浮光", true, None::<&str>)?;
 
-    let menu = Menu::with_items(app, &[&show, &toggle_ball, &open_data, &sep, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&show, &new_panel, &toggle_ball, &open_data, &sep, &quit],
+    )?;
 
     TrayIconBuilder::with_id("main-tray")
         .icon(app.default_window_icon().cloned().ok_or_else(|| {
@@ -32,6 +38,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 // 托盘回调在主线程上执行，必须丢到独立线程再创建窗口
                 windows::spawn_show_panel(app);
             }
+            "new_panel" => windows::spawn_new_panel(app),
             "toggle_ball" => toggle_ball_visibility(app),
             "open_data" => open_data_dir(app),
             "quit" => {

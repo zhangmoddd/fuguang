@@ -22,12 +22,21 @@ const PREFIX: &str = "ball:";
 /// 构建小球右键菜单。
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let open = MenuItem::with_id(app, format!("{PREFIX}panel"), "打开主面板", true, None::<&str>)?;
+    // 「打开主面板」始终只操作第一个面板（它常驻、位置稳定），
+    // 「新建窗口」才是多面板的入口 —— 两件事分开，用户不会"点一下又多一个窗口"。
+    let new_panel = MenuItem::with_id(
+        app,
+        format!("{PREFIX}new"),
+        "新建窗口",
+        true,
+        None::<&str>,
+    )?;
     let data = MenuItem::with_id(app, format!("{PREFIX}data"), "打开数据文件夹", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, format!("{PREFIX}hide"), "隐藏悬浮球", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, format!("{PREFIX}quit"), "退出浮光", true, None::<&str>)?;
 
-    Menu::with_items(app, &[&open, &data, &hide, &sep, &quit])
+    Menu::with_items(app, &[&open, &new_panel, &data, &hide, &sep, &quit])
 }
 
 /// 在小球窗口上弹出右键菜单。
@@ -72,6 +81,7 @@ pub fn register_handler(app: &AppHandle) {
                 // 菜单回调在主线程上执行，必须丢到独立线程再创建窗口
                 windows::spawn_show_panel(&handle);
             }
+            "new" => windows::spawn_new_panel(&handle),
             "data" => {
                 if let Ok(dir) = crate::storage::reveal_data_dir(&handle) {
                     let _ = tauri_plugin_opener::open_path(dir.to_string_lossy().to_string(), None::<&str>);

@@ -6,6 +6,7 @@
 //! - [`platform`]  剪贴板、模拟粘贴、前台窗口记录
 //! - [`launcher`]  启动外部程序、打开文件夹与网址
 //! - [`linkicon`]  从 exe/文件提取图标
+//! - [`media`]     图片媒体：落盘、读取、剪贴板互转
 //! - [`autostart`] 开机自启（注册表）
 //! - [`hotkey`]    全局热键唤出面板
 //!
@@ -13,11 +14,11 @@
 //! - [`models`]     数据模型（时间语义见该文件顶部）
 //! - [`storage`]    数据目录与 JSON 原子读写
 //! - [`state`]      内存状态与持久化
-//! - [`backup`]     全量数据的导出与导入
+//! - [`backup`]     全量数据的导出与导入（含图片）
 //! - [`scheduler`]  后台调度线程：到点弹提醒
 //!
 //! 界面
-//! - [`windows`]    小球 / 主面板 / 提醒弹窗的创建与定位
+//! - [`windows`]    小球 / 主面板（可多个）/ 提醒弹窗的创建与定位
 //! - [`tray`]       系统托盘兜底入口
 //! - [`ballmenu`]   悬浮球的右键原生菜单
 //! - [`commands`]   暴露给前端的命令
@@ -30,6 +31,7 @@ mod diag;
 mod hotkey;
 mod launcher;
 mod linkicon;
+mod media;
 mod models;
 mod platform;
 mod scheduler;
@@ -77,6 +79,9 @@ pub fn run() {
             commands::toggle_panel,
             commands::show_panel,
             commands::hide_panel,
+            commands::new_panel,
+            commands::list_panels,
+            commands::close_panel,
             commands::hide_ball,
             commands::show_ball,
             commands::quit_app,
@@ -85,6 +90,18 @@ pub fn run() {
             // 剪贴板
             commands::paste_text,
             commands::copy_text,
+            // 读剪贴板文本：右键菜单的「粘贴」用它（浏览器 API 在浮光里没有权限）
+            commands::read_clipboard_text,
+            // 图片媒体
+            commands::media_import_path,
+            commands::media_import_clipboard,
+            commands::media_set_meta,
+            commands::media_read,
+            commands::media_delete,
+            commands::media_export,
+            commands::media_copy_image,
+            commands::media_paste_to_target,
+            commands::media_stats,
             // 通用数据文件
             commands::read_data,
             commands::write_data,
@@ -199,11 +216,19 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            let label = window.label();
+
             // 关闭主面板时只隐藏不销毁，下次打开更快，也保住面板内的搜索状态。
             // 但提醒弹窗要真正销毁，否则下次弹出会残留旧内容。
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let label = window.label();
-                if label == windows::PANEL {
+                // ⚠️ 判据是**面板前缀**而不是 `label == PANEL`。
+                //
+                // 只拦 `panel` 的话，用户对 `panel-2` 按 Alt+F4（或任务视图里的关闭）
+                // 会真的销毁它 —— 后果有两层：那个窗口里前端的全部状态（当前文件夹、
+                // 搜索框内容、未落盘的编辑）一起丢；更糟的是窗口卸载时前端会把
+                // **内存里那份陈旧数据** flush 落盘，把别的窗口刚写的新数据整份盖回去。
+                // 隐藏则两者都不会发生。
+                if windows::is_panel_label(label) {
                     api.prevent_close();
                     let _ = window.hide();
                 } else if label == windows::BALL {
@@ -220,6 +245,24 @@ pub fn run() {
                     //
                     // 只挡不藏：小球是常驻入口，藏起来用户就只能去托盘找了。
                     api.prevent_close();
+                }
+                return;
+            }
+
+            // 面板被拖动之后记住它的位置（多面板时尤其重要：不错开就全叠在一起）。
+            //
+            // 放在 Rust 侧而不是让前端调 `save_panel_pos`：拖动是系统行为，
+            // 前端拿不到"用户什么时候松手"。小球的位置仍然由前端防抖保存
+            // （`commands::save_ball_pos`），两条路径互不重叠。
+            if let tauri::WindowEvent::Moved(position) = event {
+                if windows::is_panel_label(label) {
+                    let scale = window.scale_factor().unwrap_or(1.0);
+                    windows::remember_panel_move(
+                        window.app_handle(),
+                        label,
+                        position.x as f64 / scale,
+                        position.y as f64 / scale,
+                    );
                 }
             }
         })

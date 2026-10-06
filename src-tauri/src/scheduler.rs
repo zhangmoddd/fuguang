@@ -611,6 +611,9 @@ mod tests {
             remind_at,
             repeat: Repeat::None,
             fired_for: None,
+            // 图片是独立字段，与提醒摘要无关（见 `summarize_body` 的说明）。
+            // 这里显式给空，正好也是「带图的备忘到点提醒时摘要只取正文」那条断言的输入。
+            images: Vec::new(),
             created_at: 0,
             updated_at: 0,
         }
@@ -910,6 +913,41 @@ mod tests {
 
         assert!(result.alerts.is_empty());
         assert!(!result.memos_changed);
+    }
+
+    #[test]
+    fn 带图片的备忘到点提醒时摘要只取正文() {
+        // 图片是 `Memo::images` 这个**独立字段**，不是正文的一部分，
+        // 所以 `summarize_body(&m.body)` 天然看不到它。
+        //
+        // 这条测试的意义是把"天然看不到"变成"钉住不许变"：
+        // 如果哪天有人为了"提醒里也显示图"改成把图片描述拼进 body，
+        // 提醒弹窗的正文会立刻变成一堆文件名/路径，用户看到的是一句废话。
+        let mut timers = Vec::new();
+        let mut memo_with_image = memo("m", Some(NOW));
+        memo_with_image.images = vec![crate::models::MediaRef {
+            id: "a".repeat(32),
+            name: "屏幕截图 2026-09-19.png".into(),
+            mime: "image/png".into(),
+            width: 1920,
+            height: 1080,
+            bytes: 123_456,
+            added_at: 1,
+        }];
+        let mut memos = vec![memo_with_image];
+
+        let result = evaluate(&mut timers, &mut memos, NOW);
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(
+            result.alerts[0].body, "正文内容",
+            "提醒摘要只能取正文，不能把图片信息算进去"
+        );
+        assert!(
+            !result.alerts[0].body.contains("png"),
+            "摘要里不该出现图片文件名：{}",
+            result.alerts[0].body
+        );
     }
 
     #[test]

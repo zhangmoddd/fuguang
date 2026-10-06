@@ -123,6 +123,13 @@ pub fn start(app: AppHandle) {
             match msg.message {
                 WM_HOTKEY => {
                     // 切面板会创建窗口，必须另开线程（见 windows::spawn_toggle_panel）
+                    //
+                    // ⚠️ 热键**只唤出第一个面板**（`panel`），这是刻意的：
+                    // 本模块只有一个 `HOTKEY_ID`，要支持"每组热键对应一个面板"
+                    // 得把注册模型改成 `id → 组合键` 的映射，并处理
+                    // "哪个面板绑定哪个组合键"的持久化。本轮不做，
+                    // 所以多面板只能从托盘/悬浮球菜单的「新建窗口」开。
+                    // README 的「已知限制」里也写了这一条。
                     crate::windows::spawn_toggle_panel(&app);
                 }
                 MSG_APPLY => process_requests(),
@@ -564,7 +571,7 @@ mod tests {
         assert_eq!(parse("Ctrl+Esc").unwrap().label, "Ctrl+Esc");
         assert_eq!(parse("Ctrl+PageUp").unwrap().vk, 0x21);
         assert_eq!(parse("Ctrl+PgUp").unwrap().label, "Ctrl+PageUp");
-        assert_eq!(parse("Ctrl+ArrowUp").is_err(), true, "未支持的别名应报错而不是猜");
+        assert!(parse("Ctrl+ArrowUp").is_err(), "未支持的别名应报错而不是猜");
         assert_eq!(parse("Ctrl+Up").unwrap().vk, 0x26);
     }
 

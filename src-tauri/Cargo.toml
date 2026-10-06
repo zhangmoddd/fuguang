@@ -48,6 +48,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     # 图标位图转 RGBA 需要 GDI
     "Win32_Graphics_Gdi",
+    # 图片编解码（剪贴板 DIB ⇄ PNG）用系统自带的 GDI+：
+    # gdiplus.dll 从 XP 起就在系统里，不进安装包，比引 image crate 划算得多
+    # （体积取舍见 media.rs / linkicon.rs 的说明）
+    "Win32_Graphics_GdiPlus",
 ] }
 
 # 发布构建体积优化：用户下载的就是这个 exe，尽量压小。

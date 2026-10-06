@@ -221,10 +221,11 @@ impl Timer {
 }
 
 /// 提醒的重复规则。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Repeat {
     /// 只提醒一次。
+    #[default]
     None,
     /// 每天同一时刻。
     Daily,
@@ -234,12 +235,6 @@ pub enum Repeat {
     Monthly,
     /// 周一至周五同一时刻。
     Weekday,
-}
-
-impl Default for Repeat {
-    fn default() -> Self {
-        Repeat::None
-    }
 }
 
 /// 一条备忘录。
@@ -275,8 +270,65 @@ pub struct Memo {
     #[serde(default)]
     pub fired_for: Option<i64>,
 
+    /// 这条备忘里附带的图片。
+    ///
+    /// # 为什么是普通字段 + `#[serde(default)]`，而不是新的枚举值
+    ///
+    /// `memos.json` 是**整份读**的：只要有一个字段解析不了，整个文件会被
+    /// [`crate::storage`] 判为损坏并改名隔离（见 `storage::read_json_at`），
+    /// 用户看到的是「我的备忘全没了」。加一个带 `default` 的普通字段则两头都安全：
+    /// 老文件（没有 `images`）读进来是空数组，新文件被老版本读到也只是忽略多出来的键。
+    ///
+    /// 反例就是枚举：`models.rs` 的「未知的枚举值会解析失败而不是静默取错」那条测试
+    /// 钉着的行为意味着，往枚举里加一个取值会让**旧版本**读不了整份文件。
+    #[serde(default)]
+    pub images: Vec<MediaRef>,
+
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// 一张图片的引用。**只存元数据，不存像素。**
+///
+/// # 为什么不把图片 base64 塞进 JSON
+///
+/// 数据文件是**整份覆盖写**的，而且前端每次改一条片段都可能重写整份
+/// `snippets.json`（见 `src/lib/store.ts`）。把图片塞进去会有三个后果：
+/// 1. 文件体积按图片大小膨胀几个数量级，每次击键都要重写这么大的文件；
+/// 2. 全文搜索、摘要、命令面板的关键词匹配都会去扫那段 base64 —— 既是纯浪费，
+///    也会让"搜到一张图"变成"搜到一段乱码"；
+/// 3. 备份文件跟着变成几十兆，而它本来是可以直接用记事本打开的。
+///
+/// 所以像素单独落盘在 `%APPDATA%\浮光\media\`，JSON 里只留这个引用
+/// （见 [`crate::media`]）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaRef {
+    /// 图片 id，等于**文件内容的 sha256 前 32 位十六进制**。
+    ///
+    /// 用内容摘要当 id 而不是随机 id，是为了让「同一张图导入两次」天然只留一份：
+    /// 第二次导入算出来的 id 与第一次相同，直接复用已有文件
+    /// （见 `media::import_bytes_at`）。
+    #[serde(default)]
+    pub id: String,
+    /// 原始文件名（或剪贴板图片的自动命名），用于在界面上显示与「另存为」。
+    #[serde(default)]
+    pub name: String,
+    /// MIME 类型，例如 `image/png`。由文件头（magic）判定，不看扩展名。
+    #[serde(default)]
+    pub mime: String,
+    /// 宽（像素）。导入时未知，由前端用 canvas 量出来回填（见 `media_set_meta`）。
+    #[serde(default)]
+    pub width: u32,
+    /// 高（像素）。见 [`MediaRef::width`]。
+    #[serde(default)]
+    pub height: u32,
+    /// 文件字节数。
+    #[serde(default)]
+    pub bytes: u64,
+    /// 导入时刻（Unix 毫秒）。
+    #[serde(default)]
+    pub added_at: i64,
 }
 
 /// 一个快捷链接。

@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "浮光各窗口的默认权限集。这里只列**不能靠 core:default 兜底、且前端真的会用**的能力。删掉的那些分两类：(1) allow-set-position / allow-hide / allow-show / allow-set-focus / allow-set-always-on-top —— 前端零调用，窗口的显示/隐藏/定位/置顶全部走 Rust 命令（commands.rs / windows.rs），不经 ACL；(2) allow-outer-position / allow-scale-factor / allow-is-visible / allow-internal-toggle-devtools / opener:default —— 前三个已包含在 core:default 展开出的 core:window:default 里，第四个在 core:webview:default 里，opener 则只被 Rust 自由函数调用、不经 ACL。注意：scale_factor 与 internal_toggle_devtools 其实**仍在被使用**（小球取 DPI；Ctrl+Shift+I 走 Tauri 注入的脚本），只是靠 core:default 兜底 —— 所以这次删的是「冗余的显式声明」，不是「冗余的能力」。将来若有人收紧 core:default、改成逐项显式授权，必须把这两项写回来，否则会静默失效（不报错，只是没反应）。",
-  "windows": ["ball", "panel", "alert"],
+  "windows": ["ball", "panel*", "alert"],
   "permissions": [
     "core:default",
 

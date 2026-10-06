@@ -244,10 +244,13 @@ unsafe fn extract_inner(path: &str) -> Option<IconData> {
 ///
 /// 自己写而不是引入 `base64` crate：只有这一个用途，
 /// 二十来行代码换掉一个依赖是划算的（本项目对发布体积敏感）。
-fn base64_encode(data: &[u8]) -> String {
+///
+/// 对 `crate::media` / `crate::backup` 公开：图片的 base64 也走这一份 ——
+/// 三处各写一份编码器，迟早会有一处编错（而编错的表现是"图片花了/文件坏了"）。
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -449,7 +452,7 @@ mod tests {
                 "长度 {len} 的输入编码后长度不是 4 的倍数：{encoded}"
             );
             // 期望长度：每 3 字节 4 字符，不足的按 4 取整
-            assert_eq!(encoded.len(), (len + 2) / 3 * 4);
+            assert_eq!(encoded.len(), len.div_ceil(3) * 4);
         }
     }
 

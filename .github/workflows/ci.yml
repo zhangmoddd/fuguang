@@ -42,6 +42,13 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
+      # 放在类型检查旁边、且**排在它前面**：这条检查是毫秒级的（纯字符串扫描），
+      # 而它拦的是 tsc **抓不到**的一类错 —— `invoke("xxx")` 里的命令名只是个
+      # 字符串，Rust 侧改了名字或压根没注册，tsc 与单元测试（IPC 是 mock 的）
+      # 都会全绿，只有点下去才会发现"什么都没发生"。
+      - name: 命令名核对（api.ts ↔ Rust invoke_handler）
+        run: node scripts/check-commands.mjs
+
       - name: 类型检查
         run: npx tsc -b --force
 

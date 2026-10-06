@@ -15,7 +15,8 @@
     "test:watch": "vitest",
     "test:dst": "node scripts/run-tests-in-tz.mjs America/New_York",
     "test:all": "npm run test && npm run test:dst",
-    "check": "tsc -b && vitest run"
+    "check:commands": "node scripts/check-commands.mjs",
+    "check": "npm run check:commands && tsc -b && vitest run"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

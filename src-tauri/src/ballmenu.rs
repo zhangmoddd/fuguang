@@ -82,7 +82,10 @@ pub fn register_handler(app: &AppHandle) {
                     let _ = ball.hide();
                 }
             }
-            "quit" => handle.exit(0),
+            "quit" => {
+                crate::diag!("[浮光] 退出：悬浮球右键菜单");
+                handle.exit(0);
+            }
             _ => {}
         }
     });

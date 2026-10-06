@@ -45,6 +45,29 @@ use tauri::Manager;
 
 /// 应用入口。由 `main.rs` 调用。
 pub fn run() {
+    // 正式版**没有任何地方能看到 panic**：`main.rs` 是 `windows_subsystem = "windows"`
+    // （没有控制台、没有 stderr），release 档又开着 `panic = "abort"` ——
+    // 于是任何一处 panic（**任何线程**）都是静默秒退：窗口凭空消失，
+    // 用户只会说"软件自己退出了"，而事后一点线索都查不到。
+    //
+    // 这个钩子把 panic 的文件、行号、内容写进 `app.log`。`panic = "abort"` 下
+    // 钩子照样会执行，只是执行完就 abort —— 有它和没它的区别就是
+    // "能定位"和"永远只能猜"。
+    std::panic::set_hook(Box::new(|info| {
+        let at = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "位置未知".to_string());
+        // panic 载荷有两种：字面量是 `&str`，`format!` / `expect` 出来的是 `String`
+        let what = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "（读不出内容）".to_string());
+        crate::diag!("[浮光] panic @ {at}：{what}");
+    }));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -168,6 +191,11 @@ pub fn run() {
             // 才能把焦点还回去，让 Ctrl+V 落到正确的地方。
             start_foreground_tracker();
 
+            // 启动完成留一行。作用不是"记录成功"，而是给 `app.log` 一个**起点**：
+            // 日志最后一行是"启动完成"、后面什么都没有，说明进程是被崩溃或强杀
+            // 带走的；走正常退出的话，那三处出口都会各写一行（见下面）。
+            crate::diag!("[浮光] 启动完成 v{}", env!("CARGO_PKG_VERSION"));
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -178,6 +206,20 @@ pub fn run() {
                 if label == windows::PANEL {
                     api.prevent_close();
                     let _ = window.hide();
+                } else if label == windows::BALL {
+                    // ⚠️ 小球也必须挡住。
+                    //
+                    // Tauri 的默认行为是「所有窗口都关掉就退出进程」，而小球是
+                    // **唯一一个在启动时就存在的窗口**：主面板要用户点开才创建。
+                    // 于是启动后对小球来一次 WM_CLOSE（Alt+F4、任务视图里的关闭等）
+                    // 就能把整个软件带走，表现正是"我没主动关，它自己退出了"。
+                    //
+                    // `closable(false)` 只保证"没有关闭按钮" —— 它挡的是那个按钮，
+                    // 不是 WM_CLOSE 这条消息本身（到底拦不拦没实测过），
+                    // 不能拿它当兜底。这里显式挡一道，代价是零。
+                    //
+                    // 只挡不藏：小球是常驻入口，藏起来用户就只能去托盘找了。
+                    api.prevent_close();
                 }
             }
         })

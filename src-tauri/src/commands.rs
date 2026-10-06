@@ -92,6 +92,9 @@ pub async fn show_ball(app: AppHandle) -> Result<(), String> {
 /// 必须走这个命令显式结束进程，否则会留下无法关闭的后台进程。
 #[tauri::command]
 pub async fn quit_app(app: AppHandle) {
+    // 正常退出也留一行：`app.log` 里"最后一行是启动完成"和
+    // "最后一行是某处主动退出"是两种完全不同的结论（见 lib.rs 的 panic 钩子）。
+    crate::diag!("[浮光] 退出：设置页的「退出浮光」");
     app.exit(0);
 }
 

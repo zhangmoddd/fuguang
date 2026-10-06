@@ -34,7 +34,10 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             }
             "toggle_ball" => toggle_ball_visibility(app),
             "open_data" => open_data_dir(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                crate::diag!("[浮光] 退出：托盘菜单");
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

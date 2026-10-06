@@ -57,3 +57,10 @@ pnpm-debug.log*
 #
 # 用 / 前缀锚定在仓库根目录，避免误伤子目录里的同名文件。
 /开发笔记.md
+
+# --- AgentTeams 运行时状态：只在本地，绝不上传 ---
+#
+# 多 agent 协作时，`.agent-teams/<团队名>/` 下会有 team.json、inbox/*.jsonl
+# 之类的运行时文件。它们是本机协作的中间状态，不是项目内容 ——
+# 混进仓库既没意义，也会把 agent 之间的对话记录推上 GitHub。
+/.agent-teams/

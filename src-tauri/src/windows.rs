@@ -109,11 +109,78 @@ pub struct WindowState {
     pub panels: HashMap<String, PanelPos>,
 }
 
-/// 一个面板窗口记住的位置（逻辑像素）。
+/// 一个面板窗口记住的位置。
+///
+/// # 单位是**物理**像素，不是逻辑像素
+///
+/// 这一点和 [`WindowState::ball_x`] 刻意不同，理由是同一条：
+/// **存进去的和取出来的必须是同一个坐标系**。
+///
+/// - 存：`WindowEvent::Moved` 给的就是物理坐标，[`remember_panel_move`]
+///   **直传**落盘（见 [`PanelPos::from_moved`]）；
+/// - 取：`set_position(PhysicalPosition)` 吃的也是物理坐标（见
+///   [`place_panel_at`]），并且"这个点还在不在某块屏幕上"的
+///   `monitor_from_point` 同样是物理坐标。
+///
+/// 中间**不留"当时的缩放比例"**，所以换缩放比例、把窗口拖到另一块不同 DPI 的
+/// 屏幕上，读回来的位置都不会漂。
+///
+/// 曾经存的是逻辑像素（`Moved` 的物理值 ÷ 当时的 `scale_factor`，
+/// 取用时再乘**当前**的 `scale_factor`）。那在"存和取之间缩放比例没变过"时
+/// 看着是对的，但用户完全可能把面板从 100% 的屏幕拖到 150% 的屏幕、或者中途
+/// 改了显示缩放 —— 那时用的比例就是错的，窗口会落到离用户放的地方差一截的位置，
+/// 而且**只在跨 DPI 时复现**，极难归因。存物理坐标就没有这个中间态。
+///
+/// ⚠️ 中间还短暂出现过"`lib.rs` 除一次、这里再乘回一次"的写法。那**不是**恒等：
+/// 两次 `scale_factor()` 是两次独立调用，跨 DPI 移动时可能给出不同的值，
+/// 落盘值会按 `s2/s1` 偏掉（算术见 [`PanelPos::from_moved`]）。
+/// 现在两边都不换算，"两次取值必须相同"这个前提本身就不存在了。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PanelPos {
     pub x: f64,
     pub y: f64,
+}
+
+impl PanelPos {
+    /// 从 `Moved` 事件给的**物理**坐标直传。
+    ///
+    /// # 为什么坐标必须是物理值（以及这次改动消掉了什么）
+    ///
+    /// 逻辑坐标只在一块显示器上自洽：它等于"物理值 ÷ 那块屏幕的缩放比例"。
+    /// 面板位置以前就是按逻辑值存的（存的时候除一次当时的 `scale_factor`，
+    /// 取用时乘**当前**的 `scale_factor`）—— 一旦存和取用不在同一块屏幕上
+    /// （把面板从 100% 的屏幕拖到 150% 的屏幕、或者中途改了显示缩放），
+    /// 两个比例就不是同一个了，窗口会落到离用户放的地方差一截的位置，
+    /// 而且**只在跨 DPI 时复现**，极难归因。
+    ///
+    /// 物理坐标没有这个问题：`Moved` 给的是物理值，
+    /// `set_position(PhysicalPosition)` 与 `monitor_from_point` 也都吃物理值，
+    /// 三处同一个坐标系，中间不需要"当时的比例"。
+    ///
+    /// 这个函数以前叫 `from_logical(x, y, scale)`：那时 `lib.rs` 先把物理值
+    /// 除以它取的一次 `scale_factor()`，这里再乘回**自己另取**的一次。
+    ///
+    /// 那**不是**恒等 —— 两次取值是两次独立调用，只在同值时才是恒等。
+    /// 跨 DPI 移动恰恰是它们可能不同的场景，此时落盘值按 `s2/s1` 偏掉：
+    /// 真值 x=1200、s1=1、s2=1.5 时写成 1800（偏 600 像素，比面板宽 420 还多），
+    /// 而**下次显示**就按这个偏掉的值摆窗口。
+    ///
+    /// 现在 `lib.rs` 直接传物理值、这里只做直传，`s1`/`s2` 这两个取值
+    /// 整个消失了，所以"它们必须相同"这个前提问题也不存在了。
+    fn from_moved(x: i32, y: i32) -> Self {
+        Self {
+            x: x as f64,
+            y: y as f64,
+        }
+    }
+
+    /// 取整成 `set_position` 要的物理像素。
+    ///
+    /// 用 `round()` 而不是 `as i32`（截断）：JSON 里的浮点尾巴（手改过的文件、
+    /// 或者将来有人存了小数）截断会让位置偏 1 像素，四舍五入更接近原意。
+    fn physical(self) -> (i32, i32) {
+        (self.x.round() as i32, self.y.round() as i32)
+    }
 }
 
 /// 面板之间错开的距离（逻辑像素）。
@@ -233,7 +300,7 @@ pub fn save_ball_position(app: &AppHandle, x: f64, y: f64) -> Result<(), String>
 /// 节流（比如"每 500ms 最多写一次"）会把**用户松手那一刻**的位置丢掉 ——
 /// 而那恰好是唯一重要的那一次。所以这里攒着，等安静下来再写一次。
 struct MoveFlush {
-    pending: Vec<(String, (f64, f64))>,
+    pending: Vec<(String, PanelPos)>,
     running: bool,
 }
 
@@ -246,19 +313,25 @@ static MOVE_FLUSH: Mutex<MoveFlush> = Mutex::new(MoveFlush {
 
 /// 收到面板移动事件时记下来（由 `lib.rs` 的 `on_window_event` 调用）。
 ///
+/// `x` / `y` 是 `WindowEvent::Moved` 给的**物理**像素，直传落盘 ——
+/// 这里**不做任何 DPI 折算**，理由见 [`PanelPos::from_moved`]。
+///
 /// 位置记忆放在 Rust 侧而不是让前端去调 `save_panel_pos`：窗口拖动是**系统行为**，
 /// 前端拿不到"用户什么时候松手"，只能靠 `resize`/`scroll` 之类的近似信号，
 /// 而它已经有别的事要管了。
-pub fn remember_panel_move(app: &AppHandle, label: &str, x: f64, y: f64) {
-    if !is_panel_label(label) || validate_position(x, y).is_err() {
+pub fn remember_panel_move(app: &AppHandle, label: &str, x: i32, y: i32) {
+    // 入参是 i32，天然有限，所以这里**不需要** `validate_position`
+    // （那是给前端传来的 f64 用的）—— 这是按物理整数传参的附带好处之一
+    if !is_panel_label(label) {
         return;
     }
+    let pos = PanelPos::from_moved(x, y);
 
     let spawn_flusher = {
         let mut state = MOVE_FLUSH.lock().unwrap_or_else(|e| e.into_inner());
         match state.pending.iter_mut().find(|(l, _)| l == label) {
-            Some(slot) => slot.1 = (x, y),
-            None => state.pending.push((label.to_string(), (x, y))),
+            Some(slot) => slot.1 = pos,
+            None => state.pending.push((label.to_string(), pos)),
         }
         if state.running {
             false
@@ -292,8 +365,8 @@ fn flush_panel_moves(app: AppHandle) {
         };
 
         let mut window_state = load_window_state(&app);
-        for (label, (x, y)) in batch {
-            window_state.panels.insert(label, PanelPos { x, y });
+        for (label, pos) in batch {
+            window_state.panels.insert(label, pos);
         }
         if let Err(err) = storage::write_json(&app, FILE_WINDOW, &window_state) {
             // 位置记不住不该弹任何东西给用户，但必须留下线索
@@ -519,8 +592,17 @@ fn create_panel(app: &AppHandle, label: &str) -> tauri::Result<WebviewWindow> {
 }
 
 /// 隐藏指定面板（保留窗口实例，下次打开更快）。
+///
+/// ⚠️ 校验目标是**面板**窗口：传进来一个非面板 label 时直接报错，而不是
+/// 去把它藏起来。`commands::hide_panel` 里也有一道同样的检查 —— 两层都留着
+/// 是刻意的：命令层挡的是"前端传错 label"，这一层挡的是**将来任何直接调
+/// 这个函数的调用方**（它不知道面板 label 长什么样）。少了这一层，
+/// 一次"收起面板"就可能把悬浮球藏起来。
 pub fn hide_panel(app: &AppHandle, label: &str) -> Result<(), String> {
     let label = normalize_panel_label(Some(label));
+    if !is_panel_label(&label) {
+        return Err(format!("{label} 不是面板窗口"));
+    }
     if let Some(win) = app.get_webview_window(&label) {
         win.hide().map_err(|e| e.to_string())?;
     }
@@ -537,12 +619,18 @@ pub fn hide_panel(app: &AppHandle, label: &str) -> Result<(), String> {
 /// # 额外面板直接销毁
 ///
 /// 用户点「关闭这个窗口」就是明确不要它了。**代价**：那个窗口里前端的
-/// 内存状态（例如正在编辑但还没落盘的片段）会一起丢。要彻底解决需要前端
-/// 在关闭前主动 flush 一次（见 `src/lib/store.ts` 的写盘时机），
-/// 那属于前端的改动面，这里只保证**不会**顺手把别的窗口的数据冲掉。
+/// 内存状态（例如正在编辑但还没落盘的笔记）会一起丢。
+///
+/// 这条限制**不在 Rust 侧硬修**（修法在前端：`closePanel` 之前先 `await flush()`），
+/// 而且它属于产品级取舍 —— 要写进 README 的「已知限制」，让用户知道
+/// "关窗口前请确认没有正在敲的内容"。README 不在本次改动范围内，已交队长派发。
+///
+/// 代码这边只做一件事：关闭前留一行日志。用户事后说"我的东西丢了"时，
+/// `app.log` 里这一行能把"是关窗口关掉的"和"是崩溃/被强杀"区分开 ——
+/// 两者在用户描述里长得一模一样，没有这行就只能猜。
 ///
 /// 用 `destroy()` 而不是 `close()`：`close()` 会走 `CloseRequested`，
-/// 而那个事件已经被 [`crate::windows::is_panel_label`] 的分支拦成"只隐藏"了，
+/// 而那个事件已经被 [`is_panel_label`] 的分支拦成"只隐藏"了，
 /// 于是"关闭"会变成"藏起来"、用户点了没反应。
 pub fn close_panel(app: &AppHandle, label: &str) -> Result<(), String> {
     let label = normalize_panel_label(Some(label));
@@ -553,6 +641,9 @@ pub fn close_panel(app: &AppHandle, label: &str) -> Result<(), String> {
         return Err(format!("{label} 不是面板窗口"));
     }
     if let Some(win) = app.get_webview_window(&label) {
+        crate::diag!(
+            "[浮光] 关闭额外面板 {label}：该窗口里未落盘的前端改动会一起丢（README 已知限制）"
+        );
         win.destroy().map_err(|e| e.to_string())?;
     }
     // 记住的位置**刻意保留**：下次新建窗口如果又拿到这个 label，
@@ -579,23 +670,30 @@ fn position_panel(app: &AppHandle, panel: &WebviewWindow, label: &str) {
     position_panel_near_ball(app, panel, panel_number(label).unwrap_or(1));
 }
 
-/// 把面板摆到记住的逻辑坐标。返回是否真的摆成功了。
+/// 把面板摆到记住的**物理**坐标。返回是否真的摆成功了。
 ///
 /// 位置**现在不在任何屏幕上**（用户拔了副屏、改了显示器排列）时必须返回 false：
 /// 硬摆过去面板会落在屏幕外，用户根本够不着它 —— 而面板没有任务栏图标
 /// （`skip_taskbar(true)`），连"从任务栏点回来"这条退路都没有。
+///
+/// # 这里不做任何 DPI 折算
+///
+/// 存的是物理坐标、`monitor_from_point` 与 `set_position(PhysicalPosition)`
+/// 也都吃物理坐标，三处同一个坐标系，所以"换缩放比例之后位置会漂"这类问题
+/// 在这里根本不存在（详见 [`PanelPos`]）。
 fn place_panel_at(panel: &WebviewWindow, pos: PanelPos) -> bool {
+    // 复用悬浮球那套校验（只判"是不是有效数字"）。手改过的 window.json 里
+    // 可能是 NaN/Infinity，摆过去窗口会直接消失。
     if validate_position(pos.x, pos.y).is_err() {
         return false;
     }
-    // 逻辑 → 物理，才能用 monitor_from_point 判断"这个点还在不在屏幕上"
-    let scale = panel.scale_factor().unwrap_or(1.0);
-    let px = (pos.x * scale).round() as i32;
-    let py = (pos.y * scale).round() as i32;
+    let (px, py) = pos.physical();
     if monitor_at_for(panel, px, py).is_none() {
         return false;
     }
-    panel.set_position(tauri::LogicalPosition::new(pos.x, pos.y)).is_ok()
+    panel
+        .set_position(tauri::PhysicalPosition::new(px, py))
+        .is_ok()
 }
 
 /// 取包含指定物理坐标的那块显示器。
@@ -845,6 +943,44 @@ mod tests {
     // ===========================================================
     // 多面板
     // ===========================================================
+
+    #[test]
+    fn 面板位置落盘的是物理坐标且不做任何_dpi_折算() {
+        // 这条钉的是一个**只在跨 DPI 时才复现**的 bug：
+        // 原来存的是逻辑像素（`Moved` 的物理值 ÷ 当时的 scale_factor），
+        // 取用时却按**当前**的比例乘回去 —— 用户把面板从 100% 的屏幕拖到
+        // 150% 的屏幕之后，存和取用的比例不是同一个，窗口会落到离用户放的
+        // 地方差一截的位置。
+        //
+        // 现在落盘的一律是物理坐标，且**存与取都不乘任何比例**：
+        // 物理 1280 存进去、读出来还是 1280，与那块屏幕是 100% 还是 150% 无关。
+        let pos = PanelPos::from_moved(1280, 720);
+        assert_eq!((pos.x, pos.y), (1280.0, 720.0), "直传，不许乘任何比例");
+        assert_eq!(pos.physical(), (1280, 720));
+
+        // 副屏摆在主屏左边时的负坐标要原样保留
+        let left = PanelPos::from_moved(-1920, -100);
+        assert_eq!((left.x, left.y), (-1920.0, -100.0));
+        assert_eq!(left.physical(), (-1920, -100));
+
+        // 手改过的 window.json 里可能有小数：取整用四舍五入，而不是截断
+        // （截断会让位置稳定偏 1 像素，而且往同一个方向偏）
+        assert_eq!(PanelPos { x: 99.6, y: -0.4 }.physical(), (100, 0));
+    }
+
+    #[test]
+    fn 面板位置按物理像素序列化() {
+        let state = WindowState {
+            panels: HashMap::from([("panel-2".to_string(), PanelPos::from_moved(1600, 900))]),
+            ..WindowState::default()
+        };
+
+        let json = serde_json::to_string(&state).expect("序列化");
+        assert!(json.contains("\"panels\""), "实际：{json}");
+
+        let back: WindowState = serde_json::from_str(&json).expect("反序列化");
+        assert_eq!(back.panels["panel-2"].physical(), (1600, 900));
+    }
 
     #[test]
     fn 面板标题必须与平台白名单一致() {

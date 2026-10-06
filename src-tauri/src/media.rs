@@ -1008,6 +1008,24 @@ fn set_meta_at(
         media.mime = kind.mime.into();
     }
 
+    // 宽高是**前端 canvas 量出来的**，但这条命令是公开接口：一个手滑写错的调用
+    // （例如把字节数传进了 width）会把一个天文数字写进 sidecar，之后列表按它
+    // 算布局/占位就会炸。所以这里和 `dib_to_bgra` 对 DIB 宽高做的是同性质的防御。
+    //
+    // 上限取 100_000 而不是 DIB 那边的 20_000：这条路上的尺寸来自"用户自己
+    // 拖进来的图"，真实照片长边也就一万像素级别，10 万足够宽松；而它挡住的是
+    // `u32::MAX` 那种明显不是尺寸的值。
+    //
+    // ⚠️ 0 **不**拒绝：`MediaRef.width == 0` 在这个模块里本来就是"还没量到"的
+    // 既定含义（见 [`MediaRef::width`]），把它当错误会让"这张图前端没能解码、
+    // 只是先把引用存下来"变成一次报错。
+    const MAX_DIMENSION: u32 = 100_000;
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(format!(
+            "图片尺寸不合理：{width}×{height}（上限 {MAX_DIMENSION}）"
+        ));
+    }
+
     // 缩略图必须真的是 PNG：前端传的是 canvas 的产物，但这条命令是公开接口，
     // 存进去一个非 PNG 会让列表里的缩略图全部裂掉，而且原因很难查。
     let thumb = base64_decode(thumb_png_base64)?;
@@ -1325,28 +1343,61 @@ pub fn paste_to_target(app: &AppHandle, id: &str) -> Result<PasteOutcome, String
 // 解码只在"前端回填缩略图"这一条路上用到。
 // ===============================================================
 
-/// 极简 base64 解码（标准字母表，允许 `=` 补齐与换行）。
+/// 极简 base64 解码（标准字母表，允许 `=` 补齐与空白）。
 ///
 /// 遇到非法字符**返回错误**而不是跳过：跳过会让"前端把二进制当 base64 传过来"
 /// 这种错误静默变成一个截断的图片，而截断的 PNG 在界面上是裂图。
+///
+/// # 补齐符的规则（RFC 4648）
+///
+/// `=` 只能出现在**最后一个不完整组的末尾**，之后不许再有任何数据。
+/// 三条都要拦：
+/// 1. `=` 出现在完整组之后（`Zm9v=`）—— 没什么可补的，说明载荷被改坏了；
+/// 2. 补齐符之后又有数据字符（`Zg==Zg==`）—— 两段被拼在了一起；
+/// 3. 补齐符多于两个。
+///
+/// ⚠️ 这三条**不是**"严格但没用"：原来这里的实现是遇到 `=` 就 `break`
+/// （静默丢弃后面的一切），而注释却写着"补齐符之后的内容一律忽略" ——
+/// 注释和行为互相打脸，而且"静默丢弃"意味着一段被改坏的 base64 会被解成
+/// **看起来正常、内容却少了半截**的图片：界面上是裂图，原因根本查不到。
 pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(input.len() / 4 * 3);
     let mut buf: u32 = 0;
     let mut bits: u32 = 0;
+    // 已经遇到的补齐符个数
+    let mut padding = 0usize;
 
     for (i, byte) in input.bytes().enumerate() {
+        // 空白一律跳过：data URL 手工粘贴进来时常带换行
+        if matches!(byte, b'\n' | b'\r' | b' ' | b'\t') {
+            continue;
+        }
+
+        if byte == b'=' {
+            padding += 1;
+            if padding > 2 {
+                return Err(format!("base64 的补齐符多于两个（第 {i} 个）"));
+            }
+            // 完整组（16 位已凑满 2 字节、`bits == 0`）后面不该有补齐符：
+            // 那是"多写了一个 `=`"，不是合法的结尾
+            if bits == 0 {
+                return Err(format!("base64 的补齐符出现在完整的组之后（第 {i} 个）"));
+            }
+            continue;
+        }
+
         let value = match byte {
             b'A'..=b'Z' => byte - b'A',
             b'a'..=b'z' => byte - b'a' + 26,
             b'0'..=b'9' => byte - b'0' + 52,
             b'+' => 62,
             b'/' => 63,
-            // 补齐符之后的内容一律忽略
-            b'=' => break,
-            // canvas 的 dataURL 去前缀之后不该有空白，但手写/粘贴进来的可能有
-            b'\n' | b'\r' | b' ' | b'\t' => continue,
             _ => return Err(format!("base64 里有非法字符（第 {i} 个）")),
         } as u32;
+
+        if padding > 0 {
+            return Err(format!("base64 的补齐符之后还有内容（第 {i} 个）"));
+        }
 
         buf = (buf << 6) | value;
         bits += 6;
@@ -1880,6 +1931,55 @@ mod tests {
         assert!(err.contains("非法字符"), "实际：{err}");
         // 换行/空格是宽容的：data URL 手工粘贴时常见
         assert_eq!(base64_decode("Zm9v\n").expect("换行"), b"foo");
+    }
+
+    #[test]
+    fn base64_的补齐符规则按_rfc_来而不是静默丢弃() {
+        // 合法：补齐符只出现在最后一个不完整组的末尾
+        assert_eq!(base64_decode("Zg==").expect("f"), b"f");
+        assert_eq!(base64_decode("Zm8=").expect("fo"), b"fo");
+        assert_eq!(base64_decode("Zm9vYg==").expect("foob"), b"foob");
+
+        // ⚠️ 下面三条以前是**静默丢弃**（遇到 `=` 就 break），
+        // 而注释写着"忽略" —— 注释和行为互相打脸。被改坏的载荷会被解成
+        // "看起来正常、内容少半截"的图片，界面上是裂图而原因查不到。
+        for (bad, why) in [
+            ("Zm9v=", "完整组后面多了一个补齐符"),
+            ("Zg==Zg==", "补齐符之后又出现了数据"),
+            ("Zg===", "补齐符多于两个"),
+        ] {
+            let err = base64_decode(bad).expect_err(why);
+            assert!(err.contains("补齐符"), "{why}：实际 {err}");
+        }
+
+        // 空串仍然合法（前端可能回填一个空缩略图，由调用方单独判空）
+        assert_eq!(base64_decode("").expect("空串"), b"");
+    }
+
+    #[test]
+    fn 回填宽高时会拒绝离谱的尺寸() {
+        // 宽高是前端 canvas 量出来的，但命令是公开接口：一个手滑写错的调用
+        // （例如把字节数传进 width）会把天文数字写进 sidecar，
+        // 之后列表按它算布局就会炸
+        let dir = temp_dir("meta-range");
+        let media = import_bytes_at(&dir, &tiny_png(), "a.png").expect("导入");
+        let thumb = base64_encode(&tiny_png());
+
+        for (w, h) in [(100_001u32, 10u32), (10, 100_001), (u32::MAX, 1)] {
+            let err = set_meta_at(&dir, &media.id, w, h, &thumb).expect_err("必须拒绝");
+            assert!(err.contains("尺寸不合理"), "({w}×{h}) 实际：{err}");
+        }
+
+        // 边界：正好等于上限要放行
+        assert!(set_meta_at(&dir, &media.id, 100_000, 100_000, &thumb).is_ok());
+
+        // 0 **不**拒绝：`width == 0` 在这个模块里就是"还没量到"的既定含义，
+        // 把它当错误会让"这张图前端没能解码、先把引用存下来"变成一次报错
+        assert!(
+            set_meta_at(&dir, &media.id, 0, 0, &thumb).is_ok(),
+            "0 是「还没量到」，不是非法值"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ---------- 元数据 / 删除 / 统计 ----------

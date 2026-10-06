@@ -254,14 +254,26 @@ pub fn run() {
             // 放在 Rust 侧而不是让前端调 `save_panel_pos`：拖动是系统行为，
             // 前端拿不到"用户什么时候松手"。小球的位置仍然由前端防抖保存
             // （`commands::save_ball_pos`），两条路径互不重叠。
+            //
+            // ⚠️ `Moved` 给的是**物理**像素，原样交给 `remember_panel_move`，
+            // 这里**不做**任何 DPI 折算 —— 面板位置必须按物理坐标存：
+            // 逻辑坐标只在一块显示器上自洽，跨 DPI 就会漂（150% ↔ 100% 差 1.5 倍），
+            // 而 `set_position(PhysicalPosition)` 与 `monitor_from_point`
+            // 也都吃物理坐标。详见 `windows::PanelPos`。
+            //
+            // 这里曾经是 `position.x as f64 / scale`，而 `windows.rs` 那边
+            // 再乘回**它自己另取**的一次 `scale_factor()`。那**不是**恒等：
+            // 两次取值是两次独立调用，跨 DPI 移动时可能给出不同的值 ——
+            // 落盘值会按 `s2/s1` 偏掉（真值 x=1200、s1=1、s2=1.5 时写成 1800，
+            // 偏 600 像素，比面板本身还宽）。现在两边都不换算，
+            // "两次取值必须相同"这个前提本身就不存在了。
             if let tauri::WindowEvent::Moved(position) = event {
                 if windows::is_panel_label(label) {
-                    let scale = window.scale_factor().unwrap_or(1.0);
                     windows::remember_panel_move(
                         window.app_handle(),
                         label,
-                        position.x as f64 / scale,
-                        position.y as f64 / scale,
+                        position.x,
+                        position.y,
                     );
                 }
             }

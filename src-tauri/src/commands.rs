@@ -79,9 +79,23 @@ pub async fn hide_panel(
     window: tauri::WebviewWindow,
     label: Option<String>,
 ) -> Result<(), String> {
+    // `trim()` 不能省：前端可能传 `"   "` 过来（某个模板变量没填、或者用户
+    // 输入框里只敲了空格），那和"没传"是同一个意思。少了它，`"   "` 会被
+    // 当成一个真实的 label 去查窗口 —— 查不到就静默什么都不做，
+    // 又一次"点了没反应"。
     let target = label
         .filter(|l| !l.trim().is_empty())
         .unwrap_or_else(|| window.label().to_string());
+
+    // 与 [`close_panel`] 同款的校验：目标必须是**面板**窗口。
+    //
+    // 不校验的后果很具体：从悬浮球窗口（或将来任何一个非面板窗口）调这条命令时，
+    // `target` 取到的是调用窗口自己的 label（`ball`），于是"收起面板"会把
+    // **悬浮球藏起来** —— 而调用方以为自己收起了面板，用户看到的是球没了、
+    // 面板还在。这正是"命令名对得上、行为却不对"的那类错。
+    if !windows::is_panel_label(&target) {
+        return Err(format!("{target} 不是面板窗口"));
+    }
     windows::hide_panel(&app, &target)
 }
 

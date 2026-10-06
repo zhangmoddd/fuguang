@@ -198,7 +198,7 @@ export function orphanedImageIds(
  * 以后可以在设置里清），也不要因为一次状态不同步就把别人的图删了。
  *
  * ⚠️ 它只回答"**看起来**没人引用了"，不回答"敢不敢删" ——
- * 后者是 {@link mediaGcHold} 的事，两者必须一起用。
+ * 后者是 {@link planMediaDeletion} 的事，两者必须一起用。
  */
 export function orphanedByItemRemoval(
   items: readonly WithImages[],
@@ -293,7 +293,55 @@ function mediaGcHoldReason(evidence: MediaGcEvidence): string | null {
 }
 
 /**
- * **唯一**的删盘决策入口：这张图从条目里移除之后，敢不敢删磁盘文件。
+ * **逐张**的判据。整个仓库里三个判据只存在于这一处。
+ *
+ * `planMediaDeletion` 是它唯一的调用者 —— 所以"两条路径共用同一套判据"这件事
+ * 不是靠约定，而是结构上只有一份可共用。
+ */
+function gcHoldForOne(args: {
+  /** 判"还有没有人引用"用的条目集合。 */
+  items: readonly WithImages[];
+  /**
+   * 正在改动的那一条；**不传**表示传进来的 `items` 已经是"改完之后"的样子，
+   * 不需要排除任何条目。
+   *
+   * 这个区别很重要：
+   * - 图片/条目**正在**被改（数据还没落盘）→ 传 `fromItemId`，
+   *   判据会把来源条目自己的引用排除掉，问的是"**别的**条目还在引用吗"；
+   * - 调用方手里已经是**最终**数据（撤销后的快照、保存后重读的列表）→
+   *   不传，问的是"**整份数据**里还有人引用吗"。
+   */
+  fromItemId?: string | null;
+  imageId: string;
+  /** 「撤销 / 取消」会还原回来的那些图片 id。 */
+  undoIds: readonly string[];
+  evidence: MediaGcEvidence;
+}): MediaGcHold {
+  const stillReferenced = args.fromItemId
+    ? orphanedImageIds(args.items, args.fromItemId, [args.imageId]).length === 0
+    : referencedImageIds(args.items).has(args.imageId);
+  if (stillReferenced) return "still-referenced";
+  if (args.undoIds.includes(args.imageId)) return "undoable";
+  if (!mayDeleteMediaFile(args.evidence)) return "untrusted-memory";
+  return "none";
+}
+
+/** 一批候选的删盘决策结果。 */
+export interface MediaDeletionPlan {
+  /** 真正可以从磁盘删掉的 id。 */
+  deletable: string[];
+  /**
+   * 整批的说明。
+   *
+   * - `deletable` 非空时是 `"none"`（有东西真的删掉了，不需要解释）；
+   * - 一张都删不了时是**第一个**拦住它们的理由，喂给
+   *   {@link mediaDeletionNotice} 就能得到一句给用户看的话。
+   */
+  hold: MediaGcHold;
+}
+
+/**
+ * **唯一**的删盘决策入口：这一批候选里，哪些可以从磁盘删掉。
  *
  * # 为什么三个判据要合成一个函数
  *
@@ -305,33 +353,108 @@ function mediaGcHoldReason(evidence: MediaGcEvidence): string | null {
  * 3. `untrusted-memory`：本窗口这份引用集合不能当权威（多窗口 / 见过外部改动 /
  *    问不到面板数）—— 删了可能命中别的窗口还没落盘的引用，**不可逆**。
  *
- * 分散在调用点写三遍的话，迟早有人只写前两条 —— 而那正是 RV4 报的那条
- * 不可逆问题。所以这里合成一个函数，调用点只判 `hold !== "none"`。
+ * 分散在各个调用点写三遍的话，迟早有人只写前两条 —— 而那正是 RV4 报的那条
+ * 不可逆问题。所以这里收成**一个**函数，四个调用点（图片单独移除、删整条条目、
+ * 撤销/取消后的残留清理）都只判 `deletable` 里有没有它。
+ *
+ * # 候选集是调用方给的，但判据**由这里再验一遍**
+ *
+ * 调用方（例如 `orphanedByItemRemoval`）也会先筛一遍候选，那个筛选与本函数
+ * 第一层判据其实出自同一个底层函数，所以两者不可能给出矛盾的答案。
+ * 重复一次是**刻意的**：候选集是调用方算的，判据必须由决策函数再验一遍 ——
+ * 否则调用方少算一步（比如忘了排除自己那一条）就没人兜底了。
+ *
+ * @param candidateIds 看起来没人引用的那些 id
+ * @param undoIds 「撤销 / 取消」会还原回来的 id（删条目那条路传空数组）
  */
-export function mediaGcHold(args: {
-  /** **全部**条目的图片引用（用来判"还有没有别人在用"）。 */
+export function planMediaDeletion(args: {
   items: readonly WithImages[];
-  /** 正在编辑的那一条。 */
-  fromItemId: string;
-  /** 正要移除的那一张。 */
-  imageId: string;
-  /** 「撤销改动 / 取消」会还原回来的那些图片 id。 */
-  undoIds: readonly string[];
+  /** 见 {@link gcHoldForOne} 的 `fromItemId`。 */
+  fromItemId?: string | null;
+  candidateIds: readonly string[];
+  undoIds?: readonly string[];
   evidence: MediaGcEvidence;
-}): MediaGcHold {
-  if (orphanedImageIds(args.items, args.fromItemId, [args.imageId]).length === 0) {
-    return "still-referenced";
+}): MediaDeletionPlan {
+  const undoIds = args.undoIds ?? [];
+  const deletable: string[] = [];
+  let hold: MediaGcHold = "none";
+
+  for (const imageId of args.candidateIds) {
+    const verdict = gcHoldForOne({
+      items: args.items,
+      fromItemId: args.fromItemId,
+      imageId,
+      undoIds,
+      evidence: args.evidence,
+    });
+    if (verdict === "none") deletable.push(imageId);
+    else if (hold === "none") hold = verdict;
   }
-  if (args.undoIds.includes(args.imageId)) return "undoable";
-  if (!mayDeleteMediaFile(args.evidence)) return "untrusted-memory";
-  return "none";
+
+  return { deletable, hold };
 }
+
+/**
+ * 按计划把文件删掉。
+ *
+ * # 为什么删除循环也要收在这里
+ *
+ * 四个调用点原来各自写一遍 `Promise.all(ids.map((id) => api.mediaDelete(id).catch(...)))`
+ * —— 那句 `catch` 的语义（**清理残留失败不抛、不报错**）被复制了四份，
+ * 改一处漏三处。收在这里之后，调用点只判 `plan.deletable`。
+ *
+ * 失败**一律吞掉**：这些都是"清理残留"，报错会让用户以为刚才那步操作失败了。
+ * 留下的孤儿文件看不见、不影响使用，比一个假的失败提示好得多。
+ *
+ * `deleteFile` 由调用方注入（传 `api.mediaDelete`），所以这个函数不 import
+ * `api.ts`，也就能被单测直接钉住 —— 测试里注入一个假删除器，
+ * 断言"闸拦住时**一次都没被调**"。
+ */
+export async function applyMediaDeletion(args: {
+  plan: MediaDeletionPlan;
+  deleteFile: (id: string) => Promise<void>;
+}): Promise<{ deleted: number; failed: number }> {
+  let deleted = 0;
+  let failed = 0;
+  for (const id of args.plan.deletable) {
+    try {
+      await args.deleteFile(id);
+      deleted += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  return { deleted, failed };
+}
+
+/**
+ * 这一批删除之后该跟用户说什么。不需要解释时返回 `null`。
+ *
+ * - 有东西真的删掉了 → `null`（调用方自己会说"已删除"/"已撤销改动"，不必叠一句）；
+ * - 一张都没删掉、而且有理由 → 那句理由；
+ * - 候选本来就是空的 → `null`（没有"没删掉"这回事）。
+ *
+ * ⚠️ 静默留着文件是**不行**的：用户点了删除、文件却还在，他会以为功能坏了。
+ * 所以有理由时必须说。
+ */
+export function mediaDeletionNotice(
+  plan: MediaDeletionPlan,
+  evidence: MediaGcEvidence,
+): string | null {
+  if (plan.deletable.length > 0) return null;
+  if (plan.hold === "none") return null;
+  return mediaGcHoldNotice(plan.hold, evidence);
+}
+
 
 /**
  * 不删盘时给用户的那句话。`"none"` 返回 `null`（可以删，没什么好说的）。
  *
  * `untrusted-memory` 尽量说出**具体**原因（几个窗口 / 见过外部改动），
  * 说不出来才退回笼统说法 —— "文件留着了"而不说为什么，用户会以为是 bug。
+ *
+ * 一般不用直接调它：调用方判"这一批有没有真的删掉"应该用
+ * {@link mediaDeletionNotice}（它替调用点处理了"删成功了就不必解释"）。
  */
 export function mediaGcHoldNotice(
   hold: MediaGcHold,

@@ -65,7 +65,14 @@ import {
 } from "../../lib/datetime";
 import { useEscapeToClose } from "../../lib/escape";
 import { dateToSelect, focusDomId, highlightFrom, isHighlighted } from "../../lib/focus-highlight";
-import { orphanedByItemRemoval, referencedImageIds, referencedImageIdsExcluding } from "../../lib/media";
+import {
+  applyMediaDeletion,
+  mediaDeletionNotice,
+  orphanedByItemRemoval,
+  planMediaDeletion,
+  referencedImageIds,
+  referencedImageIdsExcluding,
+} from "../../lib/media";
 import {
   MediaSection,
   batchNotice,
@@ -350,14 +357,34 @@ export function MemoPanel() {
   );
 
   /**
-   * 删掉一批**已经确认没人引用**的图片文件。
+   * 删掉一批**候选**的图片文件。
    *
-   * 失败一律吞掉：这些都是"清理残留"，报错会让用户以为刚才那步操作失败了。
-   * 留下的孤儿文件看不见、不影响使用，比一个假的失败提示好得多。
+   * # 判据不在这里
+   *
+   * 这里只负责"把候选交给决策函数、按结果删"，**三个判据全在**
+   * `lib/media.ts` 的 `planMediaDeletion` 里 —— 删整条备忘、图片单独移除、
+   * 保存/取消后的残留清理，四条路走的是**同一个**决策函数。
+   * 在这个页面里另写一份判据的话，迟早有人只写前两条 ——
+   * 而那正是 RV4 报的那条**不可逆**问题。
+   *
+   * @param candidates 看起来没人引用的那些 id
+   * @param items 判"还有没有人引用"用的条目集合（**改完之后**的那一份）
    */
-  const cleanOrphanFiles = async (ids: readonly string[]) => {
-    if (ids.length === 0) return;
-    await Promise.all(ids.map((id) => api.mediaDelete(id).catch(() => undefined)));
+  const cleanOrphanFiles = async (
+    candidates: readonly string[],
+    items: readonly Memo[],
+  ) => {
+    if (candidates.length === 0) return;
+    const evidence = await library.gcEvidence();
+    const plan = planMediaDeletion({
+      // `items` 是改完之后的完整列表 → 不传 fromItemId，
+      // 判据问的是"整份数据里还有人引用吗"
+      items,
+      candidateIds: candidates,
+      evidence,
+    });
+    if (plan.deletable.length === 0) return;
+    await applyMediaDeletion({ plan, deleteFile: api.mediaDelete });
     library.refreshStats();
   };
 
@@ -383,17 +410,23 @@ export function MemoPanel() {
       /**
        * 清理这次被移掉的图片。
        *
-       * ⚠️ 这里**不能**用 `orphanedImageIds`：那个函数的语义是"这些 id 正在
-       * 从某个条目里被移除"，它会把来源条目自身的引用排除掉 —— 而我们
+       * ⚠️ 候选集这里**不能**用 `orphanedImageIds`：那个函数的语义是"这些 id
+       * 正在从某个条目里被移除"，它会把来源条目自身的引用排除掉 —— 而我们
        * 要问的是"**保存后的整份数据**里还有没有人引用它"。
-       * 用错的话会把别的备忘还在用的图删掉。
+       * 用错的话会把别的备忘还在用的图当成孤儿。
+       *
+       * 而"敢不敢删"由 `planMediaDeletion` 定（`cleanOrphanFiles` 里），
+       * 与删整条备忘、图片单独移除是同一个入口。
        */
       const removed = before
         .filter((old) => !cleaned.images.some((now) => now.id === old.id))
         .map((old) => old.id);
       if (removed.length > 0) {
         const referenced = referencedImageIds(fresh);
-        await cleanOrphanFiles(removed.filter((id) => !referenced.has(id)));
+        await cleanOrphanFiles(
+          removed.filter((id) => !referenced.has(id)),
+          fresh,
+        );
       }
     } catch (err) {
       // ⚠️ 这里**必须**同时给一条用户看得见的提示。
@@ -419,6 +452,10 @@ export function MemoPanel() {
    * **不能**用 `orphanedImageIds`：那个函数会把"来源条目"自己的引用排除掉，
    * 而来源条目在盘上**根本没变**（这次编辑取消了）—— 用它会把这条备忘
    * 本来就有的图片当成孤儿删掉，用户下次打开就看见裂图。
+   *
+   * `memos`（盘上那份）就是"取消之后的数据"，所以整份传进去当判据的输入；
+   * "敢不敢删"由 `planMediaDeletion` 定（在 `cleanOrphanFiles` 里），
+   * 与删整条备忘、图片单独移除是同一个入口。
    */
   const cancelEdit = () => {
     const draft = editing;
@@ -427,18 +464,26 @@ export function MemoPanel() {
     const referenced = referencedImageIds(memos);
     void cleanOrphanFiles(
       draft.images.filter((image) => !referenced.has(image.id)).map((image) => image.id),
+      memos,
     );
   };
 
   /**
    * 删除一条备忘，并顺手清理**没人再引用**的图片文件。
    *
-   * 顺序很重要：先算出孤儿、再删条目、最后删图片。反过来（先删条目）
+   * 顺序很重要：先算出候选、再删条目、最后删图片。反过来（先删条目）
    * 也**能**算对（`orphanedByItemRemoval` 允许条目已经不在列表里），
    * 但那时列表已经变了，出问题时更难对上。
    *
    * 图片清理失败**不该**让整次删除报错：备忘已经删掉了，报错会让用户
-   * 以为没删成功，然后再删一次。所以单独 catch，只记一条提示。
+   * 以为没删成功，然后再删一次。
+   *
+   * # 删盘走的是**同一个**决策函数（t25）
+   *
+   * 候选由 `orphanedByItemRemoval` 给出，但**敢不敢删**由 `planMediaDeletion`
+   * 定 —— 与"图片单独移除"是同一个入口。这很重要：删整条是**比单独移除一张图
+   * 更常用**的动作，闸不能只装在不常用的那条路上。多窗口下本窗口内存陈旧时，
+   * 这里同样会把别的窗口还在引用的文件抹掉，**不可逆**。
    */
   const remove = async (id: string) => {
     try {
@@ -448,7 +493,24 @@ export function MemoPanel() {
       await api.memoRemove(id);
       setMemos((prev) => prev.filter((m) => m.id !== id));
       setFeedback("已删除");
-      if (orphans.length > 0) await cleanOrphanFiles(orphans);
+      if (orphans.length === 0) return;
+
+      const evidence = await library.gcEvidence();
+      const plan = planMediaDeletion({
+        items: memos,
+        // 条目**正在**被删（`memos` 里还有它）→ 传 fromItemId，
+        // 判据会排除它自己的引用，问的是"别的备忘还在引用吗"
+        fromItemId: id,
+        candidateIds: orphans,
+        evidence,
+      });
+      if (plan.deletable.length === 0) {
+        // 用户明确点了删除，文件却没删掉 —— 必须说清为什么，不能静默
+        setFeedback(mediaDeletionNotice(plan, evidence) ?? "图片文件先留着");
+        return;
+      }
+      await applyMediaDeletion({ plan, deleteFile: api.mediaDelete });
+      library.refreshStats();
     } catch (err) {
       setError(String(err));
       setFeedback(`删除失败：${String(err)}`);

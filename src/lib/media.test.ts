@@ -17,6 +17,7 @@ import {
   LARGE_LIBRARY_BYTES,
   MAX_IMAGE_BYTES,
   MAX_THUMB_EDGE,
+  applyMediaDeletion,
   dataUrlPayload,
   extensionOf,
   formatBytes,
@@ -25,10 +26,11 @@ import {
   importNotice,
   isImportBatchEmpty,
   largeLibraryNotice,
-  mediaGcHold,
+  mediaDeletionNotice,
   mediaGcHoldNotice,
   orphanedByItemRemoval,
   orphanedImageIds,
+  planMediaDeletion,
   referencedImageIds,
   referencedImageIdsExcluding,
   skippedNotice,
@@ -351,7 +353,7 @@ describe("importNotice", () => {
   });
 });
 
-describe("mediaGcHold / mediaGcHoldNotice（删盘的安全阀）", () => {
+describe("planMediaDeletion / applyMediaDeletion（唯一的删盘安全阀）", () => {
   /**
    * RV4 的 F4：**不可逆**的那一条。
    *
@@ -367,27 +369,48 @@ describe("mediaGcHold / mediaGcHoldNotice（删盘的安全阀）", () => {
   const unknownPanels: MediaGcEvidence = { panelCount: null, sawExternalChange: false };
   const sawExternal: MediaGcEvidence = { panelCount: 1, sawExternalChange: true };
 
+  /** 单张图（图片单独移除那条路）。 */
   function hold(
     items: WithImages[],
     evidence: MediaGcEvidence,
     undoIds: string[] = [],
     imageId = "x",
   ): MediaGcHold {
-    return mediaGcHold({ items, fromItemId: "a", imageId, undoIds, evidence });
+    return planMediaDeletion({
+      items,
+      fromItemId: "a",
+      candidateIds: [imageId],
+      undoIds,
+      evidence,
+    }).hold;
   }
 
   it("本窗口内存陈旧 + 另一个窗口仍引用 → **文件不会被删**", () => {
     // 先确认"看起来"确实没人引用（否则这条测试就是假通过）
     expect(orphanedImageIds(staleItems, "a", ["x"])).toEqual(["x"]);
-    // 但多窗口开着 → 决策是"不删"
-    expect(hold(staleItems, twoWindows)).toBe("untrusted-memory");
+    const plan = planMediaDeletion({
+      items: staleItems,
+      fromItemId: "a",
+      candidateIds: ["x"],
+      evidence: twoWindows,
+    });
+    // 多窗口开着 → 决策是"不删"
+    expect(plan.deletable).toEqual([]);
+    expect(plan.hold).toBe("untrusted-memory");
     // 并且会给用户一句解释，而不是静默留下文件
-    expect(mediaGcHoldNotice("untrusted-memory", twoWindows)).toContain("文件先留着");
+    expect(mediaDeletionNotice(plan, twoWindows)).toContain("文件先留着");
   });
 
   it("只有这一个面板窗口、也没见过外部改动 → 可以删", () => {
     expect(hold(staleItems, soleWindow)).toBe("none");
-    expect(mediaGcHoldNotice("none", soleWindow)).toBeNull();
+    const plan = planMediaDeletion({
+      items: staleItems,
+      fromItemId: "a",
+      candidateIds: ["x"],
+      evidence: soleWindow,
+    });
+    expect(plan.deletable).toEqual(["x"]);
+    expect(mediaDeletionNotice(plan, soleWindow)).toBeNull();
   });
 
   it("问不到面板数（list_panels 失败）→ 不删，而不是「假设只有一个」", () => {
@@ -426,6 +449,135 @@ describe("mediaGcHold / mediaGcHoldNotice（删盘的安全阀）", () => {
         expect(verdict).toBe(panelCount === 1 && !sawExternalChange);
       }
     }
+  });
+
+  // =============================================================
+  // t25：**删整条条目**那条路（比"单独移除一张图"更常用）
+  // =============================================================
+
+  /** 一条带三张图的条目 + 一条别的条目。 */
+  const entry = [item("note", "x", "y", "z"), item("other", "z")];
+
+  it("删整条条目 + 多窗口 → 三张图**一张都不删**", () => {
+    // 候选：看起来没人引用的那些（`z` 被 other 引用，不在候选里）
+    const candidates = orphanedByItemRemoval(entry, "note");
+    expect(candidates.sort()).toEqual(["x", "y"]);
+
+    const plan = planMediaDeletion({
+      items: entry,
+      fromItemId: "note",
+      candidateIds: candidates,
+      evidence: twoWindows,
+    });
+    expect(plan.deletable).toEqual([]);
+    expect(plan.hold).toBe("untrusted-memory");
+    expect(mediaDeletionNotice(plan, twoWindows)).toContain("面板窗口");
+  });
+
+  it("删整条条目 + 单窗口 → 只删没人引用的那两张", () => {
+    const plan = planMediaDeletion({
+      items: entry,
+      fromItemId: "note",
+      candidateIds: orphanedByItemRemoval(entry, "note"),
+      evidence: soleWindow,
+    });
+    expect(plan.deletable.sort()).toEqual(["x", "y"]);
+  });
+
+  it("候选集就算给错了（把别人还在用的图也塞进来）也会被拦下", () => {
+    // 判据由决策函数再验一遍，所以调用方少算一步不会造成误删 ——
+    // 这是"候选是调用方算的、判据必须由决策函数定"的实际价值
+    const plan = planMediaDeletion({
+      items: entry,
+      fromItemId: "note",
+      candidateIds: ["x", "y", "z"], // z 被 other 引用
+      evidence: soleWindow,
+    });
+    expect(plan.deletable.sort()).toEqual(["x", "y"]);
+    expect(plan.deletable).not.toContain("z");
+  });
+
+  it("传进来的 items 已经是「改完之后」的样子时，不传 fromItemId（整份数据里没人引用才删）", () => {
+    // 这是"撤销 / 保存 / 取消"那三条路用的形状：手里就是最终数据
+    const afterRemoval = [item("b", "y")];
+    const plan = planMediaDeletion({
+      items: afterRemoval,
+      candidateIds: ["x", "y"],
+      evidence: soleWindow,
+    });
+    // x 谁都不引用 → 可删；y 被 b 引用 → 留着
+    expect(plan.deletable).toEqual(["x"]);
+  });
+
+  it("候选为空时什么都不删，也不编出一句解释", () => {
+    const plan = planMediaDeletion({
+      items: entry,
+      fromItemId: "note",
+      candidateIds: [],
+      evidence: soleWindow,
+    });
+    expect(plan.deletable).toEqual([]);
+    expect(plan.hold).toBe("none");
+    expect(mediaDeletionNotice(plan, soleWindow)).toBeNull();
+  });
+
+  it("有东西真的删掉时不再叠一句解释（调用方自己会说「已删除」）", () => {
+    const plan = planMediaDeletion({
+      items: entry,
+      fromItemId: "note",
+      candidateIds: ["x", "y"],
+      evidence: soleWindow,
+    });
+    expect(plan.deletable).toHaveLength(2);
+    expect(mediaDeletionNotice(plan, soleWindow)).toBeNull();
+  });
+
+  it("**闸真的会拦**：applyMediaDeletion 在拦住时一次都不调删除器", async () => {
+    // 这条是"闸装上了"而不是"函数返回了个值"的证据：注入一个假的删除器，
+    // 数它被调了几次
+    const called: string[] = [];
+    const deleteFile = async (id: string) => {
+      called.push(id);
+    };
+
+    // 多窗口 → 拦住
+    const blocked = planMediaDeletion({
+      items: entry,
+      fromItemId: "note",
+      candidateIds: orphanedByItemRemoval(entry, "note"),
+      evidence: twoWindows,
+    });
+    const blockedResult = await applyMediaDeletion({ plan: blocked, deleteFile });
+    expect(called).toEqual([]);
+    expect(blockedResult).toEqual({ deleted: 0, failed: 0 });
+
+    // 单窗口 → 真的删
+    const allowed = planMediaDeletion({
+      items: entry,
+      fromItemId: "note",
+      candidateIds: orphanedByItemRemoval(entry, "note"),
+      evidence: soleWindow,
+    });
+    const allowedResult = await applyMediaDeletion({ plan: allowed, deleteFile });
+    expect(called.sort()).toEqual(["x", "y"]);
+    expect(allowedResult).toEqual({ deleted: 2, failed: 0 });
+  });
+
+  it("删除器抛错不往上抛（清理残留失败不该让用户以为刚才那步操作失败了）", async () => {
+    const plan = planMediaDeletion({
+      items: entry,
+      fromItemId: "note",
+      candidateIds: ["x", "y"],
+      evidence: soleWindow,
+    });
+    const result = await applyMediaDeletion({
+      plan,
+      deleteFile: async (id) => {
+        if (id === "x") throw new Error("磁盘忙");
+      },
+    });
+    // 一张失败、一张成功，且没有异常冒出来
+    expect(result).toEqual({ deleted: 1, failed: 1 });
   });
 });
 

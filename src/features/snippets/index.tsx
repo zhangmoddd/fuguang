@@ -55,8 +55,11 @@ import {
 } from "../../lib/focus-highlight";
 import { usePendingFocus } from "../../lib/navigation";
 import {
+  applyMediaDeletion,
   hasAnyContent,
+  mediaDeletionNotice,
   orphanedByItemRemoval,
+  planMediaDeletion,
   referencedImageIds,
   referencedImageIdsExcluding,
 } from "../../lib/media";
@@ -683,16 +686,43 @@ export function SnippetsPanel() {
   };
 
   /**
-   * 删掉一批**已经确认没人引用**的图片文件。
+   * 删掉一批**候选**的图片文件。
    *
-   * 失败一律吞掉：这些都是"清理残留"，报错会让用户以为刚才那步操作失败了。
-   * 留下的孤儿文件看不见、不影响使用，比一个假的失败提示好得多。
+   * # 判据不在这里
+   *
+   * 这里只负责"把候选交给决策函数、按结果删"，**三个判据全在**
+   * `lib/media.ts` 的 `planMediaDeletion` 里 —— 删整条条目、图片单独移除、
+   * 撤销/取消后的残留清理，四条路走的都是**同一个**决策函数。
+   * 在这个页面里另写一份判据的话，迟早有人只写前两条 ——
+   * 而那正是 RV4 报的那条**不可逆**问题。
+   *
+   * # 为什么静默
+   *
+   * 这些是"顺手清理残留"，调用方自己已经报过「已撤销改动 / 已保存 / 已删除」了。
+   * 闸拦住时也不说话（那三种情况下再叠一句"文件先留着"只是噪音）；
+   * 只有**用户明确点了删除**那条路（`remove`）才会解释为什么留着。
+   *
+   * @param candidates 看起来没人引用的那些 id
+   * @param fromItemId 正在改动的那一条；不传表示 `items` 已经是改完之后的样子
+   * @param items 判"还有没有人引用"用的条目集合
    */
-  const cleanOrphanFiles = (ids: readonly string[]) => {
-    if (ids.length === 0) return;
-    void Promise.all(ids.map((id) => api.mediaDelete(id).catch(() => undefined))).then(() =>
-      library.refreshStats(),
-    );
+  const cleanOrphanFiles = (
+    candidates: readonly string[],
+    options: { items: readonly Snippet[]; fromItemId?: string },
+  ) => {
+    if (candidates.length === 0) return;
+    void (async () => {
+      const evidence = await library.gcEvidence();
+      const plan = planMediaDeletion({
+        items: options.items,
+        fromItemId: options.fromItemId,
+        candidateIds: candidates,
+        evidence,
+      });
+      if (plan.deletable.length === 0) return;
+      await applyMediaDeletion({ plan, deleteFile: api.mediaDelete });
+      library.refreshStats();
+    })();
   };
 
   /**
@@ -737,7 +767,9 @@ export function SnippetsPanel() {
           : prev.map((s) => (s.id === snap.id ? snap : s)),
       );
       showFeedback("已撤销改动");
-      cleanOrphanFiles(orphans);
+      // `restored` **就是**改完之后的数据，所以不传 `fromItemId`：
+      // 判据问的是"整份数据里还有人引用吗"
+      cleanOrphanFiles(orphans, { items: restored });
     }
     setEditing(null);
   };
@@ -761,6 +793,13 @@ export function SnippetsPanel() {
    * **漏掉一个孤儿文件是可恢复的（只是占着空间），删掉一个还在被引用的文件
    * 是不可恢复的（对方立刻裂图）** —— 两者不对称，所以宁可漏删。
    * 已写进 CHANGELOG 的已知限制。
+   *
+   * # 删盘走的是**同一个**决策函数（t25）
+   *
+   * 这条路的候选由 `orphanedByItemRemoval` 给出，但**敢不敢删**由
+   * `planMediaDeletion` 定 —— 与"图片单独移除"是同一个入口。
+   * 这很重要：删整条是**比单独移除一张图更常用**的动作，闸不能只装在不常用的那条路上。
+   * 多窗口下本窗口内存陈旧时，这里同样会把别的窗口还在引用的文件抹掉，**不可逆**。
    */
   const remove = async (id: string) => {
     const orphans = orphanedByItemRemoval(snippets, id);
@@ -770,12 +809,24 @@ export function SnippetsPanel() {
       ok ? "已删除" : "删除失败：改动只在内存里，重启后它还会回来",
       ok ? "ok" : "warn",
     );
-    if (ok && orphans.length > 0) {
-      await Promise.all(
-        orphans.map((imageId) => api.mediaDelete(imageId).catch(() => undefined)),
-      );
-      library.refreshStats();
+    if (!ok || orphans.length === 0) return;
+
+    const evidence = await library.gcEvidence();
+    const plan = planMediaDeletion({
+      items: snippets,
+      // 条目**正在**被删（状态更新是异步的，`snippets` 里还有它）→ 传 fromItemId，
+      // 判据会排除它自己的引用，问的是"别的条目还在引用吗"
+      fromItemId: id,
+      candidateIds: orphans,
+      evidence,
+    });
+    if (plan.deletable.length === 0) {
+      // 用户明确点了删除，文件却没删掉 —— 必须说清为什么，不能静默
+      showFeedback(mediaDeletionNotice(plan, evidence) ?? "图片文件先留着", "ok");
+      return;
     }
+    await applyMediaDeletion({ plan, deleteFile: api.mediaDelete });
+    library.refreshStats();
   };
 
   const toggleFlag = (id: string, key: "starred" | "sensitive") => {

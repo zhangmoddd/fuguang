@@ -56,8 +56,9 @@ import {
   importNotice,
   isImportBatchEmpty,
   largeLibraryNotice,
-  mediaGcHold,
-  mediaGcHoldNotice,
+  mediaDeletionNotice,
+  planMediaDeletion,
+  applyMediaDeletion,
   referencedImageIdsExcluding,
   skippedNotice,
   statsNotice,
@@ -365,7 +366,7 @@ export function useMediaLibrary(
    * 见到别的窗口写数据之后，本窗口这份引用集合**可能**已经落后于盘
    * （能不能追平取决于那几处订阅有没有及时重读，而"及时"是没法证明的）。
    * 所以这里按"见过就不再信任"处理 —— 代价只是不再删盘（文件留着），
-   * 换来的是不可能因为一次竞态删掉别人的图。取舍见 `lib/media.ts` 的 `mediaGcHold`。
+   * 换来的是不可能因为一次竞态删掉别人的图。取舍见 `lib/media.ts` 的 `planMediaDeletion`。
    *
    * # 为什么只认 `fuguang:data-changed`
    *
@@ -782,17 +783,13 @@ export function useMediaAttachments(options: MediaAttachmentsOptions): MediaAtta
   /**
    * 从条目里移除一张图。
    *
-   * 先把引用从条目里去掉（这一步总是要做），再决定**敢不敢删磁盘文件**。
-   * 三个判据全部收在 `lib/media.ts` 的 `mediaGcHold` 里 —— 少写任何一个都会
-   * 出真 bug，所以这里只判 `hold !== "none"`，不在这里各写一遍：
+   * 先把引用从条目里去掉（这一步总是要做），再决定**敢不敢删磁盘文件** ——
+   * 判据全部收在 `lib/media.ts` 的 `planMediaDeletion` 里（`still-referenced` /
+   * `undoable` / `untrusted-memory`），这里只判 `plan.deletable` 里有没有它。
    *
-   * 1. `still-referenced`：别的条目还在引用（导入按内容 sha256 去重，这很常见）；
-   * 2. `undoable`：「撤销改动」会把这张图带回来；
-   * 3. `untrusted-memory`：本窗口这份引用集合不能当权威（多窗口 / 见过外部改动 /
-   *    问不到面板数）—— 这一条是 RV4 的 F4，后果**不可逆**。
-   *
-   * 三种"不删"都只移除引用、把文件留在盘上，并且**都告诉用户为什么** ——
-   * 静默留着文件会让用户以为删除功能坏了。
+   * ⚠️ **不要在这里另写一份判据**：删整条条目（`snippets` / `memo` 的 `remove`）
+   * 和撤销/取消后的残留清理走的是**同一个** `planMediaDeletion`。
+   * 三处各写一遍的话，迟早有人只写前两条 —— 而那正是 RV4 报的那条不可逆问题。
    */
   const removeImage = useCallback((image: MediaRef) => {
     void (async () => {
@@ -801,25 +798,26 @@ export function useMediaAttachments(options: MediaAttachmentsOptions): MediaAtta
       opt.onChange(current.filter((m) => m.id !== image.id));
 
       const evidence = await opt.library.gcEvidence();
-      const hold = mediaGcHold({
+      const plan = planMediaDeletion({
         items: opt.allItems(),
+        // 图片**正在**被改（数据还没落盘）→ 传 fromItemId，
+        // 判据会排除本条目自己的引用，问的是"别的条目还在引用吗"
         fromItemId: opt.itemId,
-        imageId: image.id,
+        candidateIds: [image.id],
         undoIds: (opt.undoImages?.() ?? []).map((m) => m.id),
         evidence,
       });
 
-      if (hold !== "none") {
-        opt.onNotice(mediaGcHoldNotice(hold, evidence) ?? "已从这条里移除，文件先留着", "ok");
+      if (plan.deletable.length === 0) {
+        opt.onNotice(
+          mediaDeletionNotice(plan, evidence) ?? "已从这条里移除，文件先留着",
+          "ok",
+        );
         return;
       }
 
-      try {
-        await api.mediaDelete(image.id);
-        opt.onNotice("已删除", "ok");
-      } catch (err) {
-        opt.onNotice(`删除失败：${String(err)}`, "warn");
-      }
+      await applyMediaDeletion({ plan, deleteFile: api.mediaDelete });
+      opt.onNotice("已删除", "ok");
       opt.library.refreshStats();
     })();
   }, []);

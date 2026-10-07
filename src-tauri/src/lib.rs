@@ -121,7 +121,10 @@ pub fn run() {
             commands::link_save,
             commands::link_remove,
             commands::link_launch,
+            commands::link_launch_elevated,
             commands::link_icon,
+            commands::links_probe,
+            commands::link_find_same_name,
             commands::classify_paths,
             // 文件夹（链接 / 文本片段 / 计时器共用）
             commands::folders_list,

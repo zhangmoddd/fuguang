@@ -68,6 +68,13 @@ pub fn extract(path: &str) -> Option<IconData> {
     if touches_network(path) {
         return None;
     }
+    // 映射网络盘同样不碰，但理由不同：那**不是安全**问题（盘符映射是用户自己的
+    // 配置，攻击者不可控），是**卡顿**问题 —— 共享断开时 `SHGetFileInfoW` 会等到
+    // SMB 超时（几十秒），而提取是串行的（见 ICON_LOCK），一条这样的链接就能让
+    // **整面图标墙**一起等。图标只是装饰，少画一个远好过整页不出图。
+    if drive_letter(path).is_some_and(is_remote_drive) {
+        return None;
+    }
 
     // 中毒了也继续用：图标是尽力而为的东西，
     // 不该因为某个线程 panic 过一次就永久失效。
@@ -75,45 +82,10 @@ pub fn extract(path: &str) -> Option<IconData> {
     unsafe { extract_inner(path) }
 }
 
-/// 判断这个路径会不会让 Shell 去访问网络。
-///
-/// # 为什么必须拦
-///
-/// `SHGetFileInfoW` 不带 `SHGFI_USEFILEATTRIBUTES` 时会**真实解析**路径。
-/// 对 `\\attacker\share\x.exe` 这种 UNC 路径，Windows 会去连 SMB 并做 NTLM 认证 ——
-/// 于是「打开链接页」这个动作就变成了「把当前用户的 NetNTLM 响应发给攻击者指定的主机」，
-/// 可以离线破解或做中继。
-///
-/// 链接目标是完全自由的字符串（可以从别人给的备份里导进来），
-/// 而链接页**渲染即自动提取图标、不需要任何点击**，所以这一步是零点击可达的，
-/// 必须在调用 Shell 之前拦住。
-///
-/// 顺带的好处：不可达主机不再让 `SHGetFileInfoW` 阻塞到 SMB 超时（几十秒）拖住界面。
-///
-/// # 为什么不做「映射网络驱动器」的检查
-///
-/// 那需要 `GetDriveTypeW` + `DRIVE_REMOTE`，而该常量在这个版本的 windows-sys 里位于
-/// `Win32::System::WindowsProgramming` —— 为一个判断引入整个绑定模块不划算。
-/// 更要紧的是**它不是攻击者可控的**：盘符映射是用户自己的配置，
-/// 攻击者无法凭空让 `Z:` 指向他的服务器。UNC 才是唯一的零点击通道。
-fn touches_network(path: &str) -> bool {
-    let p = path.trim();
-
-    // UNC：`\\server\share\...`、`\\?\UNC\server\share`，以及正斜杠写法
-    if p.starts_with("\\\\") || p.starts_with("//") {
-        return true;
-    }
-
-    // 带协议头的 URL（http://、ftp://…）：Shell 同样会去连网络。
-    // 前端对 `kind === "url"` 已经跳过，但链接类型本身也能被备份文件改掉，
-    // 所以这里必须自己再挡一次，不能依赖前端的判断。
-    // Windows 文件名里不可能出现 `:`（除盘符），所以这个子串不会误伤本地路径。
-    if p.contains("://") {
-        return true;
-    }
-
-    false
-}
+// 网络路径的拦截放在 launcher 里共用：链接页现在**有两个**会碰文件系统的
+// 自动路径（这里提取图标、`launcher::probe` 核对目标还在不在），
+// 理由一模一样，各写一份迟早会有一边漏掉。完整说明见那边的注释。
+use crate::launcher::{drive_letter, is_remote_drive, touches_network};
 
 /// # Safety
 /// 只在本模块内调用，内部已处理所有句柄的释放。

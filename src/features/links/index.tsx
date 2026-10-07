@@ -31,15 +31,20 @@ import {
   AppWindow,
   Check,
   Copy,
+  ExternalLink,
   FileText,
   Folder,
   FolderInput,
+  FolderSearch,
   Globe,
   Link2,
   MoreHorizontal,
   Pencil,
+  RotateCw,
+  ShieldCheck,
   Trash2,
   TriangleAlert,
+  Wrench,
   X,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -54,7 +59,23 @@ import {
   type IconData,
   type LinkItem,
   type LinkKind,
+  type LinkStatus,
+  type SameNameCandidate,
 } from "../../lib/api";
+import {
+  brokenReason,
+  formatBytes,
+  formatWhen,
+  healthBadge,
+  healthOf,
+  mergeStatuses,
+  parentOf,
+  pickerStartDir,
+  probeSignature,
+  pruneStatuses,
+  shortenFrom,
+  wantsDirectory,
+} from "../../lib/link-health";
 import { FolderBar, FolderEditor, FolderPicker, FolderTiles, useFolders } from "../../lib/folders-ui";
 import {
   isContextMenuOpen,
@@ -389,6 +410,34 @@ export function LinksPanel() {
   const [menu, setMenu] = useState<{ id: string; rect: DOMRect } | null>(null);
 
   /**
+   * 正在「修好它」的那条链接。
+   *
+   * 确认打不开的链接**点下去不再去撞一次必然的失败**，而是直接开这个面板：
+   * 里面有原因、有「重新定位」、有「附近找到的同名文件」、有「删除」。
+   * 原来用户唯一能得到的反馈是一句错误提示，然后就没有下一步了。
+   */
+  const [repairId, setRepairId] = useState<string | null>(null);
+  /** 修复面板里找同名文件的结果。 */
+  const [sameName, setSameName] = useState<{
+    loading: boolean;
+    items: SameNameCandidate[];
+  }>({ loading: false, items: [] });
+  /** 修复面板里「重新检查」正在跑。 */
+  const [rechecking, setRechecking] = useState(false);
+  /**
+   * 当前面板属于哪一条、以及是第几轮（ref 版）。
+   *
+   * 找同名文件是异步的，回来时用户可能已经关了面板、或者换了一条 ——
+   * 没有这个闸门就会把上一条的结果贴到下一条上。
+   *
+   * 用"令牌"而不是只比 id：**同一条链接关了又开**时 id 是一样的，
+   * 只比 id 会让第一轮的旧结果通过检查，把第二轮的加载态提前结束。
+   * 每一轮 `openRepair` 都换一个新令牌，旧的自然作废。
+   */
+  const repairRef = useRef<{ id: string; token: number } | null>(null);
+  const repairToken = useRef(0);
+
+  /**
    * 这次编辑是否已被取消（按了 Esc）。
    *
    * 取消会让输入框卸载、紧接着触发一次 blur，而 blur 的语义是「保存」。
@@ -456,6 +505,104 @@ export function LinksPanel() {
       unlisten?.();
     };
   }, [reload]);
+
+  // ---- 目标核对（「这条链接现在还能不能用」）----
+
+  /**
+   * 每条链接的目标核对结果。
+   *
+   * 表里**没有**的 id 一律按「没确认」处理，界面不会因此打上失效标记 ——
+   * 核不出来和确定坏了是两件事，混在一起就会冤枉一批好好的链接。
+   */
+  const [statuses, setStatuses] = useState<Map<string, LinkStatus>>(() => new Map());
+
+  /**
+   * 正在飞的核对请求的序号。
+   *
+   * 面板会被频繁唤出（每次重新获得焦点都可能触发一次核对），两次核对叠在
+   * 一起时**后发的结果才是对的**。没有这个闸门的话，先发的那次晚回来会把
+   * 新结果盖掉，表现是"标记闪一下又变回去"。
+   */
+  const probeSeq = useRef(0);
+  /** 上次核对是什么时候（节流用）。 */
+  const probeAt = useRef(0);
+
+  const probeAll = useCallback(async (): Promise<LinkStatus[] | null> => {
+    const seq = ++probeSeq.current;
+    probeAt.current = Date.now();
+    try {
+      const list = await api.linksProbe();
+      if (seq === probeSeq.current) {
+        setStatuses((prev) => mergeStatuses(prev, list));
+      }
+      return list;
+    } catch {
+      /**
+       * 核对失败返回 `null`，而不是空数组。
+       *
+       * 两者在调用方那里意思完全不同：空数组是"核对跑成功了，一条都没有"，
+       * `null` 是"核对根本没跑起来"。混成一个的话，「重新检查」会把
+       * "检查失败"说成"还是没查到这条链接的状态"，用户以为链接有问题，
+       * 其实是这次检查没成。
+       *
+       * 表里保留上一次的结果（那仍然是我们知道的最后一件事），
+       * 不打标记、不拦点击 —— 这类失败少的是一个提示，不是功能坏了。
+       */
+      return null;
+    }
+  }, []);
+
+  /**
+   * 什么时候重新核对。
+   *
+   * 用 `probeSignature`（id + 类型 + 目标）而不是 `links` 数组本身：
+   * 数组每次 `reload()` 都是新对象，直接当依赖会让核对跟着每一次渲染跑。
+   *
+   * 指纹**与数组顺序无关**（`probeSignature` 内部先按 id 排序），
+   * 所以拖动排序不会白跑一遍逐条 `stat` —— 这一点是实测抓出来的：
+   * 原来指纹是直接按数组顺序拼的，而拖动排序产出的正是"内容一样、
+   * 顺序不同"的新数组，于是每拖一次都要重核一遍、所有格子重渲染一次。
+   */
+  const healthSignature = useMemo(() => probeSignature(links), [links]);
+
+  useEffect(() => {
+    if (loading) return;
+    void probeAll();
+  }, [loading, healthSignature, probeAll]);
+
+  /**
+   * 窗口重新获得焦点时再核一次。
+   *
+   * 用户很可能刚在资源管理器里把文件删了/挪了，回来一点就报错 ——
+   * 那正是要消灭的体验。核对本身很便宜（读一次文件属性），
+   * 但面板会被频繁唤出，所以节流到 10 秒。
+   */
+  useEffect(() => {
+    const onFocus = () => {
+      if (Date.now() - probeAt.current < 10_000) return;
+      void probeAll();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [probeAll]);
+
+  /** 链接删掉之后，它的核对结果也要跟着丢，否则这张表只会一直涨。 */
+  useEffect(() => {
+    setStatuses((prev) => {
+      const kept = pruneStatuses(prev, links);
+      // 没变化就返回原对象：否则每次 links 变一下都要多渲染一轮
+      return kept.size === prev.size ? prev : kept;
+    });
+  }, [links]);
+
+  /** 这条链接现在是不是"确定打不开"。没核对过的返回 `false`（不冤枉）。 */
+  const isBroken = useCallback(
+    (link: LinkItem) => {
+      const status = statuses.get(link.id);
+      return status ? healthOf(status.state) === "broken" : false;
+    },
+    [statuses],
+  );
 
   // ---- 文件夹与缩放 ----
 
@@ -802,7 +949,54 @@ export function LinksPanel() {
 
   // ---- 对单条链接的操作 ----
 
-  const launch = async (link: LinkItem) => {
+  /**
+   * 打开「修好它」面板。
+   *
+   * 打开的同时就去附近找同名文件 —— 用户挪文件的习惯很集中
+   * （把桌面上的脚本收进「临时」、把项目挪进 `archive`），
+   * 这一步能直接把"自己去翻文件夹"省掉。
+   */
+  const openRepair = async (link: LinkItem) => {
+    const token = ++repairToken.current;
+    repairRef.current = { id: link.id, token };
+    setRepairId(link.id);
+    setSameName({ loading: true, items: [] });
+
+    let items: SameNameCandidate[] = [];
+    try {
+      items = await api.linkFindSameName(link.id);
+    } catch {
+      items = [];
+    }
+
+    // 这一轮已经不作数了（用户关了面板、换了一条、或者又开了一次同一条）：
+    // 晚到的结果不能贴上去
+    if (repairRef.current?.token !== token) return;
+    setSameName({ loading: false, items });
+  };
+
+  const closeRepair = () => {
+    // 只作废，不重置令牌计数：下一次 openRepair 拿到的一定是新令牌
+    repairRef.current = null;
+    setRepairId(null);
+    setSameName({ loading: false, items: [] });
+  };
+
+  const launch = async (link: LinkItem, force = false) => {
+    /**
+     * 已经确认打不开的，别去撞一次必然的失败。
+     *
+     * 这不是"拦住用户"：面板里有「仍然尝试打开」，也有「重新检查」。
+     * 直接开修复面板是因为**用户点这一下的目的是"用它"**，
+     * 而一句"找不到文件"给不出下一步。
+     *
+     * `force` 用在"重新检查之后确认已经好了"这条路上 —— 那时状态还是旧的闭包值。
+     */
+    if (!force && isBroken(link)) {
+      void openRepair(link);
+      return;
+    }
+
     setBusyId(link.id);
     try {
       await api.linkLaunch(link.id);
@@ -812,9 +1006,102 @@ export function LinksPanel() {
       // Rust 侧给的就是中文人话（「打开「xxx」失败：找不到文件，可能已被移动或删除」），
       // 直接用，不要再包一层「操作失败」把原因挤掉
       setNotice({ kind: "error", text: errorText(err) });
+      /**
+       * 启动失败说明状态已经变了（刚被删、刚被拔、刚断网）。
+       * 立刻重核一次，让格子上出现标记 —— 否则用户得再点一次才发现，
+       * 而且下次点还是同一句错误。
+       */
+      void probeAll();
     } finally {
       setBusyId(null);
     }
+  };
+
+  /**
+   * 以管理员身份运行。
+   *
+   * 只在用户显式选的时候做。自动提权等于**替用户按下了 UAC 确认框**，
+   * 而这个应用的定位是启动器：用户点一个格子时预期的是"打开它"，
+   * 不是"给这个东西管理员权限"。
+   *
+   * 已经确认打不开的同样直接开修复面板：否则用户会先被打扰一次 UAC，
+   * 再收到一句"找不到文件" —— 和左键的行为分叉，而且两步都是白费的。
+   */
+  const elevate = async (link: LinkItem) => {
+    if (isBroken(link)) {
+      void openRepair(link);
+      return;
+    }
+
+    setBusyId(link.id);
+    try {
+      await api.linkLaunchElevated(link.id);
+      setNotice(null);
+    } catch (err) {
+      setNotice({ kind: "error", text: errorText(err) });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  /**
+   * 给一条链接换目标：重新判一次类型再落盘。
+   *
+   * 「重新定位」和「用附近找到的同名文件」走的是同一条路 ——
+   * 两条路各写一遍的话，总有一条会忘了重判类型，图标和"怎么启动"就跟实际对不上。
+   */
+  const applyTarget = async (link: LinkItem, target: string, okText: string) => {
+    let kind = link.kind;
+    try {
+      kind = (await api.classifyPaths([target]))[0] ?? link.kind;
+    } catch {
+      // 判不出来就保留原类型：图标不准总比"改不了"好
+    }
+    closeRepair();
+    await persist({ ...link, target, kind }, okText);
+  };
+
+  /** 重新定位：让用户挑一个新目标，从坏掉的那个位置开始翻。 */
+  const relocate = async (link: LinkItem, status: LinkStatus) => {
+    const picked = allPaths(
+      await open({
+        directory: wantsDirectory(link.kind),
+        multiple: false,
+        defaultPath: pickerStartDir(status),
+      }),
+    );
+    const target = picked[0];
+    if (!target) return;
+    await applyTarget(link, target, `已重新定位到「${baseName(target)}」`);
+  };
+
+  /**
+   * 重新检查一条链接，好了就直接打开它。
+   *
+   * 点「重新检查」的意图就是"再试一次"，所以状态恢复时不该再让用户点第三下。
+   */
+  const recheck = async (link: LinkItem) => {
+    setRechecking(true);
+    const list = await probeAll();
+    setRechecking(false);
+
+    // `null` = 核对根本没跑起来（不是"没查到这一条"）。这两件事要分开说：
+    // 前者是浮光这边的问题，后者才可能是链接的问题。
+    if (list === null) {
+      setNotice({ kind: "error", text: "重新核对没跑起来，稍后再试（链接本身不一定有问题）" });
+      return;
+    }
+
+    const fresh = list.find((s) => s.id === link.id);
+    if (!fresh || healthOf(fresh.state) === "broken") {
+      setNotice({
+        kind: "error",
+        text: fresh ? brokenReason(fresh, link.name) : "这次核对里没有这一条，稍后再试",
+      });
+      return;
+    }
+    closeRepair();
+    void launch(link, true);
   };
 
   const remove = async (link: LinkItem) => {
@@ -853,6 +1140,10 @@ export function LinksPanel() {
    * 多了「打开」和「复制地址」两项：右键是"我要对这一条做点什么"，
    * 而这两个正是链接最常用的动作（「⋯」菜单里没有，因为它原来只有
    * "改和删"这一类管理动作）。
+   *
+   * 「修好它…」只在**确认打不开**时才出现，「以管理员身份运行」只在
+   * 非网址时出现 —— 两个都是"按当前情况才成立"的项，常驻只会让菜单变长。
+   * 这两项在「⋯」菜单里也有：用户在哪一边找都得能找到。
    */
   const linkMenu = (link: LinkItem): ContextMenuItem[] => [
     {
@@ -861,6 +1152,18 @@ export function LinksPanel() {
       icon: <LinkGlyph link={link} />,
       onSelect: () => void launch(link),
     },
+    // 确认打不开的，把「修好它」放到最上面：这时用户点右键的目的
+    // 十有八九就是"把它弄好"，而不是"再打开一次"
+    ...(isBroken(link)
+      ? [
+          {
+            id: "repair",
+            label: "修好它…",
+            icon: <Wrench size={13} />,
+            onSelect: () => void openRepair(link),
+          },
+        ]
+      : []),
     {
       id: "copy-target",
       label: "复制地址",
@@ -875,6 +1178,17 @@ export function LinksPanel() {
         });
       },
     },
+    // 网址没有"以管理员身份"这回事
+    ...(link.kind === "url"
+      ? []
+      : [
+          {
+            id: "elevate",
+            label: "以管理员身份运行",
+            icon: <ShieldCheck size={13} />,
+            onSelect: () => void elevate(link),
+          },
+        ]),
     {
       id: "edit",
       label: "编辑",
@@ -1015,6 +1329,23 @@ export function LinksPanel() {
    * 查不到（被删了）就当菜单没开。
    */
   const menuLink = menu ? links.find((l) => l.id === menu.id) ?? null : null;
+
+  /**
+   * 「修好它」面板要显示的那条链接，以及它的核对结果。
+   *
+   * 状态**可能还没有**（面板是用户点出来的，核对却可能是几秒前的事，
+   * 也可能那条链接刚被别处改过）。这时用一份中性的占位状态把面板撑起来 ——
+   * 让面板整个消失是最糟的：用户刚点了一下，界面却什么都没发生。
+   */
+  const repairLink = repairId ? links.find((l) => l.id === repairId) ?? null : null;
+  const repairStatus: LinkStatus | null = repairLink
+    ? statuses.get(repairLink.id) ?? {
+        id: repairLink.id,
+        state: "unknown",
+        resolved: repairLink.target,
+        lnkTarget: null,
+      }
+    : null;
 
   /**
    * 让位之后的渲染顺序。
@@ -1242,6 +1573,16 @@ export function LinksPanel() {
           }
 
           /**
+           * 这条链接的目标现在还能不能用。
+           *
+           * 表里没有就按「没确认」处理：不打标记、正常打开。
+           * **不能**把"没核对过"当成"坏了" —— 那会在面板刚打开、
+           * 核对还在路上的一瞬间把所有格子标成失效。
+           */
+          const status = statuses.get(link.id);
+          const broken = status !== undefined && healthOf(status.state) === "broken";
+
+          /**
            * 就地编辑：**整行宽**，而且能改**全部**可改字段（名字 / 目标 / 启动参数）。
            *
            * 两个理由：
@@ -1280,6 +1621,10 @@ export function LinksPanel() {
                       className="links__editinput"
                       value={editDraft.target}
                       title={link.target}
+                      // 把 `%VAR%` 这条路说出来：它是唯一能让链接**跟着环境走**
+                      // 的写法（换个用户名、换台机器照样能用），但光看一个空输入框
+                      // 没人会知道可以这么写。
+                      placeholder="C:\…\a.exe，也可以用 %USERPROFILE% 这类变量"
                       onChange={(e) =>
                         setEditDraft((d) => ({ ...d, target: e.target.value }))
                       }
@@ -1318,12 +1663,21 @@ export function LinksPanel() {
               className={[
                 "links__tile",
                 busyId === link.id ? "links__tile--busy" : "",
+                broken ? "links__tile--broken" : "",
                 isHighlighted(focus.highlight, link.id) ? "links__tile--focus" : "",
               ]
                 .filter(Boolean)
                 .join(" ")}
-              title={link.args ? `${link.target}\n参数：${link.args}` : link.target}
-              // 右键：打开 / 复制地址 / 编辑 / 移动到… / 删除。
+              // 悬停时优先说"为什么打不开"：这时用户最需要的就是这个，
+              // 而不是再重复一遍他已经知道的路径
+              title={
+                broken && status
+                  ? brokenReason(status, link.name)
+                  : link.args
+                    ? `${link.target}\n参数：${link.args}`
+                    : link.target
+              }
+              // 右键：打开 / 修好它 / 复制地址 / 以管理员身份运行 / 编辑 / 移动到… / 删除。
               // 和右上角「⋯」菜单内容有重叠是刻意的（见 linkMenu 的说明）。
               onContextMenu={(e) => ctx.open(e, () => linkMenu(link))}
               {...drag.itemProps(link.id)}
@@ -1342,11 +1696,21 @@ export function LinksPanel() {
                   if (drag.consumeClick()) return;
                   void launch(link);
                 }}
-                title={`打开：${link.target}`}
+                title={broken ? `修好「${link.name}」` : `打开：${link.target}`}
               >
                 <LinkGlyph link={link} />
                 <span className="links__name">{link.name}</span>
               </button>
+
+              {/* 失效标记。压在左上角（右上角被「⋯」占了），
+                  只写短标签 —— 完整原因在 tooltip 和「修好它」面板里。
+                  没有这个标记的话，用户只能靠"点下去报错"来发现链接坏了。 */}
+              {broken && status && (
+                <span className="links__tile-warn">
+                  <TriangleAlert size={10} />
+                  {healthBadge(status.state)}
+                </span>
+              )}
 
               {/* 悬停才出现。**只占右上角 20px**：
                   原来这里是一排四个图标按钮（加起来 83px），而格子默认只有
@@ -1416,16 +1780,53 @@ export function LinksPanel() {
         <LinkMenu
           link={menuLink}
           anchor={menu.rect}
+          broken={isBroken(menuLink)}
+          repairOpen={repairId !== null}
           onClose={() => setMenu(null)}
           onMove={() => {
             setMenu(null);
             setMovingId(menuLink.id);
           }}
           onEdit={() => startEdit(menuLink)}
+          onElevate={() => {
+            setMenu(null);
+            void elevate(menuLink);
+          }}
+          onRepair={() => {
+            setMenu(null);
+            void openRepair(menuLink);
+          }}
           onRemove={() => {
             setMenu(null);
             void remove(menuLink);
           }}
+        />
+      )}
+
+      {/* 「修好它」面板。确认打不开的链接点下去开的就是这个 ——
+          原因 + 重新定位 + 附近找到的同名文件 + 删除，四件事一步到位。 */}
+      {repairLink && repairStatus && (
+        <LinkRepair
+          link={repairLink}
+          status={repairStatus}
+          sameName={sameName}
+          rechecking={rechecking}
+          onRelocate={() => void relocate(repairLink, repairStatus)}
+          onUseCandidate={(path) =>
+            void applyTarget(repairLink, path, `已改用「${baseName(path)}」`)
+          }
+          onRecheck={() => void recheck(repairLink)}
+          onOpenAnyway={() => {
+            const target = repairLink;
+            closeRepair();
+            void launch(target, true);
+          }}
+          onRemove={() => {
+            const target = repairLink;
+            closeRepair();
+            void remove(target);
+          }}
+          onClose={closeRepair}
         />
       )}
 
@@ -1467,16 +1868,26 @@ export function LinksPanel() {
 function LinkMenu({
   link,
   anchor,
+  broken,
+  repairOpen,
   onClose,
   onMove,
   onEdit,
+  onElevate,
+  onRepair,
   onRemove,
 }: {
   link: LinkItem;
   anchor: DOMRect;
+  /** 这条链接是不是确认打不开（决定要不要给「修好它」这一行）。 */
+  broken: boolean;
+  /** 「修好它」面板是不是正开着（决定 Esc 该谁认领）。 */
+  repairOpen: boolean;
   onClose: () => void;
   onMove: () => void;
   onEdit: () => void;
+  onElevate: () => void;
+  onRepair: () => void;
   onRemove: () => void;
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
@@ -1508,8 +1919,16 @@ function LinkMenu({
    * `t13` 还给菜单根节点加了 `onContextMenu` 拦截（右键菜单不会叠在它上面）。
    * 这条改动是**把规则补成一致的**，不是修一个现成能复现的 bug。
    * 详见 `lib/escape.ts` 的 `shouldClaim`。
+   *
+   * # 为什么要连 `repairOpen` 一起判
+   *
+   * 「修好它」面板的 z-index 是 70，比这个菜单高。两层同时开着时按 Esc，
+   * 认领顺序是按**挂载顺序**走的（`document` 上的捕获监听器谁先注册谁先跑），
+   * 而这个菜单通常注册得更早 —— 于是一次 Esc 把两层一起关了。
+   * 规则是"只关最上面那一层"，所以菜单在上面那层开着时不该认领。
+   * （场景：面板贴在底部，上面半屏还露着，用户可以在那儿开「⋯」菜单。）
    */
-  useEscapeToClose(onClose, () => !isContextMenuOpen());
+  useEscapeToClose(onClose, () => !isContextMenuOpen() && !repairOpen);
 
   /**
    * 贴住「⋯」按钮定位，但不许出面板。
@@ -1555,6 +1974,15 @@ function LinkMenu({
         {link.name}
       </div>
 
+      {/* 确认打不开时，这一项排在最前面：这时用户打开菜单的目的
+          十有八九就是"把它弄好"，而不是"再打开一次" */}
+      {broken && (
+        <button type="button" className="linkmenu__row linkmenu__row--warn" onClick={onRepair}>
+          <Wrench size={13} />
+          修好它…
+        </button>
+      )}
+
       <button type="button" className="linkmenu__row" onClick={onMove}>
         <FolderInput size={13} />
         移动到文件夹
@@ -1571,6 +1999,14 @@ function LinkMenu({
         </em>
       </button>
 
+      {/* 网址没有"以管理员身份"这回事，给了只会让人以为点了有用 */}
+      {link.kind !== "url" && (
+        <button type="button" className="linkmenu__row" onClick={onElevate}>
+          <ShieldCheck size={13} />
+          以管理员身份运行
+        </button>
+      )}
+
       <button
         type="button"
         className="linkmenu__row linkmenu__row--danger"
@@ -1579,6 +2015,160 @@ function LinkMenu({
         <Trash2 size={13} />
         删除
       </button>
+    </div>
+  );
+}
+
+/**
+ * 「修好它」面板。
+ *
+ * # 为什么要有这一层
+ *
+ * 链接坏掉时，用户原来只能得到一句「找不到文件」。那句话既没说清是
+ * **哪种**找不到（文件被挪走？整个文件夹没了？U 盘没插？快捷方式指向的程序卸了？），
+ * 也没给出下一步 —— 用户只能自己去翻文件夹，翻到了还要回来编辑那条链接。
+ * 这个面板把"为什么"和"怎么办"一次给全。
+ *
+ * # 为什么「重新定位」和「用找到的同名文件」都要有
+ *
+ * 用户挪文件的习惯很集中（桌面上的脚本收进「临时」、项目挪进 `archive`），
+ * 所以"在原来那个文件夹附近找同名文件"命中率很高，一步就能修好；
+ * 但改名、换盘、换目录的情况它覆盖不到，那时还是得让用户自己挑。
+ *
+ * # 为什么不自动改用找到的同名文件
+ *
+ * 同名不等于同一个东西。自动改有可能把链接指向一个完全无关的文件，
+ * 而用户不会发现 —— 所以只列出来，改不改由用户点。
+ */
+function LinkRepair({
+  link,
+  status,
+  sameName,
+  rechecking,
+  onRelocate,
+  onUseCandidate,
+  onRecheck,
+  onOpenAnyway,
+  onRemove,
+  onClose,
+}: {
+  link: LinkItem;
+  status: LinkStatus;
+  sameName: { loading: boolean; items: SameNameCandidate[] };
+  rechecking: boolean;
+  onRelocate: () => void;
+  onUseCandidate: (path: string) => void;
+  onRecheck: () => void;
+  onOpenAnyway: () => void;
+  onRemove: () => void;
+  onClose: () => void;
+}) {
+  const boxRef = useRef<HTMLDivElement>(null);
+
+  // 点面板外面就关掉，和 `FolderEditor` 同一个做法：挂监听是在渲染之后的
+  // effect 里，所以不会被"打开面板的那一次 pointerdown"立刻关掉
+  useEffect(() => {
+    const onDown = (e: PointerEvent) => {
+      const box = boxRef.current;
+      if (box && !box.contains(e.target as Node)) onClose();
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+    };
+  }, [onClose]);
+
+  // Esc 只关这一层。和「⋯」菜单一样让位给全应用那个右键菜单（见 lib/escape.ts）
+  useEscapeToClose(onClose, () => !isContextMenuOpen());
+
+  return (
+    <div
+      className="repair"
+      ref={boxRef}
+      onClick={(e) => e.stopPropagation()}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+    >
+      <div className="repair__head">
+        <TriangleAlert size={13} />
+        <span className="repair__title">打不开「{link.name}」</span>
+        <button className="iconbtn" onClick={onClose} title="关闭">
+          <X size={13} />
+        </button>
+      </div>
+
+      <p className="repair__why">{brokenReason(status, link.name)}</p>
+
+      <div className="repair__path" title={status.resolved}>
+        {status.resolved}
+      </div>
+
+      {/* 快捷方式的情况必须把**真实目标**单独列出来：
+          用户看到"快捷方式在"，会以为坏的是那个 .lnk 文件 */}
+      {status.lnkTarget && (
+        <div className="repair__path repair__path--sub" title={status.lnkTarget}>
+          快捷方式指向：{status.lnkTarget}
+        </div>
+      )}
+
+      {sameName.loading && <div className="repair__hint">正在附近找同名文件…</div>}
+
+      {!sameName.loading && sameName.items.length > 0 && (
+        <>
+          <div className="repair__hint">
+            附近找到 {sameName.items.length} 个同名文件。<strong>同名不等于同一个东西</strong>
+            ，看清楚大小和时间再点：
+          </div>
+          <div className="repair__candidates">
+            {sameName.items.map((item) => (
+              <button
+                key={item.path}
+                type="button"
+                className="repair__candidate"
+                title={item.path}
+                onClick={() => onUseCandidate(item.path)}
+              >
+                <FolderSearch size={12} />
+                <span className="repair__candidate-main">
+                  {/* 缩成相对「原来那个文件夹」的形式：候选全都同名、
+                      又都在同一个父目录下面，照原样显示的话真正有区别的
+                      那一段会被长长的公共前缀挤到看不见 */}
+                  <span className="repair__candidate-text">
+                    {shortenFrom(parentOf(status.resolved), item.path)}
+                  </span>
+                  {/* 大小和时间是**唯一**能让用户分辨"哪个才是我要的"的东西 */}
+                  <span className="repair__candidate-meta">
+                    {[formatWhen(item.modifiedMs), formatBytes(item.bytes)]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      <div className="repair__actions">
+        <button type="button" className="btn btn--primary" onClick={onRelocate}>
+          <FolderSearch size={12} />
+          重新定位…
+        </button>
+        <button type="button" className="btn" onClick={onRecheck} disabled={rechecking}>
+          <RotateCw size={12} />
+          {rechecking ? "检查中…" : "重新检查"}
+        </button>
+        <button type="button" className="btn" onClick={onOpenAnyway}>
+          <ExternalLink size={12} />
+          仍然尝试打开
+        </button>
+        <button type="button" className="btn repair__danger" onClick={onRemove}>
+          <Trash2 size={12} />
+          删除
+        </button>
+      </div>
     </div>
   );
 }

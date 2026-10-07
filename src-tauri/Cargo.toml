@@ -42,10 +42,15 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     # 取前台窗口、设置前台窗口、取窗口标题、GetIconInfo/DestroyIcon
     "Win32_UI_WindowsAndMessaging",
-    # 打开文件夹、SHGetFileInfoW（提取快捷链接的图标）
+    # 打开文件夹、SHGetFileInfoW（提取快捷链接的图标）、ShellExecuteExW
     "Win32_UI_Shell",
-    # SHGetFileInfoW 签名里用到 FILE_FLAGS_AND_ATTRIBUTES
+    # SHGetFileInfoW 签名里用到 FILE_FLAGS_AND_ATTRIBUTES，
+    # 以及 GetLogicalDrives / GetDriveTypeW（核对链接目标还在不在）
     "Win32_Storage_FileSystem",
+    # MultiByteToWideChar：解析 .lnk 里的 LocalBasePath。
+    # 那一段是**系统 ANSI 代码页**的字节（本机 936），不是 UTF-8，
+    # 只有这个 API 能问对"这台机器用哪个代码页"
+    "Win32_Globalization",
     # 图标位图转 RGBA 需要 GDI
     "Win32_Graphics_Gdi",
     # 图片编解码（剪贴板 DIB ⇄ PNG）用系统自带的 GDI+：

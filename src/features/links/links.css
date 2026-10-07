@@ -452,3 +452,227 @@
   text-align: center;
   flex-shrink: 0;
 }
+
+/* ============================================================
+   失效的链接
+   目标不在了：文件被挪走、U 盘拔了、快捷方式指向的程序卸了。
+   处理原则是**标记，但不拦着** —— 图标压暗 + 左上角一个小标签说清
+   是哪种失效；点下去开「修好它」面板，而不是去撞一次必然的失败。
+   描边用琥珀（--warning）而不是红色：红色是"操作失败了"，
+   而这里只是"它现在不在那儿"，事情还有救。
+   ============================================================ */
+
+.links__tile--broken,
+.links__tile--broken:hover {
+  /* hover 那条规则是 `.links__tile:hover`，特异性 (0,2,0) 比单类高 ——
+     **跟源码顺序无关，它一定会赢**。所以这里必须把 `:hover` 也写出来，
+     否则鼠标一放上去描边就被改回中性灰，而 hover 正是用户想细看这一格的时刻：
+     文件被改回来了？还是仍然坏着？描边不该在这时闭嘴。 */
+  border-color: var(--warning);
+}
+
+.links__tile--broken .links__glyph {
+  /* 压暗 + 去色：扫一眼就能看出这一格和别的不一样 */
+  opacity: 0.4;
+  filter: grayscale(1);
+}
+
+.links__tile--broken:hover .links__glyph {
+  opacity: 0.7;
+}
+
+/* 左上角的短标签。右上角被「⋯」占了，所以放左上。
+   字号用最小那一档：格子默认只有 86px 宽，写长了会把名字挤走。
+   `pointer-events: none` 是必须的 —— 整块格子才是热区，
+   标签浮在上面把点击吃掉的话，用户点它反而没反应。 */
+.links__tile-warn {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  max-width: calc(100% - 24px);
+  padding: 1px 4px;
+  background: var(--bg-solid);
+  border: 1px solid var(--warning);
+  border-radius: 999px;
+  color: var(--warning);
+  font-size: var(--fs-2xs);
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* ---- 「⋯」菜单里的「修好它…」 ---- */
+
+.linkmenu__row--warn,
+.linkmenu__row--warn svg {
+  color: var(--warning);
+}
+
+.linkmenu__row--warn:hover {
+  background: rgba(180, 83, 9, 0.12);
+}
+
+/* ============================================================
+   「修好它」面板
+   贴底的浮层，**不用整屏遮罩**：遮罩会把格子墙压暗，用户就没法
+   对照"还有哪些链接"，而这一层的信息量并不大（一句原因 + 几个按钮）。
+   点面板外面 / 按 Esc 就关，和「⋯」菜单是同一套交互。
+   z-index 70：在「⋯」菜单（60）之上、全应用右键菜单（100）之下。
+   ============================================================ */
+
+.repair {
+  position: fixed;
+  z-index: 70;
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  max-height: 78%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px;
+  background: var(--bg-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.2);
+}
+
+.repair__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--warning);
+}
+
+.repair__head svg {
+  flex-shrink: 0;
+}
+
+.repair__title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repair__why {
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--text-dim);
+  word-break: break-word;
+}
+
+/* 路径单独一行、并且**可选中**：用户经常要把它复制出去自己找 */
+.repair__path {
+  max-height: 62px;
+  overflow-y: auto;
+  padding: 5px 7px;
+  background: var(--bg-raised);
+  border-radius: 6px;
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  word-break: break-all;
+  user-select: text;
+}
+
+.repair__path--sub {
+  color: var(--text-faint);
+}
+
+.repair__hint {
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+.repair__candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 132px;
+  overflow-y: auto;
+}
+
+.repair__candidate {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 7px;
+  background: var(--bg-raised);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.repair__candidate:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+.repair__candidate svg {
+  flex-shrink: 0;
+  color: var(--text-dim);
+  /* 两行文字时图标跟着第一行对齐 */
+  align-self: flex-start;
+  margin-top: 1px;
+}
+
+.repair__candidate-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* 候选路径最多显示两行、允许换行。
+   刻意不用省略号：候选之间的区别常常在**中间那一层**目录
+   （同级目录下的同名文件），截掉哪一头都可能正好把区别截掉。 */
+.repair__candidate-text {
+  word-break: break-all;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 大小与修改时间。**这是候选列表里唯一能帮用户分辨"哪个才是我要的"的信息**：
+   几个候选文件名完全一样，只有时间和大小不同。 */
+.repair__candidate-meta {
+  color: var(--text-faint);
+  font-size: var(--fs-2xs);
+  white-space: nowrap;
+}
+
+.repair__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+/* 四个动作平分一行；窄档位下自动折行，不硬挤 */
+.repair__actions .btn {
+  flex: 1;
+  min-width: 92px;
+  justify-content: center;
+}
+
+.repair__danger {
+  color: var(--danger);
+}
+
+.repair__danger:hover {
+  border-color: var(--danger);
+}
+

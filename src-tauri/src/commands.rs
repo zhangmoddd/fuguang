@@ -559,21 +559,146 @@ pub async fn link_remove(app: AppHandle, id: String) -> Result<(), String> {
     state::persist(&app, || store.lock().links.clone(), state::save_links)
 }
 
+/// 一条链接的目标现在还在不在。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkStatus {
+    /// 对应哪条链接。
+    pub id: String,
+    /// 核对结果。字段平铺进来，前端拿到的就是 `{ id, state, resolved, lnkTarget }`。
+    #[serde(flatten)]
+    pub target: launcher::TargetStatus,
+}
+
+/// 取出一条链接的启动信息。
+fn link_target_of(app: &AppHandle, id: &str) -> Result<(String, Option<String>), String> {
+    let store = app.state::<Store>();
+    let st = store.lock();
+    st.links
+        .iter()
+        .find(|l| l.id == id)
+        .map(|l| (l.target.clone(), l.args.clone()))
+        .ok_or_else(|| "找不到这个链接，可能已被删除".to_string())
+}
+
+/// 在阻塞线程池上启动。
+///
+/// # 为什么必须离开异步运行时的线程
+///
+/// `ShellExecuteExW` 是同步调用，而且**可能阻塞很久**：目标是断开的网络盘时，
+/// Shell 会一直等到 SMB 超时（几十秒）；目标是个坏掉的 `.lnk` 时，
+/// 系统还可能弹一个模态框等用户点。直接在 `async fn` 里调用，
+/// 占住的是 Tauri 异步运行时的线程 —— 而跨窗口同步、图标提取、
+/// 目标核对同一时刻也在用这些线程。
+async fn launch_blocking(
+    target: String,
+    args: Option<String>,
+    elevated: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if elevated {
+            launcher::open_elevated(&target, args.as_deref())
+        } else {
+            launcher::open(&target, args.as_deref())
+        }
+    })
+    .await
+    .map_err(|err| format!("启动线程失败：{err}"))?
+}
+
 /// 启动一个快捷链接。
 #[tauri::command]
 pub async fn link_launch(app: AppHandle, id: String) -> Result<(), String> {
-    let target = {
+    let (target, args) = link_target_of(&app, &id)?;
+    launch_blocking(target, args, false).await
+}
+
+/// 以管理员身份启动一个快捷链接（会弹 UAC 提权确认）。
+///
+/// # 为什么单独开一个入口，而不是"检测到需要提权就自动提权"
+///
+/// 自动提权等于**替用户按下了那个 UAC 确认框**，而这个应用的定位是启动器 ——
+/// 用户点一个格子时预期的是"打开它"，不是"给这个东西管理员权限"。
+/// 所以提权必须是用户显式选的动作，放在右键菜单里。
+///
+/// # 这里**刻意不校验** `link.kind`
+///
+/// 前端只在 `kind !== "url"` 时给出这个入口，但后端不重复这个判断：
+/// `kind` 只是个展示字段（决定默认图标），而一条被改过 `kind` 的链接
+/// （比如从备份里导进来的）仍然能被前端正常显示成一个程序。
+/// 真正的门是 UAC 确认框 —— 用户必须亲手点"是"，而且这个入口不是零点击、
+/// 也不是顺手可达的。写成后端也拦一道只会制造"前端能点、后端报错"的不对称。
+#[tauri::command]
+pub async fn link_launch_elevated(app: AppHandle, id: String) -> Result<(), String> {
+    let (target, args) = link_target_of(&app, &id)?;
+    launch_blocking(target, args, true).await
+}
+
+/// 批量核对：这些链接的目标现在还在不在。
+///
+/// # 为什么一次核完所有，而不是一条一条问
+///
+/// 链接页一挂载就要给**所有**失效的格子打标记。逐条 invoke 意味着
+/// 几十次 IPC 往返 + 几十次状态更新，而每次更新都会重渲染整面格子墙。
+/// 一次拿回整张表，界面只更新一次。
+///
+/// # 为什么绝不访问网络
+///
+/// 这个核对是**面板一打开就自动跑的、不需要任何点击**，而链接目标是完全
+/// 自由的字符串（可以从别人给的备份里导进来）。对 `\\attacker\share\x`
+/// 做一次 `metadata` 就等于把当前用户的 NetNTLM 响应发给那台主机。
+/// 拦截在 `launcher::probe` 里（见那里的说明），这里只负责批量。
+#[tauri::command]
+pub async fn links_probe(app: AppHandle) -> Vec<LinkStatus> {
+    let items: Vec<(String, String, LinkKind)> = {
+        let store = app.state::<Store>();
+        let st = store.lock();
+        st.links
+            .iter()
+            .map(|l| (l.id.clone(), l.target.clone(), l.kind))
+            .collect()
+    };
+
+    // 读文件属性可能撞上慢盘（几万条的目录、要转起来的机械盘），
+    // 放到阻塞线程池上，不占异步运行时的线程
+    tauri::async_runtime::spawn_blocking(move || {
+        items
+            .into_iter()
+            .map(|(id, target, kind)| LinkStatus {
+                id,
+                target: launcher::probe(&target, kind),
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// 在目标原来所在的文件夹附近找同名文件，作为「重新定位」的候选。
+///
+/// **不改任何数据**：同名不等于同一个东西，改不改由用户点。
+/// 候选里带上大小和修改时间 —— 只给路径的话用户没法在几个同名文件之间分辨，
+/// 点错一个链接就永久指向无关的文件，而且它照样"打开成功"、不会有人发现。
+///
+/// 搜不动（网络路径、目标没有文件名、原来那个文件夹也没了）就返回空表。
+#[tauri::command]
+pub async fn link_find_same_name(app: AppHandle, id: String) -> Vec<launcher::SameNameCandidate> {
+    let found = {
         let store = app.state::<Store>();
         let st = store.lock();
         st.links
             .iter()
             .find(|l| l.id == id)
-            .map(|l| (l.target.clone(), l.args.clone()))
+            .map(|l| (l.target.clone(), l.kind))
     };
-    let Some((target, args)) = target else {
-        return Err("找不到这个链接，可能已被删除".into());
+    let Some((target, kind)) = found else {
+        return Vec::new();
     };
-    launcher::open(&target, args.as_deref())
+
+    let want_dir = kind == LinkKind::Folder;
+    tauri::async_runtime::spawn_blocking(move || launcher::find_same_name(&target, want_dir))
+        .await
+        .unwrap_or_default()
 }
 
 /// 提取某个路径的图标。

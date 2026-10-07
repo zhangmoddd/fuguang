@@ -213,6 +213,56 @@ export interface IconData {
   rgbaBase64: string;
 }
 
+/**
+ * 一个目标**现在**的状态（Rust 侧 `launcher::TargetState`）。
+ *
+ * 只有 `missing` / `noParent` / `noDrive` / `denied` / `lnkBroken` / `empty`
+ * 这几种算「坏了，点开一定失败」；`network` 和 `unknown` 是「没法确认」，
+ * 界面**不能**把它们显示成失效 —— 那是冤枉。
+ */
+export type TargetState =
+  | "url"
+  | "ok"
+  | "missing"
+  | "noParent"
+  | "noDrive"
+  | "denied"
+  | "lnkBroken"
+  | "network"
+  | "empty"
+  | "unknown";
+
+/** 一条链接的目标核对结果。 */
+export interface LinkStatus {
+  id: string;
+  state: TargetState;
+  /**
+   * 归一化之后**真正会交给 Shell** 的那个字符串。
+   *
+   * 和链接里存的 `target` 可能不同：去掉了首尾空白、剥掉了外层引号、
+   * 展开了 `%USERPROFILE%` 这类环境变量。
+   */
+  resolved: string;
+  /** `.lnk` 里解析出来的真实目标。只有 `state === "lnkBroken"` 时有值。 */
+  lnkTarget: string | null;
+}
+
+/**
+ * 「附近找到的同名文件」候选。
+ *
+ * 带上大小和修改时间不是装饰：候选的判据只有"文件名一样"，而用户真正想要的
+ * 那个可能和半年前的旧版本、和某个模板完全同名。只列路径的话界面上
+ * **没有任何信息能帮用户分辨**，点错了链接就永久指向一个无关的文件 ——
+ * 而且它照样"打开成功"，不会有人发现。
+ */
+export interface SameNameCandidate {
+  path: string;
+  /** 文件字节数。目录是 0。 */
+  bytes: number;
+  /** 最后修改时刻（Unix 毫秒）。取不到就是 `null`。 */
+  modifiedMs: number | null;
+}
+
 // ===============================================================
 // 文件夹
 // ===============================================================
@@ -528,6 +578,28 @@ export const api = {
   linkSave: (link: LinkItem) => invoke<void>("link_save", { link }),
   linkRemove: (id: string) => invoke<void>("link_remove", { id }),
   linkLaunch: (id: string) => invoke<void>("link_launch", { id }),
+  /**
+   * 以管理员身份启动（会弹 UAC 提权确认）。
+   *
+   * 和 {@link linkLaunch} 分开是刻意的：提权必须由用户显式选，
+   * 不能"检测到需要提权就自动提"——那等于替用户按下了 UAC 确认框。
+   */
+  linkLaunchElevated: (id: string) => invoke<void>("link_launch_elevated", { id }),
+  /**
+   * 批量核对：这些链接的目标现在还在不在。
+   *
+   * 纯本地、零网络（Rust 侧会跳过 UNC 和映射盘）。一次核完所有链接，
+   * 而不是逐条问：面板一挂载就要给所有失效的格子打标记，
+   * 逐条会有几十次 IPC 往返 + 几十次重渲染。
+   */
+  linksProbe: () => invoke<LinkStatus[]>("links_probe"),
+  /**
+   * 在目标原来所在的文件夹附近找同名文件，作为「重新定位」的候选。
+   *
+   * 只**提议**，不改数据：同名不等于同一个东西。搜不动就返回空数组。
+   * 候选里带大小和修改时间，界面上要显示出来 —— 见 {@link SameNameCandidate}。
+   */
+  linkFindSameName: (id: string) => invoke<SameNameCandidate[]>("link_find_same_name", { id }),
   linkIcon: (path: string) => invoke<IconData | null>("link_icon", { path }),
   /**
    * 判断一批路径各自是什么（拖拽添加链接时用）。

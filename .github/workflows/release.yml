@@ -80,7 +80,9 @@ jobs:
           releaseBody: |
             ## 安装
 
-            下载下面的 `浮光_x.x.x_x64-setup.exe`，双击安装。
+            下载下面的 `fuguang_x.x.x_x64-setup.exe`，双击安装。
+            （文件名是英文的 —— GitHub 的 Release **不允许资产名带中文**，
+            装完之后程序名、开始菜单和界面仍然是「浮光」。）
             不需要装 Node.js、不需要 Rust、不需要 WebView2 运行库（Windows 10/11 自带）。
 
             安装后从开始菜单启动，屏幕右侧会出现一个蓝色小球。
@@ -105,6 +107,28 @@ jobs:
               真正的数据在 `%APPDATA%\浮光`，要彻底清理请手动删掉那个文件夹
 
             完整列表见 [README 的「已知限制」](https://github.com/${{ github.repository }}#已知限制)。
+
+      # ⚠️ GitHub 的 Release 资产名**不允许非 ASCII 字符**。
+      #
+      # tauri-action 上传的是 `浮光_0.1.0_x64-setup.exe`，会被平台静默剥成
+      # `_0.1.0_x64-setup.exe`（中文没了）。**实测确认这是平台限制，不是 action 的问题**：
+      # 用 API 主动改成中文名，GitHub 会再次把它剥掉；改成 ASCII 名则成功。
+      #
+      # 所以上传后统一改成 ASCII 名，让用户下载到的文件名和 README 里写的一致。
+      - name: 安装包改名（GitHub 的资产名不允许中文）
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repo = "${{ github.repository }}"
+          $tag = "${{ github.ref_type == 'tag' && github.ref_name || format('v{0}-manual', github.run_number) }}"
+          $assets = (gh release view $tag --repo $repo --json assets | ConvertFrom-Json).assets
+          foreach ($a in $assets) {
+            if ($a.name -match '^[A-Za-z0-9._-]+$') { continue }   # 已经是 ASCII，不用动
+            $fixed = "fuguang_" + ($a.name -replace '^[^0-9]*', '')
+            gh api --method PATCH "repos/$repo/releases/assets/$($a.id)" -f "name=$fixed" | Out-Null
+            Write-Host "资产改名：$($a.name) -> $fixed"
+          }
 
       - name: 上传构建产物（即使 Release 是草稿也能单独下载）
         uses: actions/upload-artifact@v4

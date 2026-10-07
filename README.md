@@ -46,7 +46,9 @@
 
 ## 下载安装
 
-到 [Releases](https://github.com/zhangmoddd/fuguang/releases) 下载 `浮光_x.x.x_x64-setup.exe`，双击安装。
+到 [Releases](https://github.com/zhangmoddd/fuguang/releases) 下载 `fuguang_x.x.x_x64-setup.exe`，双击安装。
+（文件名是英文的：GitHub 的 Release **不允许资产名带中文**，会被静默剥成 `_x.x.x_...`。
+装完之后程序名、开始菜单和界面都是「浮光」。）
 安装完从开始菜单启动，屏幕右侧会出现一个蓝色小球。
 
 不需要装 Node.js、不需要 Rust、不需要 WebView2 运行库（Windows 10/11 自带）。
